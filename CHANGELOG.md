@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Rollback and `doctor --fix` no longer run `git worktree prune`, which also
+  removed the registrations of unrelated worktrees whose directories were
+  unreachable (for example on an unmounted disk). Only the run's own
+  registration is removed.
+- `doctor --fix` detects a worktree that was already published even when the
+  crashed run's journal lacks the destination or was lost, and repairs it instead
+  of removing its registration and branch.
+- The journal is written with `F_FULLFSYNC`, so it reaches the disk before the
+  step it describes.
+
 ### Added
 
 - Visual identity in ASCII ("sun dogs": the source worktree in the middle, its

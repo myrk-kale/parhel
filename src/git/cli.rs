@@ -188,6 +188,27 @@ fn git_dir_markers(git_dir: &Path) -> Vec<&'static str> {
     .collect()
 }
 
+/// Equal as written, or once the existing parent directories are resolved
+/// (`/var/...` vs `/private/var/...`).
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let resolve = |p: &Path| -> Option<PathBuf> {
+        let (parent, name) = (p.parent()?, p.file_name()?);
+        let mut base = parent;
+        let mut tail = vec![name];
+        while !base.exists() {
+            tail.push(base.file_name()?);
+            base = base.parent()?;
+        }
+        let mut out = fs::canonicalize(base).ok()?;
+        out.extend(tail.iter().rev());
+        Some(out)
+    };
+    matches!((resolve(a), resolve(b)), (Some(x), Some(y)) if x == y)
+}
+
 fn canonical(path: &Path) -> Result<PathBuf> {
     fs::canonicalize(path)
         .map_err(|e| Error::new(ErrorCode::Io, format!("{}: {e}", path.display())))
@@ -437,8 +458,28 @@ impl Git for GitCli {
         .map(drop)
     }
 
-    fn worktree_prune(&self, repo: &Path) -> Result<()> {
-        self.run(repo, &["worktree", "prune"]).map(drop)
+    fn unregister_worktree(&self, repo: &Path, path: &Path) -> Result<()> {
+        let common = self.stdout(
+            repo,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let admin_root = Path::new(&common).join("worktrees");
+        let Ok(entries) = fs::read_dir(&admin_root) else {
+            return Ok(());
+        };
+        let target = path.join(".git");
+        for entry in entries.flatten() {
+            let Ok(recorded) = fs::read(entry.path().join("gitdir")) else {
+                continue;
+            };
+            let recorded = PathBuf::from(OsStr::from_bytes(recorded.trim_ascii_end()));
+            if same_path(&recorded, &target) {
+                return fs::remove_dir_all(entry.path()).map_err(|e| {
+                    Error::new(ErrorCode::Io, format!("{}: {e}", entry.path().display()))
+                });
+            }
+        }
+        Ok(())
     }
 
     fn branch_delete(&self, repo: &Path, name: &str) -> Result<()> {

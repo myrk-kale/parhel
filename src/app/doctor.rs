@@ -152,15 +152,20 @@ fn fix(
             .and_then(|bytes| Journal::decode(&bytes).ok());
         let ok = if let Some(journal) = journal {
             handled.extend(journal.worktree.clone());
-            if was_published(env, &journal) {
-                complete_publish(env, repo, staging, &journal)
-            } else {
-                rollback(env.git, env.fs, staging, &journal).is_ok()
+            let published = journal.worktree.as_deref().and_then(|staged| {
+                published_dest(env, staging, staged, journal.publish_to.as_deref())
+            });
+            match published {
+                Some(dest) => complete_publish(env, repo, staging, &dest),
+                None => rollback(env.git, env.fs, staging, &journal).is_ok(),
             }
         } else {
             let mut ok = true;
             for reg in registrations.iter().filter(|r| r.starts_with(staging)) {
-                ok &= remove_registration(env, repo, reg);
+                ok &= match published_dest(env, staging, reg, None) {
+                    Some(dest) => env.git.worktree_repair(&repo.toplevel, &dest).is_ok(),
+                    None => remove_registration(env, repo, reg),
+                };
                 handled.push(reg.clone());
             }
             ok && env.fs.remove_dir_all(staging).is_ok()
@@ -185,21 +190,46 @@ fn fix(
     }
 }
 
-/// The run died after its exclusive rename: the staged worktree is gone and the
-/// destination it journaled exists.
-fn was_published(env: &Env<'_>, journal: &Journal) -> bool {
-    let (Some(staged), Some(dest)) = (&journal.worktree, &journal.publish_to) else {
-        return false;
+/// Where the crashed run published `staged`, if the exclusive rename happened.
+///
+/// The destination is the journaled `publish_to`, or else the staging dir's sibling
+/// with the staged worktree's name (staging is always created next to the
+/// destination). Without a journal entry the disk must prove it: the destination's
+/// `.git` file points to an admin dir whose `gitdir` still names `staged`, i.e. the
+/// worktree was moved but `git worktree repair` never ran. The journal alone is not
+/// trusted to be on disk after a power loss.
+fn published_dest(
+    env: &Env<'_>,
+    staging: &Path,
+    staged: &Path,
+    publish_to: Option<&Path>,
+) -> Option<PathBuf> {
+    if env.fs.exists_no_follow(staged).unwrap_or(true) {
+        return None;
+    }
+    let dest = match publish_to {
+        Some(dest) => dest.to_path_buf(),
+        None => staging.parent()?.join(staged.file_name()?),
     };
-    !env.fs.exists_no_follow(staged).unwrap_or(true)
-        && env.fs.exists_no_follow(dest).unwrap_or(false)
+    if !env.fs.exists_no_follow(&dest).unwrap_or(false) {
+        return None;
+    }
+    if publish_to.is_some() {
+        return Some(dest);
+    }
+    let gitfile = env.fs.read_file(&dest.join(".git")).ok()?;
+    let admin = String::from_utf8_lossy(&gitfile)
+        .trim()
+        .strip_prefix("gitdir:")?
+        .trim()
+        .to_owned();
+    let backlink = env.fs.read_file(&Path::new(&admin).join("gitdir")).ok()?;
+    let backlink = String::from_utf8_lossy(&backlink).trim().to_owned();
+    (Path::new(&backlink) == staged.join(".git")).then_some(dest)
 }
 
 /// Finish what the crashed run was doing: point the registration at the destination.
-fn complete_publish(env: &Env<'_>, repo: &RepoInfo, staging: &Path, journal: &Journal) -> bool {
-    let Some(dest) = &journal.publish_to else {
-        return false;
-    };
+fn complete_publish(env: &Env<'_>, repo: &RepoInfo, staging: &Path, dest: &Path) -> bool {
     env.git.worktree_repair(&repo.toplevel, dest).is_ok() && env.fs.remove_dir_all(staging).is_ok()
 }
 
@@ -208,7 +238,7 @@ fn remove_registration(env: &Env<'_>, repo: &RepoInfo, path: &Path) -> bool {
         return true;
     }
     let removed = env.fs.remove_dir_all(path).is_ok();
-    removed && env.git.worktree_prune(&repo.toplevel).is_ok()
+    removed && env.git.unregister_worktree(&repo.toplevel, path).is_ok()
 }
 
 /// Walk the source (not following symlinks, skipping the root `.git`) for `.git`
@@ -254,8 +284,9 @@ fn find_foreign_gitfiles(env: &Env<'_>, repo: &RepoInfo, dir: &Path, report: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fakes::{Call, SHA_A, World, p};
+    use crate::app::fakes::{Call, SHA_A, Step, World, p};
     use crate::app::rollback::{JOURNAL_FILE, Journal};
+    use crate::domain::ErrorCode;
     use crate::git::parse::WorktreeEntry;
     use crate::ports::VolumeInfo;
     use std::ffi::OsString;
@@ -550,5 +581,104 @@ mod tests {
         );
         assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
         assert_eq!(w.count(|c| matches!(c, Call::Repair { .. })), 0);
+    }
+
+    /// Published worktree at `/w/feat` whose registration still points into the
+    /// staging dir (killed before `worktree repair`), with the given journal state.
+    fn published_before_repair(journal: Option<Journal>) -> World {
+        let w = crashed_world();
+        let staging = p("/w/.parhel-staging-dead");
+        w.tree.borrow_mut().remove(&staging.join("feat"));
+        w.tree
+            .borrow_mut()
+            .get_mut(&staging)
+            .unwrap()
+            .retain(|n| n != "feat");
+        w.tree
+            .borrow_mut()
+            .insert(p("/w/feat"), vec![OsString::from(".git")]);
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w"))
+            .unwrap()
+            .push(OsString::from("feat"));
+        w.files.borrow_mut().remove(&staging.join("feat/.git"));
+        w.files.borrow_mut().insert(
+            p("/w/feat/.git"),
+            b"gitdir: /w/repo/.git/worktrees/feat\n".to_vec(),
+        );
+        w.files.borrow_mut().insert(
+            p("/w/repo/.git/worktrees/feat/gitdir"),
+            b"/w/.parhel-staging-dead/feat/.git\n".to_vec(),
+        );
+        if let Some(j) = journal {
+            w.files
+                .borrow_mut()
+                .insert(staging.join(JOURNAL_FILE), j.encode());
+        } else {
+            w.files.borrow_mut().remove(&staging.join(JOURNAL_FILE));
+            w.tree
+                .borrow_mut()
+                .get_mut(&staging)
+                .unwrap()
+                .retain(|n| n != JOURNAL_FILE);
+        }
+        w
+    }
+
+    fn assert_repaired_not_removed(w: &World) {
+        assert_eq!(
+            w.calls(),
+            vec![
+                Call::Repair { path: p("/w/feat") },
+                Call::RemoveDirAll(p("/w/.parhel-staging-dead")),
+            ],
+            "the published worktree must be repaired, never unregistered"
+        );
+    }
+
+    // U-DOC-12: journal written before the destination was recorded (e.g. the
+    // last journal write never reached the disk): detect publication on disk.
+    #[test]
+    fn detects_publication_without_journal_publish_to() {
+        let old = Journal {
+            repo: p("/w/repo"),
+            worktree: Some(p("/w/.parhel-staging-dead/feat")),
+            created_branch: Some("feat".into()),
+            publish_to: None,
+        };
+        let w = published_before_repair(Some(old));
+        assert!(run(&w, true).healthy());
+        assert_repaired_not_removed(&w);
+    }
+
+    // U-DOC-13: no readable journal at all.
+    #[test]
+    fn detects_publication_without_any_journal() {
+        let w = published_before_repair(None);
+        assert!(run(&w, true).healthy());
+        assert_repaired_not_removed(&w);
+    }
+
+    // U-DOC-14: orphan registration (not published) whose removal fails: only that
+    // registration goes, never a global prune.
+    #[test]
+    fn orphan_registration_cleanup_is_scoped() {
+        let w = crashed_world().failing(Step::RemoveForce, ErrorCode::GitFailed);
+        let staging = p("/w/.parhel-staging-dead");
+        w.files.borrow_mut().remove(&staging.join(JOURNAL_FILE));
+        w.tree
+            .borrow_mut()
+            .get_mut(&staging)
+            .unwrap()
+            .retain(|n| n != JOURNAL_FILE);
+        assert!(run(&w, true).healthy());
+        assert_eq!(
+            w.count(|c| *c
+                == Call::Unregister {
+                    path: staging.join("feat")
+                }),
+            1
+        );
     }
 }

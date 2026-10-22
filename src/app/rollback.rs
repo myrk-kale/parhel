@@ -123,7 +123,8 @@ impl Journal {
 /// Undo everything recorded in `journal`, then delete `staging_dir`:
 ///
 /// 1. `git worktree remove --force <worktree>`; if that fails, delete the directory
-///    and `git worktree prune`;
+///    and remove only its registration (never a repository-wide `worktree prune`,
+///    which would also drop worktrees that are merely unreachable);
 /// 2. `git branch -D <created_branch>`;
 /// 3. remove the staging dir.
 ///
@@ -142,8 +143,14 @@ pub fn rollback(
             if let Err(e) = fs.remove_dir_all(worktree) {
                 failures.push((format!("rm -rf '{}'", worktree.display()), e));
             }
-            if let Err(e) = git.worktree_prune(repo) {
-                failures.push(("git worktree prune".to_owned(), e));
+            if let Err(e) = git.unregister_worktree(repo, worktree) {
+                failures.push((
+                    format!(
+                        "rm -rf \"$(git rev-parse --git-common-dir)/worktrees/{}\"",
+                        worktree.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    e,
+                ));
             }
         }
     }
@@ -253,17 +260,21 @@ mod tests {
         );
     }
 
-    // U-RB-06
+    // U-RB-06: when `worktree remove` fails, only this run's registration is
+    // removed. A global `worktree prune` would also drop unrelated worktrees whose
+    // directories are temporarily unreachable (unmounted disks).
     #[test]
-    fn failed_worktree_remove_falls_back_to_delete_and_prune() {
+    fn failed_worktree_remove_unregisters_only_this_worktree() {
         let w = World::default().failing(Step::RemoveForce, ErrorCode::GitFailed);
         rollback(&w, &w, &p("/w/.parhel-staging-test"), &full_journal()).unwrap();
         let wt = p("/w/.parhel-staging-test/feat");
         let rm = w
             .position(|c| *c == Call::RemoveDirAll(wt.clone()))
             .expect("dir removed");
-        let prune = w.position(|c| *c == Call::Prune).expect("pruned");
-        assert!(rm < prune, "prune must run after the directory is gone");
+        let unregister = w
+            .position(|c| *c == Call::Unregister { path: wt.clone() })
+            .expect("own registration removed");
+        assert!(rm < unregister);
         assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
     }
 
