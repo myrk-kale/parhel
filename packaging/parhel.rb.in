@@ -1,5 +1,5 @@
 class Parhel < Formula
-  desc "Copy-on-write Git worktrees on APFS, ignored build output included"
+  desc "Copy-on-write Git worktrees with ignored build output included"
   homepage "https://github.com/myrk-kale/parhel"
   url "https://github.com/myrk-kale/parhel/releases/download/v@VERSION@/parhel-v@VERSION@-universal-apple-darwin.tar.gz"
   sha256 "@SHA256@"

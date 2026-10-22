@@ -1,6 +1,7 @@
 # parhel
 
-**Git worktrees in milliseconds, with your `node_modules` and `target/` already there.**
+New Git worktrees in under a second, with `node_modules`, `target/` and the rest
+of your build output already in place.
 
 [![CI](https://github.com/myrk-kale/parhel/actions/workflows/ci.yml/badge.svg)](https://github.com/myrk-kale/parhel/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/myrk-kale/parhel?sort=semver)](https://github.com/myrk-kale/parhel/releases)
@@ -11,28 +12,40 @@
 git parhel add ../my-feature --new-branch feature/my-feature
 ```
 
-`git parhel add` creates a **regular Git worktree** by cloning your current
-worktree with APFS copy-on-write (`clonefile(2)`) instead of checking files out.
-Ignored heavyweights (`node_modules/`, `target/`, `.venv/`, build caches) come
-along instantly and use **no extra disk space** until one side modifies them.
-You skip the reinstall and the cold rebuild that a fresh worktree needs.
+A fresh `git worktree add` gives you the tracked files and nothing else, so the
+first thing you do in it is reinstall dependencies and rebuild from scratch.
+`git parhel add` creates the same kind of worktree, but it copies your current
+working tree with the filesystem's copy-on-write cloning. Ignored directories
+such as `node_modules/`, `target/` or `.venv/` arrive with it, and they take no
+extra disk space until one of the two copies changes a file.
 
-| Project with 78 MB `node_modules` (20k files) + 300 MB build artifact | Time | Extra disk |
+The result is an ordinary Git worktree. `git worktree list`, `move`, `lock` and
+`remove` all work on it.
+
+Measured on macOS with a project holding 78 MB of `node_modules` (20,000 files)
+and a 300 MB build artifact:
+
+| | Time | Extra disk used |
 |---|---|---|
-| `git worktree add` + `cp -R node_modules target` | 6.9 s | 383 MiB |
-| `git parhel add` | **0.5 s** | **~8 MiB** |
+| `git worktree add`, then `cp -R node_modules target` | 6.9 s | 383 MiB |
+| `git parhel add` | 0.5 s | about 8 MiB |
 
-> **Status: 0.x, experimental.** The behavior is covered by 430+ tests against real
-> git and real APFS volumes, but the CLI may still change before 1.0. Please
-> [report anything odd](https://github.com/myrk-kale/parhel/issues/new/choose).
+parhel currently runs on macOS (APFS). Linux is next, then Windows; see
+[Platform support](#platform-support).
+
+parhel is at version 0.x. More than 430 tests run it against real git and real
+APFS volumes, but command-line details may still change before 1.0. If
+something looks wrong, please
+[open an issue](https://github.com/myrk-kale/parhel/issues/new/choose).
 
 ## Contents
 
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Commands](#commands)
+- [Platform support](#platform-support)
 - [How it works](#how-it-works)
-- [Safety guarantees](#safety-guarantees)
+- [What happens when things go wrong](#what-happens-when-things-go-wrong)
 - [Limitations](#limitations)
 - [FAQ](#faq)
 - [Error codes](#error-codes)
@@ -42,38 +55,39 @@ You skip the reinstall and the cold rebuild that a fresh worktree needs.
 
 ## Install
 
-Requirements: macOS with an APFS volume (the default since macOS 10.13) and
-git 2.29 or newer (Apple's bundled git is fine).
+You need macOS on an APFS volume (the default since macOS 10.13) and git 2.29
+or newer. The git that ships with Xcode's command line tools works.
 
-**Homebrew** (recommended):
+With Homebrew:
 
 ```sh
 brew install myrk-kale/tap/parhel
 ```
 
-**Install script** (no Homebrew; installs to `~/.local/bin`, verifies the SHA-256):
+Without Homebrew, the install script puts the binary in `~/.local/bin` and
+checks its SHA-256 before installing:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
 ```
 
-Set `PARHEL_VERSION=0.1.0` to pin a version or `PARHEL_INSTALL_DIR` to change the
-location.
+Set `PARHEL_VERSION=0.1.0` to install a specific version, or
+`PARHEL_INSTALL_DIR` to put the binary somewhere else.
 
-**From source** (Rust 1.85+):
+From source, with Rust 1.85 or newer:
 
 ```sh
 cargo install --git https://github.com/myrk-kale/parhel
 ```
 
-Check it works:
+Then check that git can find it:
 
 ```sh
 git parhel --version
 ```
 
-Git finds any `git-<name>` executable on your `PATH`, so the `git-parhel` binary
-becomes the `git parhel` command. No git configuration is needed.
+Git runs any executable called `git-<name>` on your `PATH` as `git <name>`, so
+installing the `git-parhel` binary is all the setup there is.
 
 ## Quick start
 
@@ -96,7 +110,7 @@ git parhel add ../spike                            # new branch named "spike"
 git parhel add ../older --new-branch old-ui 3f2a9c1   # start from another commit
 ```
 
-When you're done, use plain git:
+To get rid of a worktree, use git itself:
 
 ```sh
 git worktree remove ../my-app-login
@@ -106,45 +120,83 @@ git worktree remove ../my-app-login
 
 ### `git parhel add [options] <destination> [ref]`
 
-Creates a worktree at `<destination>` (its parent directory must exist) and checks
-out `[ref]` (default: the source HEAD).
+Creates a worktree at `<destination>` and checks out `[ref]`, which defaults to
+the commit your current worktree is on. The parent directory of
+`<destination>` has to exist already.
 
 | Option | Meaning |
 |---|---|
-| `--new-branch <name>` | Create and check out a new branch |
+| `--new-branch <name>` | Create a new branch and check it out |
 | `--branch <name>` | Check out an existing branch |
-| `--detach` | Detached HEAD at `[ref]` |
-| *(none of the above)* | Like `git worktree add`: a branch named after the destination's basename (created if missing) |
-| `[ref]` | Any commit-ish. It may differ from the source HEAD: only the tracked files that differ are rewritten, everything else stays shared |
-| `--from <path>` | The source worktree, as any path inside it (default: current directory) |
-| `--allow-dirty` | Carry uncommitted changes into the new worktree (staged changes arrive unstaged). Without it, a dirty source is refused |
-| `--submodules=refuse\|reinit` | Initialized submodules are refused by default. `reinit` gives each submodule its own git dir in the new worktree, cloned from the source's copy (works offline) |
-| `--fallback` | When copy-on-write is impossible (not APFS, different volumes), create a regular worktree instead of failing |
+| `--detach` | Check out `[ref]` with a detached HEAD |
+| (none of the three) | Same as `git worktree add`: use a branch named after the destination folder, creating it if needed |
+| `[ref]` | Any commit, tag or branch. If it differs from your current commit, parhel rewrites only the tracked files that differ and keeps sharing the rest |
+| `--from <path>` | Which worktree to copy, given as any path inside it. Defaults to the current directory |
+| `--allow-dirty` | Copy uncommitted changes too. Staged changes arrive unstaged. Without this flag, a worktree with uncommitted changes is refused |
+| `--submodules=refuse\|reinit` | By default, initialized submodules are refused. `reinit` gives each submodule in the new worktree its own git directory, cloned from your local copy, so it works offline |
+| `--fallback` | If copy-on-write is not possible (unsupported filesystem, or source and destination on different volumes), create a regular worktree instead of failing |
 
-Only **ignored** files are cloned along with tracked ones. A clean source is
-required unless you pass `--allow-dirty`, so untracked files never leak in by
-surprise.
+Besides tracked files, the copy brings along ignored files. Untracked files
+that are not ignored only come along with `--allow-dirty`, because without it a
+worktree that has them is refused.
 
 ### `git parhel doctor [--fix] [--from <path>]`
 
-Checks the repository and the environment:
+Reports problems in the repository and its environment:
 
-- whether the source volume is APFS;
-- leftovers from a crashed run (hidden `.parhel-staging-*` directories and the
-  worktree registrations inside them);
-- `.git` files of *other* repositories nested in your tree, which a clone would
-  carry along.
+- the worktree is on a filesystem parhel cannot clone on;
+- an earlier run crashed and left a hidden `.parhel-staging-*` directory, or a
+  worktree registration inside one;
+- a `.git` file inside your tree belongs to a different repository, so a clone
+  would carry that repository's state along.
 
-`--fix` undoes leftovers using the crashed run's journal: only what that run
-created is removed, and a worktree that was already published is repaired, not
-deleted. Runs still in progress are detected and never touched.
+`--fix` cleans up after crashed runs. It reads the journal the run left behind
+and removes only what that run created. If the crash happened after the new
+worktree was already in place, `--fix` repairs it and leaves it alone. Runs that
+are still going hold a lock on their journal, and `doctor` skips them.
 
 ### Help
 
-`git parhel -h` prints a summary; `git parhel --help` (and `man git-parhel`) opens
-the manual when installed with Homebrew or the install script.
+`git parhel -h` prints a short summary. `git parhel --help` and
+`man git-parhel` open the manual page, which the Homebrew formula and the
+install script both install.
+
+## Platform support
+
+| Platform | Status | Mechanism |
+|---|---|---|
+| macOS, APFS | Supported | `clonefile(2)` |
+| Linux, Btrfs or XFS | Planned next | reflink copies (`FICLONE`) |
+| Windows | Planned after Linux | |
+
+On a filesystem without copy-on-write support, or when the source and the
+destination are on different volumes, `add` stops with `not-apfs` or
+`cross-volume` before touching anything. Pass `--fallback` to get a regular
+`git worktree add` in those cases.
+
+The code keeps filesystem access behind one interface (`CowFs` in
+`src/ports.rs`), so adding a platform means writing a new implementation of it
+and running the same test suite against it.
 
 ## How it works
+
+On macOS, `add` goes through five steps:
+
+1. It checks everything it can before making changes: the git version, the
+   state of the source worktree, the destination, and whether both are on the
+   same APFS volume. Any refusal happens here, so a refused command leaves no
+   trace.
+2. It registers a new worktree with `git worktree add --no-checkout`, inside a
+   hidden staging directory next to the destination.
+3. It clones the source into the staging directory with `clonefile(2)`. A whole
+   directory takes a single call; parhel only walks into a directory when
+   something inside it must be left out: the root `.git`, other worktrees
+   nested in the source and, with `reinit`, submodules.
+4. It builds the index from the source commit. If `[ref]` points somewhere else,
+   a two-way checkout rewrites the files that differ.
+5. It moves the finished worktree to the destination with
+   `renamex_np(RENAME_EXCL)`, which fails instead of overwriting anything, and
+   then runs `git worktree repair`.
 
 ```
  source worktree                      .parhel-staging-xxxx/ (next to the destination)
@@ -158,114 +210,106 @@ the manual when installed with Homebrew or the install script.
                      renamex_np(RENAME_EXCL) ─▶ ../my-feature   then `git worktree repair`
 ```
 
-1. **Validate everything first:** git version, repository state, destination,
-   volume type. Any refusal happens before anything is created.
-2. **Register** a worktree with `git worktree add --no-checkout` inside a private
-   staging directory on the destination's volume.
-3. **Clone** the source tree into it with `clonefile(2)`, skipping the root
-   `.git`, other worktrees nested in the source and (with `reinit`) submodules.
-   Whole directories are cloned in one syscall.
-4. **Build the index** from the source HEAD; if `[ref]` differs, a two-way
-   checkout rewrites only the files that differ.
-5. **Publish** with an exclusive atomic rename to the destination, then let git
-   repair the registration.
+An APFS clone shares data blocks with the original. When either side writes to
+a block, APFS copies that block first, so from the moment the clone exists the
+two worktrees change independently.
 
-APFS clones share data blocks; a block is copied only when one side writes to it.
-Your source and the new worktree are fully independent from that moment on.
+## What happens when things go wrong
 
-## Safety guarantees
+parhel started as a reimplementation of
+[git-worktree-apfs](https://github.com/dannolan/git-worktree-apfs), and the
+test suite began with three problems found in that tool:
 
-parhel is a reimplementation of the idea behind
-[git-worktree-apfs](https://github.com/dannolan/git-worktree-apfs). Its failure
-modes were the starting point of the test suite:
-
-| Failure | git-worktree-apfs | parhel |
+| Situation | git-worktree-apfs | parhel |
 |---|---|---|
-| Two runs target the same destination | The loser deletes the winner's worktree, including uncommitted work | The destination is only ever written by an exclusive rename. An existing destination, even one created a millisecond earlier, is never modified or deleted |
-| Source has submodules | Their `.git` files keep pointing at the source, so a checkout in the copy changes the source | Refused by default; `--submodules=reinit` gives them their own git dirs |
-| A run fails midway | The temporary worktree stays registered, and its branch reports "already used by worktree" | Write-ahead journal plus rollback: the registration, the branch created by this run (never a pre-existing one) and the staging dir are removed |
+| Two runs target the same destination | The run that loses deletes the winner's worktree, uncommitted work included | Only an exclusive rename ever writes the destination, so an existing destination is never modified or deleted, even one created a millisecond earlier |
+| The source has submodules | The copied submodules still point at the source's git directories, so a checkout in the copy changes the source | Refused by default. `--submodules=reinit` gives the copies their own git directories |
+| A run fails partway | The temporary worktree stays registered, and its branch shows as "already used by worktree" | The run keeps a journal and undoes its own changes: the registration, the branch it created (never one that already existed) and the staging directory |
 
-Also:
+Other cases the tests cover:
 
-- Ctrl-C, `SIGTERM` and `SIGHUP` roll back cleanly (exit status `128 + signal`).
-  Signals during the rollback do not interrupt it.
-- After a crash (`kill -9`, power loss), `git parhel doctor --fix` finishes or
-  undoes the run from its journal.
-- If the source HEAD or its files change while the worktree is being created,
-  the run aborts with `source-changed` instead of producing an inconsistent copy.
-- A merge, rebase, cherry-pick, revert or `am` in progress in the source is refused.
-- Files flagged `assume-unchanged` or `skip-worktree` count as local changes,
-  since `git status` cannot vouch for them.
-- Values you pass are never interpreted as git options: branch and ref names
-  starting with `-` are rejected, and everything is passed after `--end-of-options`.
-- Symlinks are cloned as symlinks and never followed.
+- Ctrl-C, `SIGTERM` and `SIGHUP` roll the run back, and the process exits with
+  `128 + signal`. More signals during the rollback do not stop it.
+- After a hard crash (`kill -9`, power loss), `git parhel doctor --fix`
+  finishes or undoes the run, using its journal.
+- If the source's HEAD or files change while the copy is being made, the run
+  stops with `source-changed` rather than leave you with a mismatched worktree.
+- A merge, rebase, cherry-pick, revert or `am` in progress in the source is
+  refused.
+- Files marked `assume-unchanged` or `skip-worktree` count as uncommitted
+  changes, because `git status` does not check them.
+- Branch and ref names that start with `-` are rejected, and parhel passes all
+  of your values to git after `--end-of-options`, so none of them can be read as
+  an option.
+- Symlinks are copied as symlinks and never followed.
 
 ## Limitations
 
-- **macOS / APFS only.** Elsewhere, `--fallback` gives you a regular worktree.
-  Linux reflink support (Btrfs, XFS) is planned.
-- **Source and destination must be on the same volume.** `clonefile` cannot cross
-  volumes; use `--fallback` to get a regular worktree instead.
-- **Sparse-checkout sources** are refused.
-- **Hooks** (`post-checkout`) are not run, matching `git worktree add --no-checkout`.
-  With `--fallback`, git runs them as usual.
-- **Destinations inside a submodule's working tree** are refused.
+- Copy-on-write only works on macOS with APFS for now. Elsewhere, `--fallback`
+  creates a regular worktree. See [Platform support](#platform-support).
+- Source and destination must be on the same volume, because clones cannot
+  cross volumes. `--fallback` covers this case too.
+- Worktrees that use sparse-checkout are refused.
+- Hooks such as `post-checkout` do not run, the same as with
+  `git worktree add --no-checkout`. With `--fallback`, git runs them as usual.
+- Destinations inside a submodule's working tree are refused.
 
 ## FAQ
 
 **Does the new worktree depend on the source?**
-No. After creation they are two independent worktrees sharing only the repository,
-exactly like `git worktree add`. Deleting or rebuilding the source does not affect
-the copy.
+No. Once it exists, the two worktrees share the repository and nothing else,
+as with `git worktree add`. You can delete or rebuild the source without
+affecting the copy.
 
-**Why does Finder / `du` show the full size?**
-Those tools count logical sizes. Cloned blocks are shared until written, so free
-disk space (`df -h`) is the honest measure.
+**Why do Finder and `du` report the full size?**
+They count each file's logical size. Cloned blocks are stored once until one
+side changes them, so free space (`df -h`) shows what was actually used.
 
 **How do I remove a worktree?**
-`git worktree remove <path>`. Ignored files do not block it.
+Run `git worktree remove <path>`. Ignored files do not block it.
 
 **Can I move, lock or prune it?**
-Yes. It is a normal worktree: `git worktree move`, `lock`, `unlock`, `prune` and
-`repair` all work.
+Yes, with the usual `git worktree move`, `lock`, `unlock`, `prune` and `repair`.
 
 **What about Git LFS, filters and line endings?**
-Files go through git's normal checkout path when `[ref]` differs, so clean/smudge
-filters and `.gitattributes` apply as usual. With the same ref, files are cloned
-as they are in your source (already smudged).
+When `[ref]` differs from the source commit, the files that change go through
+git's normal checkout, so clean/smudge filters and `.gitattributes` apply. When
+`[ref]` is the same commit, files are cloned exactly as they are in the source,
+which means they are already smudged.
 
-**I downloaded the tarball in a browser and macOS refuses to run it.**
-Browser downloads are quarantined by Gatekeeper. Homebrew and the install script
-are not affected. For a manual download:
+**macOS refuses to run the binary I downloaded from the releases page.**
+Gatekeeper quarantines files downloaded with a browser. Homebrew and the
+install script do not have this problem. For a manual download, run
 `xattr -d com.apple.quarantine ./git-parhel`.
 
 **Which git does it use?**
-The `git` on your `PATH`, the same one you use. It needs 2.29 or newer.
+Whatever `git` is first on your `PATH`, version 2.29 or newer.
 
 ## Error codes
 
-Errors are printed as `error[<code>]: <message>`. Codes are stable, so you can
-script against them. Exit status is 1 for errors, 2 for usage errors and
-`128 + signal` when interrupted.
+Errors look like `error[<code>]: <message>`. The codes will not change between
+releases, so scripts can rely on them. The exit status is 1 for errors, 2 for
+usage errors and `128 + signal` when a signal interrupted the run.
 
-| Code | Meaning / what to do |
+| Code | Meaning and what to do |
 |---|---|
 | `dirty-source` | Commit or stash your changes, or pass `--allow-dirty` |
-| `dest-exists` | Pick another destination; parhel never overwrites |
+| `dest-exists` | Choose another destination. parhel never overwrites |
 | `dest-parent-missing` | Create the parent directory first |
-| `not-apfs` / `cross-volume` | Use a path on the same APFS volume, or `--fallback` |
+| `not-apfs` / `cross-volume` | Use a destination on the same APFS volume, or pass `--fallback` |
 | `submodules-present` | Pass `--submodules=reinit` |
-| `operation-in-progress` | Finish or abort the merge/rebase/cherry-pick first |
-| `source-changed` | Something modified the source mid-run; run it again |
-| `checkout-conflict` | With `--allow-dirty`, your local changes clash with `[ref]` |
+| `operation-in-progress` | Finish or abort the merge, rebase or cherry-pick first |
+| `source-changed` | Something changed the source during the run. Run the command again |
+| `checkout-conflict` | With `--allow-dirty`, your local changes conflict with `[ref]` |
 | `sparse-checkout` | Not supported yet |
-| `git-failed` | git's own message follows (e.g. branch already exists) |
-| `git-too-old` | Upgrade git to 2.29+ |
-| `rollback-failed` | Run `git parhel doctor --fix`; the message lists manual steps |
+| `git-failed` | Git's own message follows, for example when a branch already exists |
+| `git-too-old` | Upgrade git to 2.29 or newer |
+| `rollback-failed` | Run `git parhel doctor --fix`. The message also lists the manual steps |
 
-Other codes: `not-a-repo`, `bare-repo`, `unborn-head`, `inside-git-dir`,
-`dest-is-source`, `dest-inside-git-dir`, `dest-inside-submodule`, `invalid-path`,
-`permission-denied`, `clone-failed`, `interrupted`, `usage`, `io`.
+Less common codes: `not-a-repo`, `bare-repo`, `unborn-head`, `inside-git-dir`,
+`dest-is-source`, `dest-inside-git-dir`, `dest-inside-submodule`,
+`invalid-path`, `permission-denied`, `clone-failed`, `interrupted`, `usage`,
+`io`.
 
 ## Uninstall
 
@@ -275,7 +319,7 @@ rm ~/.local/bin/git-parhel ~/.local/share/man/man1/git-parhel*.1   # install scr
 cargo uninstall parhel                # cargo
 ```
 
-Worktrees you created stay valid. They are regular git worktrees.
+Worktrees you already created keep working. They are regular git worktrees.
 
 ## Development
 
@@ -285,18 +329,20 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-The integration tests run real git against real APFS volumes. They create
-throwaway disk images with `hdiutil`, so no root is needed. They also prove
-copy-on-write physically by comparing block addresses, and use cross-process
-failpoints to reproduce races and crashes deterministically. See
-[docs/test-catalog.md](docs/test-catalog.md) for every covered behavior and
-[CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+The integration tests drive real git on real APFS volumes. They create
+throwaway disk images with `hdiutil`, which needs no root. To check that files
+were cloned rather than copied, they compare physical block addresses, and they
+use failpoints that work across processes to reproduce races and crashes on
+demand. [docs/test-catalog.md](docs/test-catalog.md) lists every behavior the
+tests cover, and [CONTRIBUTING.md](CONTRIBUTING.md) explains how to get
+started.
 
 ## Credits
 
 The idea comes from
-[git-worktree-apfs](https://github.com/dannolan/git-worktree-apfs). parhel is an
-independent Rust implementation with a transactional design.
+[git-worktree-apfs](https://github.com/dannolan/git-worktree-apfs). parhel is a
+separate implementation in Rust, built around a transaction that can be rolled
+back.
 
 ## License
 

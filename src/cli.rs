@@ -13,17 +13,20 @@ use crate::domain::{
     AddRequest, BranchMode, DoctorRequest, Error, ErrorCode, Result, SubmodulePolicy,
 };
 
-const ABOUT: &str = "Copy-on-write Git worktrees: new worktrees in milliseconds, \
-including node_modules, target/ and other ignored build output";
+const ABOUT: &str = "Create Git worktrees with copy-on-write, so node_modules, target/ \
+and other ignored build output come along without using extra disk";
 
 const LONG_ABOUT: &str = "\
-git parhel creates regular Git worktrees by cloning the source worktree with APFS \
-copy-on-write (clonefile) instead of checking files out. Ignored heavyweights \
-(node_modules/, target/, build caches) come along for free: they share disk blocks \
-with the source until either side writes to them.
+git parhel creates regular Git worktrees by cloning the source worktree with the \
+filesystem's copy-on-write support instead of checking files out. Ignored directories \
+such as node_modules/ and target/ come along and share disk blocks with the source \
+until one side changes them.
 
 The result is an ordinary worktree: list, move, lock and remove it with \
-`git worktree`.";
+`git worktree`.
+
+Platform support: macOS on APFS (clonefile). Linux and Windows are planned. \
+Elsewhere, `add --fallback` creates a regular worktree.";
 
 const AFTER_HELP: &str = "\
 Examples:
