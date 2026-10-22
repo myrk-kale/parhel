@@ -1,0 +1,55 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH git-parhel-add 1  "parhel 0.1.0" "Git Manual"
+.SH NAME
+git\-parhel\-add \- Create a copy\-on\-write worktree
+.SH SYNOPSIS
+\fBgit parhel add\fR [\fB\-\-from\fR] [\fB\-\-branch\fR] [\fB\-\-new\-branch\fR] [\fB\-\-detach\fR] [\fB\-\-allow\-dirty\fR] [\fB\-\-fallback\fR] [\fB\-\-submodules\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDESTINATION\fR> [\fIREFERENCE\fR] 
+.SH DESCRIPTION
+Create a worktree at <destination> by cloning the source worktree with copy\-on\-write, then check out [ref] (default: the source HEAD). Only tracked files that differ between the source HEAD and [ref] are rewritten; everything else, ignored files included, is shared with the source until modified.
+.PP
+Nothing is created unless every check passes. The worktree is assembled in a hidden .parhel\-staging\-* directory and published with an atomic, exclusive rename: an existing destination is never touched. Failures and Ctrl\-C roll back completely.
+.SH OPTIONS
+.TP
+\fB\-\-from\fR \fI<path>\fR [default: .]
+Any path inside the source worktree
+.TP
+\fB\-\-branch\fR \fI<name>\fR
+Check out an existing branch
+.TP
+\fB\-\-new\-branch\fR \fI<name>\fR
+Create and check out a new branch
+.TP
+\fB\-\-detach\fR
+Detach HEAD at the target commit
+.TP
+\fB\-\-allow\-dirty\fR
+Carry uncommitted changes from the source (staged changes arrive unstaged)
+.TP
+\fB\-\-fallback\fR
+Use a plain `git worktree add` when copy\-on\-write is impossible (not APFS, different volumes)
+.TP
+\fB\-\-submodules\fR \fI<policy>\fR [default: refuse]
+Initialized submodules: `refuse`, or `reinit` them with their own git dirs
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+refuse
+.IP \(bu 2
+reinit
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIDESTINATION\fR>
+Where to create the worktree (its parent must exist)
+.TP
+[\fIREFERENCE\fR]
+Commit\-ish to check out (default: the source HEAD)
+.SH EXTRA
+Exit status: 0 success, 1 error, 2 usage error, 128+N killed by signal N.
+Errors are printed as `error[<code>]: <message>` with a stable <code>.

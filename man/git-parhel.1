@@ -1,0 +1,39 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH git-parhel 1  "parhel 0.1.0" "Git Manual"
+.SH NAME
+git\-parhel \- Copy\-on\-write Git worktrees: new worktrees in milliseconds, including node_modules, target/ and other ignored build output
+.SH SYNOPSIS
+\fBgit parhel\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+git parhel creates regular Git worktrees by cloning the source worktree with APFS copy\-on\-write (clonefile) instead of checking files out. Ignored heavyweights (node_modules/, target/, build caches) come along for free: they share disk blocks with the source until either side writes to them.
+.PP
+The result is an ordinary worktree: list, move, lock and remove it with `git worktree`.
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+git\-parhel\-add(1)
+Create a copy\-on\-write worktree
+.TP
+git\-parhel\-doctor(1)
+Diagnose the environment and clean up after crashed runs
+.TP
+git\-parhel\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH EXTRA
+Examples:
+  git parhel add ../my\-feature \-\-new\-branch feature/my\-feature
+  git parhel add ../hotfix \-\-branch release/1.2
+  git parhel add ../review \-\-detach v1.4.0
+  git parhel doctor \-\-fix
+
+Remove a worktree with `git worktree remove <path>`.
+Docs: https://github.com/myrk\-kale/parhel
+.SH VERSION
+v0.1.0

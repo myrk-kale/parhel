@@ -13,8 +13,37 @@ use crate::domain::{
     AddRequest, BranchMode, DoctorRequest, Error, ErrorCode, Result, SubmodulePolicy,
 };
 
+const ABOUT: &str = "Copy-on-write Git worktrees: new worktrees in milliseconds, \
+including node_modules, target/ and other ignored build output";
+
+const LONG_ABOUT: &str = "\
+git parhel creates regular Git worktrees by cloning the source worktree with APFS \
+copy-on-write (clonefile) instead of checking files out. Ignored heavyweights \
+(node_modules/, target/, build caches) come along for free: they share disk blocks \
+with the source until either side writes to them.
+
+The result is an ordinary worktree: list, move, lock and remove it with \
+`git worktree`.";
+
+const AFTER_HELP: &str = "\
+Examples:
+  git parhel add ../my-feature --new-branch feature/my-feature
+  git parhel add ../hotfix --branch release/1.2
+  git parhel add ../review --detach v1.4.0
+  git parhel doctor --fix
+
+Remove a worktree with `git worktree remove <path>`.
+Docs: https://github.com/myrk-kale/parhel";
+
 #[derive(Debug, Parser)]
-#[command(name = "git-parhel", bin_name = "git parhel", version, about)]
+#[command(
+    name = "git-parhel",
+    bin_name = "git parhel",
+    version,
+    about = ABOUT,
+    long_about = LONG_ABOUT,
+    after_help = AFTER_HELP
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -23,14 +52,35 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create a copy-on-write worktree.
+    #[command(
+        long_about = "Create a worktree at <destination> by cloning the source worktree with \
+copy-on-write, then check out [ref] (default: the source HEAD). Only tracked files that \
+differ between the source HEAD and [ref] are rewritten; everything else, ignored files \
+included, is shared with the source until modified.
+
+Nothing is created unless every check passes. The worktree is assembled in a hidden \
+.parhel-staging-* directory and published with an atomic, exclusive rename: an existing \
+destination is never touched. Failures and Ctrl-C roll back completely.",
+        after_help = "Exit status: 0 success, 1 error, 2 usage error, 128+N killed by signal N.
+Errors are printed as `error[<code>]: <message>` with a stable <code>."
+    )]
     Add(AddArgs),
     /// Diagnose the environment and clean up after crashed runs.
+    #[command(
+        long_about = "Report what would make `add` refuse or misbehave: a source that is \
+not on APFS, staging directories and worktree registrations left by a crashed run, and \
+.git files of other repositories nested in the source. Runs still in progress are \
+detected and never touched.
+
+With --fix, leftovers are undone using the crashed run's journal: only what that run \
+created is removed, and a worktree that was already published is repaired, not removed."
+    )]
     Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Path inside the source worktree to clone.
+    /// Any path inside the source worktree.
     #[arg(long, value_name = "path", default_value = ".")]
     pub from: PathBuf,
     /// Check out an existing branch.
@@ -42,16 +92,17 @@ pub struct AddArgs {
     /// Detach HEAD at the target commit.
     #[arg(long)]
     pub detach: bool,
-    /// Carry uncommitted changes from the source.
+    /// Carry uncommitted changes from the source (staged changes arrive unstaged).
     #[arg(long)]
     pub allow_dirty: bool,
-    /// Use a plain `git worktree add` when copy-on-write is impossible.
+    /// Use a plain `git worktree add` when copy-on-write is impossible
+    /// (not APFS, different volumes).
     #[arg(long)]
     pub fallback: bool,
-    /// What to do with initialized submodules.
+    /// Initialized submodules: `refuse`, or `reinit` them with their own git dirs.
     #[arg(long, value_enum, value_name = "policy", default_value = "refuse")]
     pub submodules: SubmodulesArg,
-    /// Where to create the worktree.
+    /// Where to create the worktree (its parent must exist).
     pub destination: PathBuf,
     /// Commit-ish to check out (default: the source HEAD).
     pub reference: Option<String>,

@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build universal binary
+    needs: ci
+    runs-on: macos-15
+    outputs:
+      archive: ${{ steps.package.outputs.archive }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Check tag matches Cargo.toml
+        id: version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin --bin git-parhel
+          cargo build --release --locked --target x86_64-apple-darwin --bin git-parhel
+          lipo -create -output git-parhel \
+            target/aarch64-apple-darwin/release/git-parhel \
+            target/x86_64-apple-darwin/release/git-parhel
+          lipo -info git-parhel
+      - name: Smoke test
+        run: |
+          ./git-parhel --version
+          tmp="$(mktemp -d)"
+          git init -q -b main "$tmp/src"
+          git -C "$tmp/src" -c user.name=ci -c user.email=ci@example.com commit -q --allow-empty -m init
+          (cd "$tmp/src" && "$GITHUB_WORKSPACE/git-parhel" add ../wt --new-branch smoke)
+          test -z "$(git -C "$tmp/wt" status --porcelain)"
+      - name: Package
+        id: package
+        run: |
+          archive="parhel-${GITHUB_REF_NAME}-universal-apple-darwin.tar.gz"
+          mkdir -p dist/pkg/man
+          cp git-parhel README.md LICENSE CHANGELOG.md dist/pkg/
+          cp man/*.1 dist/pkg/man/
+          tar -C dist/pkg -czf "dist/${archive}" .
+          (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "dist/${archive}.sha256")" >> "$GITHUB_OUTPUT"
+      - name: Release notes from CHANGELOG
+        run: |
+          awk -v v="${{ steps.version.outputs.version }}" '
+            $0 ~ "^## \\[" v "\\]" {f=1; next}
+            f && /^## \[/ {exit}
+            f {print}
+          ' CHANGELOG.md > dist/notes.md
+          test -s dist/notes.md
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/${{ steps.package.outputs.archive }}" \
+            "dist/${{ steps.package.outputs.archive }}.sha256" \
+            install.sh \
+            --title "parhel ${GITHUB_REF_NAME}" \
+            --notes-file dist/notes.md
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: myrk-kale/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Render formula
+        run: |
+          sed -e "s/@VERSION@/${{ needs.build.outputs.version }}/g" \
+              -e "s/@SHA256@/${{ needs.build.outputs.sha256 }}/g" \
+              packaging/parhel.rb.in > tap/Formula/parhel.rb
+      - name: Audit and test formula
+        run: |
+          brew tap-new --no-git local/verify >/dev/null
+          cp tap/Formula/parhel.rb "$(brew --repository local/verify)/Formula/"
+          brew audit --strict --online local/verify/parhel
+          brew install local/verify/parhel
+          brew test local/verify/parhel
+      - name: Push
+        run: |
+          cd tap
+          git config user.name "parhel release bot"
+          git config user.email "parhel-release@users.noreply.github.com"
+          git add Formula/parhel.rb
+          git commit -m "parhel ${{ needs.build.outputs.version }}"
+          git push

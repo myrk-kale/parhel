@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH git-parhel-doctor 1  "parhel 0.1.0" "Git Manual"
+.SH NAME
+git\-parhel\-doctor \- Diagnose the environment and clean up after crashed runs
+.SH SYNOPSIS
+\fBgit parhel doctor\fR [\fB\-\-from\fR] [\fB\-\-fix\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Report what would make `add` refuse or misbehave: a source that is not on APFS, staging directories and worktree registrations left by a crashed run, and .git files of other repositories nested in the source. Runs still in progress are detected and never touched.
+.PP
+With \-\-fix, leftovers are undone using the crashed run\*(Aqs journal: only what that run created is removed, and a worktree that was already published is repaired, not removed.
+.SH OPTIONS
+.TP
+\fB\-\-from\fR \fI<path>\fR [default: .]
+Path inside the repository to diagnose
+.TP
+\fB\-\-fix\fR
+Repair leftovers of crashed runs
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
