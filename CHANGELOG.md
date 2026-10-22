@@ -11,7 +11,8 @@ All notable changes to this project are documented here. The format follows
 - Visual identity in ASCII ("sun dogs": the source worktree in the middle, its
   copies on each side). README hero, a banner at the top of `git parhel --help`
   (not `-h`), the `o(O)o` mark in release titles and a social preview image.
-  Sources live in `assets/`.
+  Sources live in `assets/`; the README shows the logo as an image with light and
+  dark variants.
 
 ## [0.1.1] - 2026-10-22
 
