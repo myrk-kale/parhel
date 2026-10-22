@@ -60,7 +60,12 @@ fn race_at_publish(interfere: impl FnOnce(&Sandbox, &TestRepo, &Path)) {
 
     interfere(&sb, &src, &dest);
     let dest_before_release = tree_digest(&dest);
-    let worktrees_before_release = src.worktree_paths();
+    // Everything registered except the loser's own in-flight staging registration.
+    let worktrees_before_release: Vec<_> = src
+        .worktree_paths()
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".parhel-staging-"))
+        .collect();
 
     barrier.release();
     let out = finish(a);

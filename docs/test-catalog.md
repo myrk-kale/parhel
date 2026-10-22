@@ -4,10 +4,19 @@ Every behavior `git parhel` must have, as an ID, mapped to the tests that pin it
 Unit test IDs appear as `// U-XXX-NN` comments above the test; integration test
 functions are prefixed with their ID (`i31_...`).
 
-Development is test-first: the suite was written against stubs (`todo!()` bodies and a
-binary that answers `error[not-implemented]`) and every product test failed. Only the
-harness self-tests (`tests/harness.rs`, `failpoint::tests`) passed, since they check the
-tools the other tests depend on.
+Development was test-first: the suite was written against stubs (`todo!()` bodies and a
+binary that answers `error[not-implemented]`) and every product test failed; only the
+harness self-tests (`tests/harness.rs`, `failpoint::tests`) passed. The implementation
+now passes the whole suite (I-124 is ignored unless `git-lfs` is installed).
+
+Spec changes made while implementing (each one a wrong assumption in the test, not a
+weakened guarantee):
+- I-10c: carried-over ignored files show as untracked when the target branch does not
+  ignore them — the same thing `git switch` shows in the source.
+- I-131: copy-on-write needs almost no space, so on a full volume a complete, clean
+  worktree is as valid as a clean failure.
+- I-23e, I-31/I-32, I-119: fixture/expectation bugs (missing parent dir, snapshot taken
+  while the run's own registration existed, comparing HEAD text the test itself moved).
 
 ## How to run
 

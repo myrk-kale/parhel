@@ -106,6 +106,7 @@ fn i23e_unicode_and_spaces() {
     src.write(nfd, "nfd\n");
     src.write("dir with spaces/file name.txt", "s\n");
     src.commit_all("names");
+    fs::create_dir(sb.path("dest with spaces")).unwrap();
     let wt = add_ok(&sb, &src, &sb.path("dest with spaces/ação"));
     wt.assert_clean();
     assert_eq!(wt.read(nfd), "nfd\n");

@@ -7,11 +7,18 @@
 //! - any failure before publish undoes the registration, the branch this run
 //!   created, and the staging dir.
 
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::domain::{AddRequest, Result};
-use crate::ports::{CowFs, Git};
+use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
+use crate::domain::clone_plan::{self, CloneOp, DirLister};
+use crate::domain::exclusions::{ExclusionInput, Exclusions};
+use crate::domain::paths::{self, Placement};
+use crate::domain::{AddRequest, BranchMode, Error, ErrorCode, Result, SubmodulePolicy};
+use crate::git::parse::ensure_supported;
+use crate::ports::{CowFs, Git, RepoInfo, WorktreeAddSpec};
 
 /// Side-effect providers and process context.
 #[derive(Clone, Copy)]
@@ -49,10 +56,410 @@ pub struct AddOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Everything validated before the first mutation.
+struct Plan {
+    repo: RepoInfo,
+    /// Canonical parent + basename.
+    destination: PathBuf,
+    parent: PathBuf,
+    submodules: Vec<PathBuf>,
+}
+
 /// Run `git parhel add`.
 pub fn add(env: &Env<'_>, request: &AddRequest) -> Result<AddOutcome> {
-    let _ = (env, request);
-    todo!("app::add")
+    let plan = validate(env, request)?;
+    if let Some(problem) = cow_problem(env, &plan)? {
+        if !request.fallback {
+            return Err(problem);
+        }
+        return fallback(env, request, &plan, &problem);
+    }
+    crate::failpoint!("after_validate");
+    transaction(env, request, &plan)
+}
+
+fn validate(env: &Env<'_>, request: &AddRequest) -> Result<Plan> {
+    let raw = paths::resolve_destination(env.cwd, &request.destination);
+    if raw.to_str().is_none() {
+        return Err(Error::new(
+            ErrorCode::InvalidPath,
+            format!(
+                "destination `{}` is not valid UTF-8, which APFS cannot store",
+                raw.display()
+            ),
+        ));
+    }
+    let name = paths::destination_basename(&raw)?.to_owned();
+    ensure_supported(env.git.version()?)?;
+    let repo = env
+        .git
+        .discover(&paths::resolve_destination(env.cwd, &request.from))?;
+
+    let raw_parent = raw.parent().unwrap_or(Path::new("/"));
+    if !env.fs.is_dir(raw_parent)? {
+        return Err(Error::new(
+            ErrorCode::DestParentMissing,
+            format!("parent directory `{}` does not exist", raw_parent.display()),
+        ));
+    }
+    let parent = env.fs.canonicalize(raw_parent)?;
+    let destination = parent.join(&name);
+    let placement = paths::classify_destination(&repo.toplevel, &repo.common_dir, &destination)?;
+    if env.fs.exists_no_follow(&destination)? {
+        return Err(Error::new(
+            ErrorCode::DestExists,
+            format!("destination `{}` already exists", destination.display()),
+        ));
+    }
+
+    let submodules = env.git.initialized_submodules(&repo.toplevel)?;
+    if let Placement::InsideSource { relative } = &placement {
+        if let Some(sub) = submodules.iter().find(|s| relative.starts_with(s)) {
+            return Err(Error::new(
+                ErrorCode::DestInsideSubmodule,
+                format!(
+                    "destination `{}` is inside submodule `{}`",
+                    destination.display(),
+                    sub.display()
+                ),
+            ));
+        }
+    }
+    check_source_state(env, request, &repo, &submodules)?;
+    Ok(Plan {
+        repo,
+        destination,
+        parent,
+        submodules,
+    })
+}
+
+/// Refusals about the source itself (after every destination-level check).
+fn check_source_state(
+    env: &Env<'_>,
+    request: &AddRequest,
+    repo: &RepoInfo,
+    submodules: &[PathBuf],
+) -> Result<()> {
+    if let Some(op) = env.git.operation_in_progress(&repo.toplevel)? {
+        return Err(Error::new(
+            ErrorCode::OperationInProgress,
+            format!(
+                "a {op} is in progress in `{}`; finish or abort it first",
+                repo.toplevel.display()
+            ),
+        ));
+    }
+    if env.git.sparse_checkout_enabled(&repo.toplevel)? {
+        return Err(Error::new(
+            ErrorCode::SparseCheckout,
+            format!(
+                "`{}` uses sparse-checkout, which is not supported",
+                repo.toplevel.display()
+            ),
+        ));
+    }
+    if !request.allow_dirty {
+        let flagged = env.git.flagged_index_entries(&repo.toplevel)?;
+        if !flagged.is_empty() {
+            return Err(Error::new(
+                ErrorCode::DirtySource,
+                format!(
+                    "files flagged assume-unchanged/skip-worktree may hide changes: {}; \
+                     commit/clear them or pass --allow-dirty",
+                    list(&flagged)
+                ),
+            ));
+        }
+        if env.git.is_dirty(&repo.toplevel, &[])? {
+            return Err(Error::new(
+                ErrorCode::DirtySource,
+                format!(
+                    "source worktree `{}` has uncommitted changes; commit/stash them or pass \
+                     --allow-dirty",
+                    repo.toplevel.display()
+                ),
+            ));
+        }
+    }
+    if !submodules.is_empty() && request.submodules == SubmodulePolicy::Refuse {
+        return Err(Error::new(
+            ErrorCode::SubmodulesPresent,
+            format!(
+                "initialized submodules would share state with the source: {}; pass \
+                 --submodules=reinit to give them their own git dirs",
+                list(submodules)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why copy-on-write is impossible, if it is.
+fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
+    let source = env.fs.volume(&plan.repo.toplevel)?;
+    let dest = env.fs.volume(&plan.parent)?;
+    let not_apfs = |path: &Path, fs_type: &str| {
+        Error::new(
+            ErrorCode::NotApfs,
+            format!(
+                "`{}` is on {fs_type}, not APFS; pass --fallback for a regular worktree",
+                path.display()
+            ),
+        )
+    };
+    Ok(if source.fs_type != "apfs" {
+        Some(not_apfs(&plan.repo.toplevel, &source.fs_type))
+    } else if dest.fs_type != "apfs" {
+        Some(not_apfs(&plan.parent, &dest.fs_type))
+    } else if source.device != dest.device {
+        Some(Error::new(
+            ErrorCode::CrossVolume,
+            format!(
+                "`{}` and `{}` are on different volumes; pass --fallback for a regular worktree",
+                plan.repo.toplevel.display(),
+                plan.parent.display()
+            ),
+        ))
+    } else {
+        None
+    })
+}
+
+fn fallback(
+    env: &Env<'_>,
+    request: &AddRequest,
+    plan: &Plan,
+    problem: &Error,
+) -> Result<AddOutcome> {
+    env.git.worktree_add(
+        &plan.repo.toplevel,
+        &WorktreeAddSpec {
+            path: plan.destination.clone(),
+            branch: request.branch.clone(),
+            reference: request.reference.clone(),
+            no_checkout: false,
+        },
+    )?;
+    Ok(AddOutcome {
+        destination: plan.destination.clone(),
+        head: env.git.head(&plan.destination)?,
+        strategy: Strategy::Fallback,
+        warnings: vec![format!(
+            "copy-on-write unavailable ({}); created a regular worktree instead",
+            problem.message
+        )],
+    })
+}
+
+fn check_interrupt(env: &Env<'_>) -> Result<()> {
+    if env.interrupted.load(Ordering::SeqCst) {
+        return Err(Error::new(
+            ErrorCode::Interrupted,
+            "interrupted; rolled back",
+        ));
+    }
+    Ok(())
+}
+
+fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOutcome> {
+    let staging = env.fs.create_staging_dir(&plan.parent)?;
+    let mut journal = Journal {
+        repo: plan.repo.toplevel.clone(),
+        ..Journal::default()
+    };
+    let mut lock = None;
+    // A panic (bug) must not skip the rollback: catch it and undo like any error.
+    let assembled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assemble(env, request, plan, &staging, &mut journal, &mut lock)
+    }))
+    .unwrap_or_else(|_| {
+        Err(Error::new(
+            ErrorCode::Io,
+            "internal error (panic); rolled back",
+        ))
+    });
+    match assembled {
+        Ok(staged) => publish(env, plan, &staging, &staged),
+        Err(cause) => {
+            #[cfg(feature = "failpoints")]
+            let _ = crate::failpoint::eval(crate::failpoint::ROLLBACK_FAILPOINT);
+            let undone = rollback(env.git, env.fs, &staging, &journal);
+            drop(lock);
+            match undone {
+                Ok(()) => Err(cause),
+                Err(rb) => Err(Error::new(
+                    ErrorCode::RollbackFailed,
+                    format!("{cause}; {}", rb.message),
+                )),
+            }
+        }
+    }
+}
+
+/// Build the worktree inside `staging`; returns its path.
+fn assemble(
+    env: &Env<'_>,
+    request: &AddRequest,
+    plan: &Plan,
+    staging: &Path,
+    journal: &mut Journal,
+    lock: &mut Option<crate::ports::FileLock>,
+) -> Result<PathBuf> {
+    let (git, fs, repo) = (env.git, env.fs, &plan.repo);
+    let journal_path = staging.join(JOURNAL_FILE);
+    *lock = Some(fs.lock_exclusive(&journal_path)?);
+    fs.write_file(&journal_path, &journal.encode())?;
+    check_interrupt(env)?;
+
+    let staged = paths::staging_worktree_path(staging, &plan.destination);
+    let implicit_branch = match (&request.branch, &request.reference) {
+        (BranchMode::New(name), _) => Some(name.clone()),
+        (BranchMode::Default, None) => {
+            let name = paths::destination_basename(&plan.destination)?
+                .to_string_lossy()
+                .into_owned();
+            (!git.branch_exists(&repo.toplevel, &name)?).then_some(name)
+        }
+        _ => None,
+    };
+    git.worktree_add(
+        &repo.toplevel,
+        &WorktreeAddSpec {
+            path: staged.clone(),
+            branch: request.branch.clone(),
+            reference: request.reference.clone(),
+            no_checkout: true,
+        },
+    )?;
+    journal.worktree = Some(staged.clone());
+    journal.created_branch = implicit_branch;
+    fs.write_file(&journal_path, &journal.encode())?;
+    crate::failpoint!("after_worktree_add");
+    check_interrupt(env)?;
+
+    let exclusions = Exclusions::compute(&ExclusionInput {
+        source_root: repo.toplevel.clone(),
+        staging_dir: Some(staging.to_path_buf()),
+        other_worktrees: git
+            .worktrees(&repo.toplevel)?
+            .into_iter()
+            .map(|w| w.path)
+            .collect(),
+        submodule_paths: plan.submodules.clone(),
+        exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
+    });
+    let ops = clone_plan::plan(
+        &Lister {
+            fs,
+            root: &repo.toplevel,
+        },
+        &exclusions,
+    )?;
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            CloneOp::CreateDir(rel) => fs.create_dir(&staged.join(rel))?,
+            CloneOp::Clone(rel) => fs.clone_entry(&repo.toplevel.join(rel), &staged.join(rel))?,
+        }
+        if i == 0 {
+            crate::failpoint!("mid_clone");
+        }
+        check_interrupt(env)?;
+    }
+    crate::failpoint!("after_clone");
+    check_interrupt(env)?;
+
+    let staging_rel: Vec<PathBuf> = staging
+        .strip_prefix(&repo.toplevel)
+        .map(|r| vec![r.to_path_buf()])
+        .unwrap_or_default();
+    let head_moved = git.head(&repo.toplevel)? != repo.head;
+    if head_moved || (!request.allow_dirty && git.is_dirty(&repo.toplevel, &staging_rel)?) {
+        return Err(Error::new(
+            ErrorCode::SourceChanged,
+            format!(
+                "`{}` changed while the worktree was being created; run the command again",
+                repo.toplevel.display()
+            ),
+        ));
+    }
+
+    let target = git.head(&staged)?;
+    git.reset_index(&staged, &repo.head)?;
+    if target != repo.head {
+        git.checkout_two_way(&staged, &repo.head, &target)?;
+    }
+    crate::failpoint!("after_index");
+    check_interrupt(env)?;
+
+    if request.submodules == SubmodulePolicy::Reinit && !plan.submodules.is_empty() {
+        git.submodules_reinit(&staged, &repo.toplevel, &plan.destination)?;
+        check_interrupt(env)?;
+    }
+    crate::failpoint!("before_rename");
+    check_interrupt(env)?;
+    fs.rename_exclusive(&staged, &plan.destination)?;
+    Ok(staged)
+}
+
+/// After the exclusive rename the worktree is ours and valid: never roll it back.
+fn publish(env: &Env<'_>, plan: &Plan, staging: &Path, _staged: &Path) -> Result<AddOutcome> {
+    let mut warnings = Vec::new();
+    env.git
+        .worktree_repair(&plan.repo.toplevel, &plan.destination)
+        .map_err(|e| {
+            Error::new(
+                e.code,
+                format!(
+                    "{}; the worktree exists at `{}` but its registration is stale: run \
+                 `git worktree repair {}`",
+                    e.message,
+                    plan.destination.display(),
+                    plan.destination.display()
+                ),
+            )
+        })?;
+    if let Err(e) = env.fs.remove_dir_all(staging) {
+        warnings.push(format!(
+            "could not remove `{}`: {}",
+            staging.display(),
+            e.message
+        ));
+    }
+    Ok(AddOutcome {
+        destination: plan.destination.clone(),
+        head: env.git.head(&plan.destination)?,
+        strategy: Strategy::CopyOnWrite,
+        warnings,
+    })
+}
+
+/// [`DirLister`] over the real source tree through the [`CowFs`] port.
+struct Lister<'a> {
+    fs: &'a dyn CowFs,
+    root: &'a Path,
+}
+
+impl DirLister for Lister<'_> {
+    fn list(&self, relative: &Path) -> io::Result<Vec<OsString>> {
+        let path = self.root.join(relative);
+        match self.fs.is_dir(&path) {
+            Ok(true) => {}
+            Ok(false) => return Err(io::Error::from(io::ErrorKind::NotADirectory)),
+            Err(e) => return Err(io::Error::other(e.to_string())),
+        }
+        self.fs
+            .list_dir(&path)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
 }
 
 #[cfg(test)]

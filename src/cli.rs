@@ -6,9 +6,12 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::domain::{AddRequest, DoctorRequest, Result};
+use crate::domain::{
+    AddRequest, BranchMode, DoctorRequest, Error, ErrorCode, Result, SubmodulePolicy,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "git-parhel", bin_name = "git parhel", version, about)]
@@ -87,8 +90,90 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let _ = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
-    todo!("cli::parse")
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let text = e.render().to_string();
+            return match e.kind() {
+                ErrorKind::DisplayHelp => Ok(Invocation::Help(text)),
+                ErrorKind::DisplayVersion => Ok(Invocation::Version(text)),
+                _ => {
+                    let text = text.trim_end();
+                    Err(usage(text.strip_prefix("error: ").unwrap_or(text)))
+                }
+            };
+        }
+    };
+    match cli.command {
+        Command::Add(args) => args.into_request().map(Invocation::Add),
+        Command::Doctor(args) => Ok(Invocation::Doctor(DoctorRequest {
+            from: args.from,
+            fix: args.fix,
+        })),
+    }
+}
+
+fn usage(message: impl Into<String>) -> Error {
+    Error::new(ErrorCode::Usage, message)
+}
+
+/// Branch and ref names can never start with `-` in git; rejecting them keeps
+/// user input from ever being read as an option.
+fn check_name(flag: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(usage(format!("{flag} needs a non-empty value")));
+    }
+    if value.starts_with('-') {
+        return Err(usage(format!("{flag} `{value}` looks like an option")));
+    }
+    Ok(())
+}
+
+impl AddArgs {
+    fn into_request(self) -> Result<AddRequest> {
+        let exclusive = [
+            self.branch.is_some(),
+            self.new_branch.is_some(),
+            self.detach,
+        ];
+        if exclusive.iter().filter(|&&set| set).count() > 1 {
+            return Err(usage(
+                "--branch, --new-branch and --detach are mutually exclusive",
+            ));
+        }
+        if self.branch.is_some() && self.reference.is_some() {
+            return Err(usage(
+                "--branch already names what to check out; drop [ref]",
+            ));
+        }
+        if let Some(b) = &self.branch {
+            check_name("--branch", b)?;
+        }
+        if let Some(b) = &self.new_branch {
+            check_name("--new-branch", b)?;
+        }
+        if let Some(r) = &self.reference {
+            check_name("[ref]", r)?;
+        }
+        let branch = match (self.branch, self.new_branch, self.detach) {
+            (Some(b), _, _) => BranchMode::Existing(b),
+            (_, Some(b), _) => BranchMode::New(b),
+            (_, _, true) => BranchMode::Detach,
+            _ => BranchMode::Default,
+        };
+        Ok(AddRequest {
+            from: self.from,
+            destination: self.destination,
+            reference: self.reference,
+            branch,
+            allow_dirty: self.allow_dirty,
+            fallback: self.fallback,
+            submodules: match self.submodules {
+                SubmodulesArg::Refuse => SubmodulePolicy::Refuse,
+                SubmodulesArg::Reinit => SubmodulePolicy::Reinit,
+            },
+        })
+    }
 }
 
 #[cfg(test)]

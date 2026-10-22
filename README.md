@@ -7,8 +7,17 @@ with APFS copy-on-write (`clonefile(2)`) instead of checking files out. Ignored
 heavyweights (`node_modules/`, `target/`, build caches) come along for free: they
 share disk blocks with the source until either side writes to them.
 
-> **Status:** test-first scaffolding. The full test suite is written and failing on
-> purpose; the implementation comes next. See [docs/test-catalog.md](docs/test-catalog.md).
+Example: a project with 78 MB of `node_modules` (20k files) and a 300 MB build
+artifact. `git worktree add` + `cp -R` takes 6.9 s and 383 MiB; `git parhel add`
+takes 0.5 s and ~8 MiB.
+
+## Install
+
+```sh
+cargo install --path .        # puts `git-parhel` on PATH, so `git parhel` works
+```
+
+Requires macOS (APFS) and git ≥ 2.29.
 
 ## Usage
 

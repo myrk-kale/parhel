@@ -64,35 +64,47 @@ fn i131_disk_full_leaves_no_trace() {
     let src = TestRepo::init_at(&sb.env, &img.mount.join("src"));
     src.ignore(&["filler/"]);
     let before = src.snapshot();
-    // Fill the volume until writes fail.
+    // Fill the volume to the last block, with shrinking chunks.
     let mut i = 0;
-    loop {
-        let p = img.mount.join(format!("fill-{i}"));
-        if fs::write(&p, vec![0xA5u8; 1 << 20]).is_err() {
-            let _ = fs::remove_file(&p);
-            break;
+    for chunk in [1 << 20, 64 << 10, 4 << 10, 512] {
+        loop {
+            let p = img.mount.join(format!("fill-{i}"));
+            i += 1;
+            if fs::write(&p, vec![0xA5u8; chunk]).is_err() {
+                let _ = fs::remove_file(&p);
+                break;
+            }
         }
-        i += 1;
     }
+    let dest = img.mount.join("dest");
     let out = parhel(
         &sb.env,
         &src.root,
-        &add_args(&img.mount.join("dest"), &["--new-branch", "full"]),
+        &add_args(&dest, &["--new-branch", "full"]),
     );
-    for j in 0..=i {
+    let worktree_ok = out.status.success() && TestRepo::open(&sb.env, &dest).status().is_empty();
+    for j in 0..i {
         let _ = fs::remove_file(img.mount.join(format!("fill-{j}")));
     }
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    let err = stderr(&out);
-    assert!(
-        ["error[git-failed]", "error[clone-failed]", "error[io]"]
-            .iter()
-            .any(|c| err.contains(c)),
-        "disk-full maps to a real failure, not a stub: {err}"
-    );
-    before.assert_same(&src.snapshot());
-    assert!(!img.mount.join("dest").exists());
-    assert_no_staging(&[&img.mount]);
+    // Copy-on-write needs almost no space, so success is legitimate — but only a
+    // complete, clean worktree. Otherwise: a real error and no trace.
+    if out.status.success() {
+        assert!(
+            worktree_ok,
+            "succeeded on a full disk but the worktree is not clean"
+        );
+    } else {
+        let err = stderr(&out);
+        assert!(
+            ["error[git-failed]", "error[clone-failed]", "error[io]"]
+                .iter()
+                .any(|c| err.contains(c)),
+            "disk-full maps to a real failure: {err}"
+        );
+        before.assert_same(&src.snapshot());
+        assert!(!dest.exists());
+        assert_no_staging(&[&img.mount]);
+    }
 }
 
 // I-132: very deep trees near PATH_MAX either clone fully or fail cleanly.

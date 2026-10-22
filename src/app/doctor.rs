@@ -1,9 +1,13 @@
 //! `git parhel doctor`: diagnose the environment and repair leftovers of crashed runs.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use crate::app::add::Env;
+use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
+use crate::domain::paths::{self, is_staging_name};
 use crate::domain::{DoctorRequest, Result};
+use crate::ports::RepoInfo;
 
 /// Something worth reporting. `code()` is printed and is a stable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +72,161 @@ impl DoctorReport {
 ///
 /// With `fix`, orphans are undone using their journal (same steps as rollback).
 pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
-    let _ = (env, request);
-    todo!("app::doctor")
+    let repo = env
+        .git
+        .discover(&paths::resolve_destination(env.cwd, &request.from))?;
+    let mut report = DoctorReport::default();
+
+    let volume = env.fs.volume(&repo.toplevel)?;
+    if volume.fs_type != "apfs" {
+        report.findings.push(Finding::NotApfs {
+            path: repo.toplevel.clone(),
+            fs_type: volume.fs_type,
+        });
+    }
+
+    let worktrees = env.git.worktrees(&repo.toplevel)?;
+    let mut scan_dirs: BTreeSet<PathBuf> = worktrees
+        .iter()
+        .filter_map(|w| w.path.parent().map(Path::to_path_buf))
+        .collect();
+    scan_dirs.extend(repo.toplevel.parent().map(Path::to_path_buf));
+    let mut live = Vec::new();
+    let mut orphans = Vec::new();
+    for dir in &scan_dirs {
+        let Ok(names) = env.fs.list_dir(dir) else {
+            continue;
+        };
+        for name in names.iter().filter(|n| is_staging_name(n)) {
+            let staging = dir.join(name);
+            if env.fs.is_locked(&staging.join(JOURNAL_FILE))? {
+                live.push(staging);
+            } else {
+                orphans.push(staging);
+            }
+        }
+    }
+    let in_staging = |path: &Path| path.components().any(|c| is_staging_name(c.as_os_str()));
+    let registrations: Vec<PathBuf> = worktrees
+        .iter()
+        .map(|w| w.path.clone())
+        .filter(|p| in_staging(p) && !live.iter().any(|l| p.starts_with(l)))
+        .collect();
+    report
+        .findings
+        .extend(live.iter().map(|p| Finding::InProgress { path: p.clone() }));
+    report.findings.extend(
+        orphans
+            .iter()
+            .map(|p| Finding::OrphanStaging { path: p.clone() }),
+    );
+    report.findings.extend(
+        registrations
+            .iter()
+            .map(|p| Finding::OrphanRegistration { path: p.clone() }),
+    );
+    find_foreign_gitfiles(env, &repo, &repo.toplevel, &mut report);
+
+    if request.fix {
+        fix(env, &repo, &orphans, &registrations, &mut report);
+    }
+    Ok(report)
+}
+
+/// Undo crashed runs: with a journal, exactly what the run created; without one,
+/// only registrations inside the staging dir and the dir itself (branches are kept:
+/// nothing proves parhel created them).
+fn fix(
+    env: &Env<'_>,
+    repo: &RepoInfo,
+    orphans: &[PathBuf],
+    registrations: &[PathBuf],
+    report: &mut DoctorReport,
+) {
+    let mut handled: Vec<PathBuf> = Vec::new();
+    for staging in orphans {
+        let journal = env
+            .fs
+            .read_file(&staging.join(JOURNAL_FILE))
+            .ok()
+            .and_then(|bytes| Journal::decode(&bytes).ok());
+        let ok = if let Some(journal) = journal {
+            handled.extend(journal.worktree.clone());
+            rollback(env.git, env.fs, staging, &journal).is_ok()
+        } else {
+            let mut ok = true;
+            for reg in registrations.iter().filter(|r| r.starts_with(staging)) {
+                ok &= remove_registration(env, repo, reg);
+                handled.push(reg.clone());
+            }
+            ok && env.fs.remove_dir_all(staging).is_ok()
+        };
+        if ok {
+            report.fixed.push(Finding::OrphanStaging {
+                path: staging.clone(),
+            });
+            for reg in registrations.iter().filter(|r| r.starts_with(staging)) {
+                report
+                    .fixed
+                    .push(Finding::OrphanRegistration { path: reg.clone() });
+            }
+        }
+    }
+    for reg in registrations.iter().filter(|r| !handled.contains(r)) {
+        if remove_registration(env, repo, reg) {
+            report
+                .fixed
+                .push(Finding::OrphanRegistration { path: reg.clone() });
+        }
+    }
+}
+
+fn remove_registration(env: &Env<'_>, repo: &RepoInfo, path: &Path) -> bool {
+    if env.git.worktree_remove_force(&repo.toplevel, path).is_ok() {
+        return true;
+    }
+    let removed = env.fs.remove_dir_all(path).is_ok();
+    removed && env.git.worktree_prune(&repo.toplevel).is_ok()
+}
+
+/// Walk the source (not following symlinks, skipping the root `.git`) for `.git`
+/// files that point outside this repository's common dir.
+fn find_foreign_gitfiles(env: &Env<'_>, repo: &RepoInfo, dir: &Path, report: &mut DoctorReport) {
+    let Ok(mut names) = env.fs.list_dir(dir) else {
+        return;
+    };
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        if dir == repo.toplevel && name == ".git" {
+            continue;
+        }
+        let is_dir = env.fs.is_dir(&path).unwrap_or(false);
+        if is_dir {
+            // Skip symlinked dirs: loops, or trees that are not part of the source.
+            if env.fs.canonicalize(&path).ok().as_deref() != Some(path.as_path()) {
+                continue;
+            }
+            find_foreign_gitfiles(env, repo, &path, report);
+        } else if name == ".git" {
+            let Ok(bytes) = env.fs.read_file(&path) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let Some(target) = text.trim().strip_prefix("gitdir:") else {
+                continue;
+            };
+            let target = paths::resolve_destination(dir, Path::new(target.trim()));
+            let own = target.starts_with(&repo.common_dir)
+                || env
+                    .fs
+                    .canonicalize(&target)
+                    .is_ok_and(|t| t.starts_with(&repo.common_dir));
+            if !own {
+                report.findings.push(Finding::ForeignGitfile { path });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

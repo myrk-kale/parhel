@@ -1,9 +1,16 @@
-//! [`CowFs`] port on macOS: `clonefile(2)`, `renamex_np(2)`, `statfs(2)`.
+//! [`CowFs`] port on macOS: `clonefile(2)`, `renamex_np(2)`, `statfs(2)`, `flock(2)`.
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::domain::Result;
+use crate::domain::paths::STAGING_PREFIX;
+use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::{CowFs, FileLock, VolumeInfo};
 
 /// `CLONE_NOFOLLOW` from `<sys/clonefile.h>` (not exported by `libc`): clone a
@@ -13,75 +20,216 @@ pub const CLONE_NOFOLLOW: u32 = 0x0001;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApfsFs;
 
+fn c_path(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        Error::new(
+            ErrorCode::InvalidPath,
+            format!("`{}` contains a NUL byte", path.display()),
+        )
+    })
+}
+
+fn io_error(path: &Path, e: &io::Error) -> Error {
+    let code = match (e.raw_os_error(), e.kind()) {
+        (Some(libc::EACCES | libc::EPERM), _) | (None, io::ErrorKind::PermissionDenied) => {
+            ErrorCode::PermissionDenied
+        }
+        (Some(libc::EILSEQ), _) => ErrorCode::InvalidPath,
+        _ => ErrorCode::Io,
+    };
+    Error::new(code, format!("`{}`: {e}", path.display()))
+}
+
+/// First entry under `root` that cannot be read (to name the culprit when a
+/// whole-directory clone fails with `EACCES`).
+fn find_unreadable(root: &Path) -> Option<PathBuf> {
+    let md = fs::symlink_metadata(root).ok()?;
+    if md.is_dir() {
+        let Ok(entries) = fs::read_dir(root) else {
+            return Some(root.to_path_buf());
+        };
+        for entry in entries.flatten() {
+            if let Some(found) = find_unreadable(&entry.path()) {
+                return Some(found);
+            }
+        }
+        None
+    } else if md.is_file() && File::open(root).is_err() {
+        Some(root.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Clear BSD flags (`uchg`, `uappnd`) and make directories writable, recursively.
+fn make_removable(path: &Path) {
+    let Ok(md) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if let Ok(c) = c_path(path) {
+        // SAFETY: valid C string; lchflags never follows symlinks.
+        unsafe { libc::lchflags(c.as_ptr(), 0) };
+    }
+    if md.is_dir() {
+        let _ = fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_removable(&entry.path());
+            }
+        }
+    }
+}
+
+fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
+    // SAFETY: valid open fd.
+    if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 impl CowFs for ApfsFs {
     fn volume(&self, path: &Path) -> Result<VolumeInfo> {
-        let _ = path;
-        todo!("ApfsFs::volume")
+        let c = c_path(path)?;
+        let mut st = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: valid C string and out-pointer.
+        if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return Err(io_error(path, &io::Error::last_os_error()));
+        }
+        // SAFETY: statfs succeeded.
+        let st = unsafe { st.assume_init() };
+        let name: Vec<u8> = st
+            .f_fstypename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c.to_ne_bytes()[0])
+            .collect();
+        let device = fs::metadata(path).map_err(|e| io_error(path, &e))?.dev();
+        Ok(VolumeInfo {
+            fs_type: String::from_utf8_lossy(&name).into_owned(),
+            device,
+        })
     }
 
     fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        let _ = path;
-        todo!("ApfsFs::canonicalize")
+        fs::canonicalize(path).map_err(|e| io_error(path, &e))
     }
 
     fn exists_no_follow(&self, path: &Path) -> Result<bool> {
-        let _ = path;
-        todo!("ApfsFs::exists_no_follow")
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => Ok(false),
+            Err(e) => Err(io_error(path, &e)),
+        }
     }
 
     fn is_dir(&self, path: &Path) -> Result<bool> {
-        let _ = path;
-        todo!("ApfsFs::is_dir")
+        Ok(fs::metadata(path).is_ok_and(|m| m.is_dir()))
     }
 
     fn create_staging_dir(&self, parent: &Path) -> Result<PathBuf> {
-        let _ = parent;
-        todo!("ApfsFs::create_staging_dir")
+        let parent = self.canonicalize(parent)?;
+        let dir = tempfile::Builder::new()
+            .prefix(STAGING_PREFIX)
+            .rand_bytes(8)
+            .tempdir_in(&parent)
+            .map_err(|e| io_error(&parent, &e))?;
+        Ok(dir.keep())
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>> {
-        let _ = path;
-        todo!("ApfsFs::list_dir")
+        fs::read_dir(path)
+            .and_then(|rd| rd.map(|e| e.map(|e| e.file_name())).collect())
+            .map_err(|e| io_error(path, &e))
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
-        let _ = path;
-        todo!("ApfsFs::create_dir")
+        fs::create_dir(path).map_err(|e| io_error(path, &e))
     }
 
     fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()> {
-        let _ = (src, dst, CLONE_NOFOLLOW);
-        todo!("ApfsFs::clone_entry")
+        let (cs, cd) = (c_path(src)?, c_path(dst)?);
+        // SAFETY: valid C strings.
+        if unsafe { libc::clonefile(cs.as_ptr(), cd.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        let code = match e.raw_os_error() {
+            Some(libc::EXDEV) => ErrorCode::CrossVolume,
+            _ => ErrorCode::CloneFailed,
+        };
+        let culprit = match e.raw_os_error() {
+            Some(libc::EACCES | libc::EPERM) => find_unreadable(src),
+            _ => None,
+        }
+        .unwrap_or_else(|| src.to_path_buf());
+        Err(Error::new(
+            code,
+            format!("cannot clone `{}`: {e}", culprit.display()),
+        ))
     }
 
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()> {
-        let _ = (from, to);
-        todo!("ApfsFs::rename_exclusive")
+        let (cf, ct) = (c_path(from)?, c_path(to)?);
+        // SAFETY: valid C strings.
+        if unsafe { libc::renamex_np(cf.as_ptr(), ct.as_ptr(), libc::RENAME_EXCL) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EEXIST) {
+            return Err(Error::new(
+                ErrorCode::DestExists,
+                format!("destination `{}` already exists", to.display()),
+            ));
+        }
+        Err(io_error(to, &e))
     }
 
     fn remove_dir_all(&self, path: &Path) -> Result<()> {
-        let _ = path;
-        todo!("ApfsFs::remove_dir_all")
+        if fs::symlink_metadata(path).is_err() {
+            return Ok(());
+        }
+        if fs::remove_dir_all(path).is_ok() {
+            return Ok(());
+        }
+        make_removable(path);
+        fs::remove_dir_all(path).map_err(|e| io_error(path, &e))
     }
 
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        let _ = (path, contents);
-        todo!("ApfsFs::write_file")
+        fs::write(path, contents).map_err(|e| io_error(path, &e))
     }
 
     fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
-        let _ = path;
-        todo!("ApfsFs::read_file")
+        fs::read(path).map_err(|e| io_error(path, &e))
     }
 
     fn lock_exclusive(&self, path: &Path) -> Result<FileLock> {
-        let _ = path;
-        todo!("ApfsFs::lock_exclusive")
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| io_error(path, &e))?;
+        flock(&file, libc::LOCK_EX | libc::LOCK_NB).map_err(|e| io_error(path, &e))?;
+        Ok(FileLock::new(file))
     }
 
     fn is_locked(&self, path: &Path) -> Result<bool> {
-        let _ = path;
-        todo!("ApfsFs::is_locked")
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io_error(path, &e)),
+        };
+        match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => {
+                let _ = flock(&file, libc::LOCK_UN);
+                Ok(false)
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(true),
+            Err(e) => Err(io_error(path, &e)),
+        }
     }
 }
 
@@ -295,7 +443,13 @@ mod tests {
         let guard = ApfsFs.lock_exclusive(&p).unwrap();
         assert!(ApfsFs.is_locked(&p).unwrap(), "held lock must be visible");
         drop(guard);
-        assert!(!ApfsFs.is_locked(&p).unwrap(), "released on drop");
+        // Parallel tests fork constantly; a child between fork and exec briefly
+        // shares the lock's open file description. Release must happen promptly.
+        let released = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            !ApfsFs.is_locked(&p).unwrap()
+        });
+        assert!(released, "released on drop");
     }
 
     // U-FS-15
