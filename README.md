@@ -1,4 +1,25 @@
-# parhel
+<div align="center">
+<pre>
+                .  -  ~  -  .
+           .'                 '.
+         /           |           \
+        |        \   |   /        |
+  (o)---+----     ( O )     ----+---(o)
+        |        /   |   \        |
+         \           |           /
+           '.                 .'
+                '  -  ~  -  '
+
+                         __         __
+       ____  ____ ______/ /_  ___  / /
+      / __ \/ __ `/ ___/ __ \/ _ \/ /
+     / /_/ / /_/ / /  / / / /  __/ /
+    / .___/\__,_/_/  /_/ /_/\___/_/
+   /_/
+
+       copy-on-write git worktrees
+</pre>
+</div>
 
 New Git worktrees in under a second, with `node_modules`, `target/` and the rest
 of your build output already in place.

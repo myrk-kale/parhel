@@ -76,7 +76,7 @@ jobs:
             "dist/${{ steps.package.outputs.archive }}" \
             "dist/${{ steps.package.outputs.archive }}.sha256" \
             install.sh \
-            --title "parhel ${GITHUB_REF_NAME}" \
+            --title "o(O)o parhel ${GITHUB_REF_NAME}" \
             --notes-file dist/notes.md
 
   homebrew:

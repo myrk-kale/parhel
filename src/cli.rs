@@ -38,6 +38,9 @@ Examples:
 Remove a worktree with `git worktree remove <path>`.
 Docs: https://github.com/myrk-kale/parhel";
 
+/// Shown above `--help` only (not `-h`, errors or man pages).
+const BANNER: &str = include_str!("../assets/banner.txt");
+
 #[derive(Debug, Parser)]
 #[command(
     name = "git-parhel",
@@ -45,6 +48,7 @@ Docs: https://github.com/myrk-kale/parhel";
     version,
     about = ABOUT,
     long_about = LONG_ABOUT,
+    before_long_help = BANNER,
     after_help = AFTER_HELP
 )]
 pub struct Cli {
@@ -421,5 +425,21 @@ mod tests {
             add(&["--", "-weird"]).unwrap().destination,
             Path::new("-weird")
         );
+    }
+
+    // U-CLI-15: the banner decorates `--help` only; `-h` stays compact for scripts.
+    #[test]
+    fn banner_only_on_long_help() {
+        let help = |flag: &str| match parse(["git-parhel", flag]).unwrap() {
+            Invocation::Help(text) => text,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            help("--help").starts_with(BANNER.trim_end()),
+            "{}",
+            help("--help")
+        );
+        assert!(help("--help").contains("o   -( O )-   o"));
+        assert!(!help("-h").contains("( O )"));
     }
 }
