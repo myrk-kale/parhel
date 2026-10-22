@@ -47,6 +47,7 @@ something looks wrong, please
 ## Contents
 
 - [Install](#install)
+  - [Skill for AI coding agents](#skill-for-ai-coding-agents)
 - [Quick start](#quick-start)
   - [Read this before you rely on it](#read-this-before-you-rely-on-it)
 - [Commands](#commands)
@@ -106,6 +107,24 @@ git parhel --version
 
 Git runs any executable called `git-<name>` on your `PATH` as `git <name>`, so
 installing the `git-parhel` binary is all the setup there is.
+
+### Skill for AI coding agents
+
+If an agent (Claude Code, Codex, Cursor and others) creates worktrees for you,
+install the parhel skill. It tells the agent when parhel fits, and walks it
+through the steps in
+[Read this before you rely on it](#read-this-before-you-rely-on-it): keeping
+`.env` files that reach shared services out of the copy, checking ignored files
+before removing a worktree, and recovering with `doctor` instead of by hand.
+
+```sh
+npx skills add myrk-kale/parhel          # this project only
+npx skills add myrk-kale/parhel -g       # every project
+```
+
+It uses the [skills](https://github.com/vercel-labs/skills) CLI, which asks
+which agents to install it for. The skill itself is
+[skills/parhel/SKILL.md](skills/parhel/SKILL.md).
 
 ## Quick start
 

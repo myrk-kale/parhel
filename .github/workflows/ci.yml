@@ -26,6 +26,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Agent skill is discoverable
+        run: npx -y skills@1 add . --list 2>&1 | tee /dev/stderr | grep -q "Found 1 skill"
 
   test:
     name: test (macOS, APFS)
