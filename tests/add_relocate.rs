@@ -261,3 +261,43 @@ fn i158_parhelignore_excludes_untracked_paths() {
     TestRepo::open(&sb.env, &dest).assert_clean();
     assert_eq!(tree_digest(&src.root), source_tree);
 }
+
+// I-159: a linked worktree of another repository inside an ignored folder is
+// detached in the copy, so the copy can never move that repository's HEAD/index.
+#[test]
+fn i159_foreign_linked_worktree_is_detached_in_the_copy() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let other = sb.repo("other");
+    let nested = src.path("node_modules/vendored");
+    other.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "vend",
+        nested.to_str().unwrap(),
+    ]);
+    let other_head = other.branch_tip("vend");
+    let dest = sb.path("dest");
+    let out = add_ok(&sb, &src, &dest, &[]);
+    assert!(
+        !dest.join("node_modules/vendored/.git").exists(),
+        "gitfile removed in the copy"
+    );
+    assert!(
+        dest.join("node_modules/vendored/README.md").is_file(),
+        "files kept"
+    );
+    assert!(
+        stderr(&out).contains("node_modules/vendored"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        nested.join(".git").is_file(),
+        "the source's worktree is untouched"
+    );
+    assert_eq!(other.branch_tip("vend"), other_head);
+    TestRepo::open(&sb.env, &nested).assert_clean();
+}

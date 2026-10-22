@@ -130,6 +130,7 @@ pub trait CowFs {
     /// Overwrite an existing file's contents, keeping its permissions (even when
     /// it is read-only).
     fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
     /// Point an existing symlink at `target`.
     fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()>;
     fn read_file(&self, path: &Path) -> Result<Vec<u8>>;

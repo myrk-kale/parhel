@@ -47,6 +47,7 @@ pub enum Call {
         path: PathBuf,
     },
     Rewrite(PathBuf),
+    RemoveFile(PathBuf),
     Relink {
         path: PathBuf,
         target: PathBuf,
@@ -81,6 +82,7 @@ impl Call {
             | Call::RemoveForce { path }
             | Call::Unregister { path }
             | Call::Rewrite(path)
+            | Call::RemoveFile(path)
             | Call::Relink { path, .. }
             | Call::CreateDir(path)
             | Call::RemoveDirAll(path)
@@ -602,6 +604,12 @@ impl CowFs for World {
             Step::Clone,
         )?;
         self.links.borrow_mut().insert(path.into(), target.into());
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.record(Call::RemoveFile(path.into()), Step::Clone)?;
+        self.files.borrow_mut().remove(path);
         Ok(())
     }
 }
