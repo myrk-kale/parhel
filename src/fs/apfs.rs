@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::paths::STAGING_PREFIX;
 use crate::domain::{Error, ErrorCode, Result};
-use crate::ports::{CowFs, EntryKind, FileLock, VolumeInfo};
+use crate::ports::{CowFs, FileLock, Scan, VolumeInfo};
 
 /// `CLONE_NOFOLLOW` from `<sys/clonefile.h>` (not exported by `libc`): clone a
 /// symlink itself instead of its target.
@@ -78,6 +78,24 @@ fn make_removable(path: &Path) {
             }
         }
     }
+}
+
+/// The whole file if it is at most `max_len` bytes, `None` if it is larger.
+fn read_capped(path: &Path, max_len: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    io::Read::read_to_end(
+        &mut io::Read::take(File::open(path)?, max_len + 1),
+        &mut buf,
+    )?;
+    Ok((buf.len() as u64 <= max_len).then_some(buf))
+}
+
+/// Whether any needle (all start with `/`) occurs in `bytes`.
+fn contains_any(bytes: &[u8], needles: &[Vec<u8>]) -> bool {
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'/' && needles.iter().any(|n| bytes[i..].starts_with(n)))
 }
 
 fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
@@ -218,20 +236,88 @@ impl CowFs for ApfsFs {
         fs::read(path).map_err(|e| io_error(path, &e))
     }
 
-    fn entry_kind(&self, path: &Path) -> Result<EntryKind> {
-        let md = fs::symlink_metadata(path).map_err(|e| io_error(path, &e))?;
-        let kind = md.file_type();
-        Ok(if kind.is_symlink() {
-            EntryKind::Symlink {
-                target: fs::read_link(path).map_err(|e| io_error(path, &e))?,
+    fn scan(
+        &self,
+        root: &Path,
+        needles: &[Vec<u8>],
+        max_len: u64,
+        skip: &(dyn Fn(&Path) -> bool + Sync),
+    ) -> Result<Scan> {
+        let mut scan = Scan::default();
+        let mut files = Vec::new();
+        let mut stack = vec![PathBuf::new()];
+        // The listing already says what each entry is: no lstat per file.
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(root.join(&dir)) else {
+                scan.unreadable += 1;
+                continue;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    scan.unreadable += 1;
+                    continue;
+                };
+                let rel = dir.join(entry.file_name());
+                if skip(&rel) {
+                    continue;
+                }
+                let Ok(kind) = entry.file_type() else {
+                    scan.unreadable += 1;
+                    continue;
+                };
+                if kind.is_dir() {
+                    stack.push(rel);
+                } else if kind.is_symlink() {
+                    if let Ok(target) = fs::read_link(entry.path()) {
+                        let bytes = target.as_os_str().as_bytes();
+                        if needles.iter().any(|n| bytes.starts_with(n)) {
+                            scan.links.push((rel, target));
+                        }
+                    }
+                } else if kind.is_file() {
+                    if entry.file_name() == ".git" {
+                        scan.gitfiles.push(rel);
+                    } else if !needles.is_empty() {
+                        files.push(rel);
+                    }
+                }
             }
-        } else if kind.is_dir() {
-            EntryKind::Dir
-        } else if kind.is_file() {
-            EntryKind::File { len: md.len() }
-        } else {
-            EntryKind::Other
-        })
+        }
+        // Reading dominates (one open per file, slower on fresh clones): parallel.
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));
+        let chunk = files.len().div_ceil(threads).max(1);
+        let parts: Vec<(Vec<PathBuf>, usize)> = std::thread::scope(|s| {
+            let handles: Vec<_> = files
+                .chunks(chunk)
+                .map(|part| {
+                    s.spawn(move || {
+                        let (mut hits, mut unreadable) = (Vec::new(), 0);
+                        for rel in part {
+                            match read_capped(&root.join(rel), max_len) {
+                                Ok(Some(bytes)) if contains_any(&bytes, needles) => {
+                                    hits.push(rel.clone());
+                                }
+                                Ok(_) => {}
+                                Err(_) => unreadable += 1,
+                            }
+                        }
+                        (hits, unreadable)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        for (hits, unreadable) in parts {
+            scan.matches.extend(hits);
+            scan.unreadable += unreadable;
+        }
+        scan.matches.sort();
+        scan.gitfiles.sort();
+        scan.links.sort();
+        Ok(scan)
     }
 
     fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()> {
@@ -589,5 +675,45 @@ mod tests {
         );
         assert!(!ApfsFs.is_dir_no_follow(&d.path().join("file")).unwrap());
         assert!(!ApfsFs.is_dir_no_follow(&d.path().join("absent")).unwrap());
+    }
+
+    // U-FS-20: the parallel scan finds exactly the relocation candidates.
+    #[test]
+    fn scan_reports_matches_gitfiles_and_links() {
+        let d = tmp();
+        let root = canon(&d);
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("skipped")).unwrap();
+        fs::write(root.join("a/hit.txt"), b"x=/w/src/y").unwrap();
+        fs::write(root.join("a/miss.txt"), b"nothing").unwrap();
+        fs::write(root.join("a/b/.git"), b"gitdir: /else\n").unwrap();
+        fs::write(root.join("skipped/hit.txt"), b"/w/src").unwrap();
+        let mut big = b"/w/src".to_vec();
+        big.resize(200, b'x');
+        fs::write(root.join("a/big.txt"), &big).unwrap();
+        symlink("/w/src/lib", root.join("a/abs")).unwrap();
+        symlink("rel", root.join("a/rel")).unwrap();
+        for i in 0..500 {
+            fs::write(
+                root.join(format!("a/f{i}")),
+                if i == 250 { &b"/w/src"[..] } else { b"z" },
+            )
+            .unwrap();
+        }
+        let skip = |p: &Path| p == Path::new("skipped");
+        let mut scan = ApfsFs
+            .scan(&root, &[b"/w/src".to_vec()], 100, &skip)
+            .unwrap();
+        scan.matches.sort();
+        assert_eq!(
+            scan.matches,
+            vec![PathBuf::from("a/f250"), PathBuf::from("a/hit.txt")]
+        );
+        assert_eq!(scan.gitfiles, vec![PathBuf::from("a/b/.git")]);
+        assert_eq!(
+            scan.links,
+            vec![(PathBuf::from("a/abs"), PathBuf::from("/w/src/lib"))]
+        );
+        assert_eq!(scan.unreadable, 0);
     }
 }

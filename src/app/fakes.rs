@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::{BranchMode, Error, ErrorCode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
-use crate::ports::{CowFs, EntryKind, FileLock, Git, RepoInfo, VolumeInfo, WorktreeAddSpec};
+use crate::ports::{CowFs, FileLock, Git, RepoInfo, Scan, VolumeInfo, WorktreeAddSpec};
 
 pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -167,6 +167,8 @@ pub struct World {
     pub links: RefCell<HashMap<PathBuf, PathBuf>>,
     /// Files reported as larger than the relocation limit.
     pub big: RefCell<HashSet<PathBuf>>,
+    /// With a failing `WorktreeAdd`: create the `-b` branch before failing, as git does.
+    pub fail_after_branch: Cell<bool>,
     /// Index of the staged worktree (relative paths).
     pub tracked: Vec<PathBuf>,
     /// Result of `parhelignored` for the source.
@@ -241,6 +243,7 @@ impl Default for World {
             commits: HashMap::from([
                 ("HEAD".to_owned(), SHA_A.to_owned()),
                 ("main".to_owned(), SHA_A.to_owned()),
+                ("v1".to_owned(), SHA_B.to_owned()),
             ]),
             staging_head: SHA_A.into(),
             volumes: vec![(p("/"), apfs(1))],
@@ -251,6 +254,7 @@ impl Default for World {
             symlinks: RefCell::default(),
             links: RefCell::default(),
             big: RefCell::default(),
+            fail_after_branch: Cell::new(false),
             tracked: vec![],
             parhelignored: vec![],
             staged_files: vec![],
@@ -404,6 +408,11 @@ impl Git for World {
     }
 
     fn worktree_add(&self, _: &Path, spec: &WorktreeAddSpec) -> Result<()> {
+        if self.fail_after_branch.get() {
+            if let BranchMode::New(name) = &spec.branch {
+                self.branches.borrow_mut().insert(name.clone());
+            }
+        }
         self.record(Call::WorktreeAdd(spec.clone()), Step::WorktreeAdd)?;
         match (&spec.branch, &spec.reference) {
             (BranchMode::New(name), _) => {
@@ -602,31 +611,6 @@ impl CowFs for World {
         Ok(self.locked.borrow().contains(path))
     }
 
-    fn entry_kind(&self, path: &Path) -> Result<EntryKind> {
-        if let Some(target) = self.links.borrow().get(path) {
-            return Ok(EntryKind::Symlink {
-                target: target.clone(),
-            });
-        }
-        if self.symlinks.borrow().contains(path) {
-            return Ok(EntryKind::Symlink {
-                target: PathBuf::new(),
-            });
-        }
-        if self.is_dir_path(path) {
-            return Ok(EntryKind::Dir);
-        }
-        if let Some(bytes) = self.files.borrow().get(path) {
-            let len = if self.big.borrow().contains(path) {
-                crate::domain::relocate::MAX_RELOCATE_BYTES + 1
-            } else {
-                bytes.len() as u64
-            };
-            return Ok(EntryKind::File { len });
-        }
-        Ok(EntryKind::Other)
-    }
-
     fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()> {
         self.record(Call::Rewrite(path.into()), Step::Clone)?;
         self.files
@@ -661,5 +645,56 @@ impl CowFs for World {
             },
             Step::Clone,
         )
+    }
+
+    fn scan(
+        &self,
+        root: &Path,
+        needles: &[Vec<u8>],
+        max_len: u64,
+        skip: &(dyn Fn(&Path) -> bool + Sync),
+    ) -> Result<Scan> {
+        let skipped = |rel: &Path| {
+            rel.ancestors()
+                .any(|a| !a.as_os_str().is_empty() && skip(a))
+        };
+        let contains = |bytes: &[u8]| {
+            needles
+                .iter()
+                .any(|n| bytes.windows(n.len()).any(|w| w == n.as_slice()))
+        };
+        let mut scan = Scan::default();
+        for (path, bytes) in self.files.borrow().iter() {
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() || skipped(rel) {
+                continue;
+            }
+            if rel.file_name().is_some_and(|n| n == ".git") {
+                scan.gitfiles.push(rel.to_path_buf());
+            } else if !self.big.borrow().contains(path)
+                && bytes.len() as u64 <= max_len
+                && contains(bytes)
+            {
+                scan.matches.push(rel.to_path_buf());
+            }
+        }
+        for (path, target) in self.links.borrow().iter() {
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            if !skipped(rel)
+                && needles
+                    .iter()
+                    .any(|n| target.as_os_str().as_encoded_bytes().starts_with(n))
+            {
+                scan.links.push((rel.to_path_buf(), target.clone()));
+            }
+        }
+        scan.matches.sort();
+        scan.gitfiles.sort();
+        scan.links.sort();
+        Ok(scan)
     }
 }
