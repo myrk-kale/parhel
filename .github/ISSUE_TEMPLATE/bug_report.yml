@@ -1,0 +1,32 @@
+name: Bug report
+description: Something did not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: The command you ran, what you expected and what happened instead.
+      placeholder: |
+        git parhel add ../feat --new-branch feat
+        expected: ...
+        got: error[...]: ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `git parhel doctor`
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `git parhel --version; git --version; sw_vers -productVersion`
+    validations:
+      required: true
+  - type: textarea
+    id: repo
+    attributes:
+      label: Repository details
+      description: Anything unusual? Submodules, LFS, very large trees, worktrees inside the repo, external drives...
