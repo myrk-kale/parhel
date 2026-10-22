@@ -42,6 +42,9 @@ pub struct AddRequest {
     /// `--fallback`: use a plain `git worktree add` when copy-on-write is impossible.
     pub fallback: bool,
     pub submodules: SubmodulePolicy,
+    /// Rewrite the source's absolute path in copied untracked files (`--no-relocate`
+    /// turns it off).
+    pub relocate: bool,
 }
 
 /// `git parhel doctor`.

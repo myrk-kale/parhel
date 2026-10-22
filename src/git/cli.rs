@@ -174,6 +174,15 @@ pub fn worktree_add_args(spec: &WorktreeAddSpec) -> Vec<OsString> {
     args
 }
 
+/// `-z` output of `ls-files`, with the trailing `/` git adds to directories removed.
+fn nul_separated_paths(output: &[u8]) -> Vec<PathBuf> {
+    output
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| PathBuf::from(OsStr::from_bytes(p.strip_suffix(b"/").unwrap_or(p))))
+        .collect()
+}
+
 fn git_dir_markers(git_dir: &Path) -> Vec<&'static str> {
     [
         "MERGE_HEAD",
@@ -356,6 +365,32 @@ impl Git for GitCli {
         parse::parse_worktree_list(&z)
     }
 
+    fn tracked_files(&self, worktree: &Path) -> Result<Vec<PathBuf>> {
+        let out = self.run(worktree, &["ls-files", "-z"])?;
+        Ok(nul_separated_paths(&out.stdout))
+    }
+
+    fn parhelignored(&self, worktree: &Path) -> Result<Vec<PathBuf>> {
+        let file = worktree.join(".parhelignore");
+        if !file.is_file() {
+            return Ok(Vec::new());
+        }
+        let mut exclude_from = OsString::from("--exclude-from=");
+        exclude_from.push(&file);
+        let out = self.run(
+            worktree,
+            &[
+                OsStr::new("ls-files"),
+                OsStr::new("-z"),
+                OsStr::new("--others"),
+                OsStr::new("--ignored"),
+                OsStr::new("--directory"),
+                &exclude_from,
+            ],
+        )?;
+        Ok(nul_separated_paths(&out.stdout))
+    }
+
     fn branch_exists(&self, repo: &Path, name: &str) -> Result<bool> {
         self.succeeds(
             repo,
@@ -382,7 +417,23 @@ impl Git for GitCli {
     }
 
     fn worktree_add(&self, repo: &Path, spec: &WorktreeAddSpec) -> Result<()> {
-        self.run(repo, &worktree_add_args(spec)).map(drop)
+        // git reads every registration while adding one; another `worktree add`
+        // running at the same moment can leave one half-written. That race is
+        // transient: retry it, and only it.
+        let mut attempt = 0;
+        loop {
+            match self.run(repo, &worktree_add_args(spec)) {
+                Err(e)
+                    if attempt < 5
+                        && e.message.contains("failed to read")
+                        && e.message.contains("worktrees/") =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                }
+                other => return other.map(drop),
+            }
+        }
     }
 
     fn reset_index(&self, worktree: &Path, commit: &str) -> Result<()> {

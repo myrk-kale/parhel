@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::{BranchMode, Error, ErrorCode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
-use crate::ports::{CowFs, FileLock, Git, RepoInfo, VolumeInfo, WorktreeAddSpec};
+use crate::ports::{CowFs, EntryKind, FileLock, Git, RepoInfo, VolumeInfo, WorktreeAddSpec};
 
 pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -46,6 +46,11 @@ pub enum Call {
     Unregister {
         path: PathBuf,
     },
+    Rewrite(PathBuf),
+    Relink {
+        path: PathBuf,
+        target: PathBuf,
+    },
     BranchDelete(String),
     CreateStaging {
         parent: PathBuf,
@@ -75,6 +80,8 @@ impl Call {
             Call::Repair { path }
             | Call::RemoveForce { path }
             | Call::Unregister { path }
+            | Call::Rewrite(path)
+            | Call::Relink { path, .. }
             | Call::CreateDir(path)
             | Call::RemoveDirAll(path)
             | Call::WriteFile(path)
@@ -145,6 +152,19 @@ pub struct World {
     pub locked: RefCell<HashSet<PathBuf>>,
     /// Directories in `tree` that are really symlinks to directories.
     pub symlinks: RefCell<HashSet<PathBuf>>,
+    /// Symlink targets (absolute paths of links -> target).
+    pub links: RefCell<HashMap<PathBuf, PathBuf>>,
+    /// Files reported as larger than the relocation limit.
+    pub big: RefCell<HashSet<PathBuf>>,
+    /// Index of the staged worktree (relative paths).
+    pub tracked: Vec<PathBuf>,
+    /// Result of `parhelignored` for the source.
+    pub parhelignored: Vec<PathBuf>,
+    /// Untracked content that "appears" in the staged worktree once registered,
+    /// standing in for what the clone would bring: (relative path, bytes).
+    pub staged_files: Vec<(PathBuf, Vec<u8>)>,
+    /// Symlinks that appear in the staged worktree: (relative path, target).
+    pub staged_links: Vec<(PathBuf, PathBuf)>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -216,6 +236,12 @@ impl Default for World {
             files: RefCell::default(),
             locked: RefCell::default(),
             symlinks: RefCell::default(),
+            links: RefCell::default(),
+            big: RefCell::default(),
+            tracked: vec![],
+            parhelignored: vec![],
+            staged_files: vec![],
+            staged_links: vec![],
         }
     }
 }
@@ -256,6 +282,21 @@ impl World {
             self.interrupted.store(true, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    /// Register `path` in its parent directory listing, creating parents as needed.
+    fn add_entry(&self, path: &Path) {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        if !self.tree.borrow().contains_key(parent) {
+            self.add_entry(parent);
+        }
+        let mut tree = self.tree.borrow_mut();
+        let entries = tree.entry(parent.to_path_buf()).or_default();
+        if !entries.iter().any(|e| e == name) {
+            entries.push(name.to_owned());
+        }
     }
 
     fn cloned_anything(&self) -> bool {
@@ -306,6 +347,14 @@ impl Git for World {
         Ok(self.worktrees.clone())
     }
 
+    fn tracked_files(&self, _: &Path) -> Result<Vec<PathBuf>> {
+        Ok(self.tracked.clone())
+    }
+
+    fn parhelignored(&self, _: &Path) -> Result<Vec<PathBuf>> {
+        Ok(self.parhelignored.clone())
+    }
+
     fn branch_exists(&self, _: &Path, name: &str) -> Result<bool> {
         Ok(self.branches.borrow().contains(name))
     }
@@ -336,6 +385,16 @@ impl Git for World {
         self.tree
             .borrow_mut()
             .insert(spec.path.clone(), vec![OsString::from(".git")]);
+        for (rel, bytes) in &self.staged_files {
+            let abs = spec.path.join(rel);
+            self.add_entry(&abs);
+            self.files.borrow_mut().insert(abs, bytes.clone());
+        }
+        for (rel, target) in &self.staged_links {
+            let abs = spec.path.join(rel);
+            self.add_entry(&abs);
+            self.links.borrow_mut().insert(abs, target.clone());
+        }
         Ok(())
     }
 
@@ -499,5 +558,50 @@ impl CowFs for World {
 
     fn is_locked(&self, path: &Path) -> Result<bool> {
         Ok(self.locked.borrow().contains(path))
+    }
+
+    fn entry_kind(&self, path: &Path) -> Result<EntryKind> {
+        if let Some(target) = self.links.borrow().get(path) {
+            return Ok(EntryKind::Symlink {
+                target: target.clone(),
+            });
+        }
+        if self.symlinks.borrow().contains(path) {
+            return Ok(EntryKind::Symlink {
+                target: PathBuf::new(),
+            });
+        }
+        if self.is_dir_path(path) {
+            return Ok(EntryKind::Dir);
+        }
+        if let Some(bytes) = self.files.borrow().get(path) {
+            let len = if self.big.borrow().contains(path) {
+                crate::domain::relocate::MAX_RELOCATE_BYTES + 1
+            } else {
+                bytes.len() as u64
+            };
+            return Ok(EntryKind::File { len });
+        }
+        Ok(EntryKind::Other)
+    }
+
+    fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        self.record(Call::Rewrite(path.into()), Step::Clone)?;
+        self.files
+            .borrow_mut()
+            .insert(path.into(), contents.to_vec());
+        Ok(())
+    }
+
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        self.record(
+            Call::Relink {
+                path: path.into(),
+                target: target.into(),
+            },
+            Step::Clone,
+        )?;
+        self.links.borrow_mut().insert(path.into(), target.into());
+        Ok(())
     }
 }

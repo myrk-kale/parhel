@@ -20,6 +20,8 @@ pub struct ExclusionInput {
     pub submodule_paths: Vec<PathBuf>,
     /// Whether submodule directories are skipped (policy `reinit`).
     pub exclude_submodules: bool,
+    /// Untracked paths the user listed in `.parhelignore`, relative to `source_root`.
+    pub user_excluded: Vec<PathBuf>,
 }
 
 /// Normalized set of excluded paths, relative to the source root.
@@ -44,6 +46,13 @@ impl Exclusions {
         let mut candidates: BTreeSet<PathBuf> = BTreeSet::from([PathBuf::from(".git")]);
         candidates.extend(input.staging_dir.iter().filter_map(nested));
         candidates.extend(input.other_worktrees.iter().filter_map(nested));
+        candidates.extend(
+            input
+                .user_excluded
+                .iter()
+                .filter(|p| p.components().next().is_some())
+                .cloned(),
+        );
         if input.exclude_submodules {
             candidates.extend(
                 input
@@ -244,5 +253,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    // U-EXCL-10: paths from .parhelignore are excluded like any other.
+    #[test]
+    fn user_excluded_paths_are_excluded() {
+        let mut i = input("/w/repo");
+        i.user_excluded = vec![PathBuf::from(".conda"), PathBuf::from("data/cache")];
+        assert_eq!(
+            listed(&Exclusions::compute(&i)),
+            vec![".conda", ".git", "data/cache"]
+        );
     }
 }
