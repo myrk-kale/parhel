@@ -79,6 +79,17 @@ fn i150_relocates_scripts_configs_and_absolute_symlinks() {
 // I-151: the reported case, with a real Python virtual environment.
 #[test]
 fn i151_python_venv_points_at_the_new_worktree() {
+    venv_follows_the_copy("dest");
+}
+
+// I-151b: a destination path with spaces: script shebangs cannot hold it as is
+// (reported: pip failed while parhel reported success).
+#[test]
+fn i151b_python_venv_in_a_path_with_spaces() {
+    venv_follows_the_copy("my dest");
+}
+
+fn venv_follows_the_copy(dest_name: &str) {
     let sb = Sandbox::new();
     let src = project(&sb);
     src.ignore(&[".venv/"]);
@@ -87,7 +98,7 @@ fn i151_python_venv_points_at_the_new_worktree() {
         .current_dir(&src.root)
         .status();
     assert!(made.is_ok_and(|s| s.success()), "setup: python3 -m venv");
-    let dest = sb.path("dest");
+    let dest = sb.path(dest_name);
     add_ok(&sb, &src, &dest, &[]);
 
     let python = dest.join(".venv/bin/python");
@@ -105,6 +116,11 @@ fn i151_python_venv_points_at_the_new_worktree() {
         .current_dir("/")
         .output()
         .unwrap();
+    assert!(
+        pip.status.success(),
+        "pip: {}",
+        String::from_utf8_lossy(&pip.stderr)
+    );
     let pip = String::from_utf8_lossy(&pip.stdout).into_owned();
     assert!(
         pip.contains(dest.join(".venv").to_str().unwrap()),

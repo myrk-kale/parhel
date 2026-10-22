@@ -155,7 +155,41 @@ impl Relocation {
             next = self.next_match(content, copied);
         }
         out.extend_from_slice(&content[copied..]);
-        Rewrite::Rewritten(out)
+        Rewrite::Rewritten(self.shebang_safe(out))
+    }
+
+    /// See U-REL-08.
+    fn shebang_safe(&self, content: Vec<u8>) -> Vec<u8> {
+        let Some(line) = content.strip_prefix(b"#!") else {
+            return content;
+        };
+        let start = line
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let interpreter = &line[start..];
+        if !interpreter.starts_with(&self.replacement)
+            || !self.replacement.iter().any(u8::is_ascii_whitespace)
+        {
+            return content;
+        }
+        let len = self.replacement.len()
+            + interpreter[self.replacement.len()..]
+                .iter()
+                .take_while(|b| !b.is_ascii_whitespace())
+                .count();
+        let mut out = b"#!/usr/bin/env -S \"".to_vec();
+        for &b in &interpreter[..len] {
+            match b {
+                b' ' => out.extend_from_slice(b"\\_"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                b'\\' | b'"' | b'$' => out.extend_from_slice(&[b'\\', b]),
+                _ => out.push(b),
+            }
+        }
+        out.push(b'"');
+        out.extend_from_slice(&interpreter[len..]);
+        out
     }
 
     /// New target for an absolute symlink into the source, if it is one.
@@ -311,6 +345,33 @@ mod tests {
         assert_eq!(
             r.rewrite_link(Path::new("/w/src/a")),
             Some(PathBuf::from("/w/feat/a"))
+        );
+    }
+
+    // U-REL-08: a shebang cannot hold a path with whitespace (the kernel splits
+    // it): when the new interpreter path has some, the line goes through
+    // `env -S` with the path quoted and escaped. Other lines keep the plain path.
+    #[test]
+    fn shebang_with_whitespace_in_new_path_goes_through_env() {
+        let r = Relocation::new(Path::new("/w/src"), Path::new("/w/my feat"));
+        assert_eq!(
+            text(&r.rewrite(b"#!/w/src/.venv/bin/python3 -E\nimport x # /w/src/a\n")),
+            "#!/usr/bin/env -S \"/w/my\\_feat/.venv/bin/python3\" -E\nimport x # /w/my feat/a\n"
+        );
+        assert_eq!(
+            text(&r.rewrite(b"#!/w/src/bin/x")),
+            "#!/usr/bin/env -S \"/w/my\\_feat/bin/x\""
+        );
+        let odd = Relocation::new(Path::new("/w/src"), Path::new("/w/a $b\\\"c"));
+        assert_eq!(
+            text(&odd.rewrite(b"#!/w/src/py\n")),
+            "#!/usr/bin/env -S \"/w/a\\_\\$b\\\\\\\"c/py\"\n"
+        );
+        // Without whitespace, or not in the interpreter position: unchanged form.
+        assert_eq!(text(&rel().rewrite(b"#!/w/src/py\n")), "#!/w/feat/py\n");
+        assert_eq!(
+            text(&r.rewrite(b"#!/bin/sh\n/w/src/py\n")),
+            "#!/bin/sh\n/w/my feat/py\n"
         );
     }
 

@@ -173,15 +173,9 @@ fn i80h_fix_keeps_unreachable_worktrees_registered() {
         "orphaned",
         orphan.to_str().unwrap(),
     ]);
-    // An immutable file makes `git worktree remove` fail, forcing the fallback path
-    // (the one that used to run a repository-wide `git worktree prune`).
-    fs::write(orphan.join("frozen"), "x").unwrap();
-    let st = std::process::Command::new("chflags")
-        .arg("uchg")
-        .arg(orphan.join("frozen"))
-        .status()
-        .unwrap();
-    assert!(st.success());
+    // Its directory is gone: only then is a journal-less registration dropped
+    // (never with a repository-wide `git worktree prune`).
+    fs::remove_dir_all(&orphan).unwrap();
 
     assert_success(&parhel(&sb.env, &src.root, &["doctor", "--fix"]));
     let paths = src.worktree_paths();
@@ -223,4 +217,27 @@ fn i80j_forged_journal_cannot_delete_outside_its_folder() {
         "keep me"
     );
     assert_eq!(src.branch_tip("victim-branch"), tip, "branch kept");
+}
+
+// I-80k: legitimate worktrees whose names only look like parhel's staging must
+// never be removed by `doctor --fix`, with or without a staging-like parent.
+#[test]
+fn i80k_lookalike_worktree_names_are_never_removed() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let direct = src.linked_worktree(&sb.path(".parhel-staging-feature"), "feature");
+    direct.write("work.txt", "uncommitted");
+    fs::create_dir(sb.path(".parhel-staging-x")).unwrap();
+    let nested = src.linked_worktree(&sb.path(".parhel-staging-x/feat"), "feat");
+    nested.write("work.txt", "uncommitted");
+    let registered = src.git(&["worktree", "list", "--porcelain"]);
+
+    parhel(&sb.env, &src.root, &["doctor", "--fix"]);
+    for wt in [&direct, &nested] {
+        assert_eq!(
+            fs::read_to_string(wt.path("work.txt")).unwrap(),
+            "uncommitted"
+        );
+    }
+    assert_eq!(src.git(&["worktree", "list", "--porcelain"]), registered);
 }
