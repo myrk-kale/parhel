@@ -187,3 +187,31 @@ fn i24_sparse_checkout_is_refused() {
     assert!(!dest.exists());
     before.assert_same(&src.snapshot());
 }
+
+// I-23i: a private source (0700) does not produce a world-readable copy.
+#[test]
+fn i23i_directory_permissions_are_not_widened() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.ignore(&[".env"]);
+    src.write(".env", "SECRET=1\n");
+    src.chmod(".env", 0o600);
+    // An ancestor of an excluded path (a nested worktree) is created by parhel.
+    let nested = src.path(".worktrees/other");
+    src.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "other",
+        nested.to_str().unwrap(),
+    ]);
+    src.chmod(".worktrees", 0o700);
+    src.chmod(".", 0o700);
+    let wt = add_ok(&sb, &src, &sb.path("private"));
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&wt.root), 0o700, "worktree root");
+    assert_eq!(mode(&wt.path(".worktrees")), 0o700, "created ancestor");
+    assert_eq!(mode(&wt.path(".env")), 0o600);
+    src.chmod(".", 0o755);
+}

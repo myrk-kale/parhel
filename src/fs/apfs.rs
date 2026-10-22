@@ -251,6 +251,13 @@ impl CowFs for ApfsFs {
         written
     }
 
+    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
+        let perms = fs::metadata(from)
+            .map_err(|e| io_error(from, &e))?
+            .permissions();
+        fs::set_permissions(to, perms).map_err(|e| io_error(to, &e))
+    }
+
     fn remove_file(&self, path: &Path) -> Result<()> {
         fs::remove_file(path).map_err(|e| io_error(path, &e))
     }

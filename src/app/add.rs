@@ -385,7 +385,10 @@ fn assemble(
     )?;
     for (i, op) in ops.iter().enumerate() {
         match op {
-            CloneOp::CreateDir(rel) => fs.create_dir(&staged.join(rel))?,
+            CloneOp::CreateDir(rel) => {
+                fs.create_dir(&staged.join(rel))?;
+                fs.copy_mode(&repo.toplevel.join(rel), &staged.join(rel))?;
+            }
             CloneOp::Clone(rel) => fs.clone_entry(&repo.toplevel.join(rel), &staged.join(rel))?,
         }
         if i == 0 {
@@ -393,6 +396,8 @@ fn assemble(
         }
         check_interrupt(env)?;
     }
+    // `git worktree add` created the root with default permissions.
+    fs.copy_mode(&repo.toplevel, &staged)?;
     crate::failpoint!("after_clone");
     check_interrupt(env)?;
 
@@ -1852,5 +1857,43 @@ mod tests {
         };
         run(&w, &new_branch()).unwrap();
         assert_eq!(w.count(|c| matches!(c, Call::RemoveFile(_))), 0);
+    }
+
+    // U-TXN-72: directories parhel creates (the worktree root, ancestors of excluded
+    // paths) get the source's permission bits, never the defaults.
+    #[test]
+    fn created_directories_copy_the_source_mode() {
+        let mut w = World::default();
+        w.worktrees.push(WorktreeEntry {
+            path: p("/w/repo/wt/other"),
+            ..WorktreeEntry::default()
+        });
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w/repo"))
+            .unwrap()
+            .push(OsString::from("wt"));
+        w.tree
+            .borrow_mut()
+            .insert(p("/w/repo/wt"), vec![OsString::from("other")]);
+        run(&w, &new_branch()).unwrap();
+        for (from, to) in [
+            ("/w/repo", STAGED_WT.to_owned()),
+            ("/w/repo/wt", format!("{STAGED_WT}/wt")),
+        ] {
+            assert_eq!(
+                w.count(|c| *c
+                    == Call::CopyMode {
+                        from: p(from),
+                        to: p(&to)
+                    }),
+                1,
+                "{from} -> {to}: {:#?}",
+                w.calls()
+            );
+        }
+        let mode = w.position(|c| matches!(c, Call::CopyMode { .. })).unwrap();
+        let rename = w.position(|c| matches!(c, Call::Rename { .. })).unwrap();
+        assert!(mode < rename);
     }
 }

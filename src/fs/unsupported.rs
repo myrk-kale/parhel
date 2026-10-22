@@ -69,4 +69,7 @@ impl CowFs for UnsupportedFs {
     fn remove_file(&self, _: &Path) -> Result<()> {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }
+    fn copy_mode(&self, _: &Path, _: &Path) -> Result<()> {
+        Err(Error::not_implemented("copy-on-write on this platform"))
+    }
 }
