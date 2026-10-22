@@ -78,3 +78,44 @@ jobs:
           sed -e "s/@VERSION@/${version}/g" -e "s/@SHA256@/$(printf '0%.0s' $(seq 64))/g" \
             packaging/parhel.rb.in > "$(brew --repository local/verify)/Formula/parhel.rb"
           brew audit --strict local/verify/parhel
+
+  git-versions:
+    name: git ${{ matrix.git }}
+    needs: lint
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 2.29: the oldest supported version. 2.39: the generation Apple ships.
+        git: ["2.29.3", "2.39.5"]
+    env:
+      GIT_PREFIX_DIR: ${{ github.workspace }}/../git-${{ matrix.git }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache git ${{ matrix.git }}
+        id: git-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GIT_PREFIX_DIR }}
+          key: git-${{ matrix.git }}-${{ runner.os }}-${{ runner.arch }}-v1
+      - name: Build git ${{ matrix.git }} from the official tarball
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${{ matrix.git }}.tar.xz" | tar xJ
+          make -C "git-${{ matrix.git }}" -j"$(sysctl -n hw.ncpu)" prefix="$GIT_PREFIX_DIR" \
+            NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 NO_INSTALL_HARDLINKS=1 install
+      - name: Put it first on PATH
+        run: |
+          echo "$GIT_PREFIX_DIR/bin" >> "$GITHUB_PATH"
+          "$GIT_PREFIX_DIR/bin/git" --version | grep -q "git version ${{ matrix.git }}"
+      - name: Test suite against git ${{ matrix.git }}
+        # Skipped on purpose: these test git features newer than this version
+        # (reftable: git 2.45; worktree.useRelativePaths: git 2.48).
+        run: |
+          git --version
+          cargo test --features failpoints --no-fail-fast -- \
+            --skip i105_reftable_repository --skip i105b_reftable_rollback_removes_branch \
+            --skip i180_relative_worktree_links
+

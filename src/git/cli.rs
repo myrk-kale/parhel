@@ -37,6 +37,17 @@ impl GitCli {
         Ok(self.runner.output(cwd, args)?.status.success())
     }
 
+    /// The repository's common git dir, absolute. `--git-common-dir` may answer
+    /// relative to `worktree` (`--path-format=absolute` needs git 2.31).
+    fn common_dir(&self, worktree: &Path) -> Result<PathBuf> {
+        let dir = PathBuf::from(self.stdout(worktree, &["rev-parse", "--git-common-dir"])?);
+        Ok(if dir.is_absolute() {
+            dir
+        } else {
+            worktree.join(dir)
+        })
+    }
+
     fn absolute_git_dir(&self, worktree: &Path) -> Result<PathBuf> {
         Ok(PathBuf::from(
             self.stdout(worktree, &["rev-parse", "--absolute-git-dir"])?,
@@ -273,18 +284,8 @@ impl Git for GitCli {
         let toplevel = canonical(Path::new(
             &self.stdout(cwd, &["rev-parse", "--show-toplevel"])?,
         ))?;
-        let dirs = self.stdout(
-            &toplevel,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-dir",
-                "--git-common-dir",
-            ],
-        )?;
-        let mut dirs = dirs.lines();
-        let git_dir = canonical(Path::new(dirs.next().unwrap_or_default()))?;
-        let common_dir = canonical(Path::new(dirs.next().unwrap_or_default()))?;
+        let git_dir = canonical(&self.absolute_git_dir(&toplevel)?)?;
+        let common_dir = canonical(&self.common_dir(&toplevel)?)?;
         let head = self
             .runner
             .output(&toplevel, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?;
@@ -547,11 +548,7 @@ impl Git for GitCli {
     }
 
     fn unregister_worktree(&self, repo: &Path, path: &Path) -> Result<()> {
-        let common = self.stdout(
-            repo,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )?;
-        let admin_root = Path::new(&common).join("worktrees");
+        let admin_root = self.common_dir(repo)?.join("worktrees");
         let Ok(entries) = fs::read_dir(&admin_root) else {
             return Ok(());
         };
