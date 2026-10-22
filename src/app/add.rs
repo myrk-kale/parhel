@@ -445,9 +445,9 @@ fn assemble(
         &staged,
         &repo.toplevel,
         &exclusions,
-        request
-            .relocate
-            .then(|| Relocation::new(&repo.toplevel, &plan.destination)),
+        request.relocate.then(|| {
+            Relocation::new(&repo.toplevel, &plan.destination).excluding(exclusions.iter())
+        }),
     )?;
     check_interrupt(env)?;
     crate::failpoint!("before_rename");
@@ -506,8 +506,26 @@ fn relocate_tree(
 
     for gitfile in &scan.gitfiles {
         let dir = gitfile.parent().unwrap_or(Path::new(""));
-        if links_outside(env, source, exclusions, dir, &staged.join(gitfile)) {
-            fs.remove_file(&staged.join(gitfile))?;
+        let path = staged.join(gitfile);
+        let detach = match gitfile_link(env, source, exclusions, dir, &path) {
+            GitLink::NotAGitfile | GitLink::InsideCopy { absolute: false } => false,
+            // Copied along, but named by its source path: follow the copy.
+            GitLink::InsideCopy { absolute: true } => match &relocation {
+                Some(relocation) => {
+                    if let Ok(contents) = fs.read_file(&path) {
+                        if let Rewrite::Rewritten(contents) = relocation.rewrite(&contents) {
+                            fs.replace_contents(&path, &contents)?;
+                            report.rewritten += 1;
+                        }
+                    }
+                    false
+                }
+                None => true,
+            },
+            GitLink::Outside => true,
+        };
+        if detach {
+            fs.remove_file(&path)?;
             report.detached.push(dir.to_path_buf());
         }
     }
@@ -538,26 +556,40 @@ fn relocate_tree(
     Ok(report)
 }
 
-/// Whether the gitfile at `path` (copied from `<source>/<dir>/.git`) names a git
-/// dir that is not part of the copy.
-fn links_outside(
+/// Where a copied gitfile leads.
+enum GitLink {
+    NotAGitfile,
+    /// To a git dir that is copied along (`absolute`: named by its source path).
+    InsideCopy {
+        absolute: bool,
+    },
+    /// To a git dir the copy does not contain (another repository, or an
+    /// excluded part of the source).
+    Outside,
+}
+
+/// Classify the gitfile at `path` (copied from `<source>/<dir>/.git`).
+fn gitfile_link(
     env: &Env<'_>,
     source: &Path,
     exclusions: &Exclusions,
     dir: &Path,
     path: &Path,
-) -> bool {
+) -> GitLink {
     let Ok(contents) = env.fs.read_file(path) else {
-        return true;
+        return GitLink::Outside;
     };
     let text = String::from_utf8_lossy(&contents);
     let Some(target) = text.trim().strip_prefix("gitdir:") else {
-        return false;
+        return GitLink::NotAGitfile;
     };
-    let resolved = paths::resolve_destination(&source.join(dir), Path::new(target.trim()));
+    let target = Path::new(target.trim());
+    let resolved = paths::resolve_destination(&source.join(dir), target);
     match resolved.strip_prefix(source) {
-        Ok(inside) => exclusions.is_excluded(inside),
-        Err(_) => true,
+        Ok(inside) if !exclusions.is_excluded(inside) => GitLink::InsideCopy {
+            absolute: target.is_absolute(),
+        },
+        _ => GitLink::Outside,
     }
 }
 
@@ -1959,5 +1991,26 @@ mod tests {
             Journal::decode(&w.files.borrow()[&p(&format!("{STAGING}/{JOURNAL_FILE}"))]).unwrap();
         assert_eq!(j.created_branch.as_deref(), Some("feat"));
         assert_eq!(j.branch_start.as_deref(), Some(SHA_A));
+    }
+
+    // U-TXN-77: a gitfile pointing (absolutely) at a git dir that is copied along
+    // must follow the copy, or the copy would drive the source's nested repo.
+    #[rstest]
+    #[case::relocated(true)]
+    #[case::detached_without_relocation(false)]
+    fn gitfile_into_a_copied_git_dir_follows_the_copy(#[case] relocate: bool) {
+        let w = World {
+            staged_files: vec![(p("nested/.git"), b"gitdir: /w/repo/nestedgit\n".to_vec())],
+            ..World::default()
+        };
+        let mut req = new_branch();
+        req.relocate = relocate;
+        run(&w, &req).unwrap();
+        let gitfile = p(&format!("{STAGED_WT}/nested/.git"));
+        if relocate {
+            assert_eq!(w.files.borrow()[&gitfile], b"gitdir: /w/feat/nestedgit\n");
+        } else {
+            assert_eq!(w.count(|c| *c == Call::RemoveFile(gitfile.clone())), 1);
+        }
     }
 }
