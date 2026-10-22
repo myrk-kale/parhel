@@ -25,7 +25,7 @@ fn fields(output: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(move |_| !trimmed.is_empty())
 }
 
-/// Oldest git supported: `git worktree repair` appeared in 2.29.
+/// Oldest git supported, exercised by CI with git built from source.
 pub const MIN_GIT_VERSION: GitVersion = GitVersion {
     major: 2,
     minor: 29,

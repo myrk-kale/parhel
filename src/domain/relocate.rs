@@ -79,7 +79,7 @@ impl Relocation {
                     if content[i..].starts_with(needle)
                         && content.get(end).is_none_or(|&b| !continues_name(b))
                     {
-                        if self.into_excluded(&content[end..]) {
+                        if self.leads_into_excluded(&content[end..]) {
                             break;
                         }
                         return Some((i, needle.len()));
@@ -105,7 +105,7 @@ impl Relocation {
 
     /// Whether the path continuing at `rest` (right after the source prefix) goes
     /// into an excluded location.
-    fn into_excluded(&self, mut rest: &[u8]) -> bool {
+    fn leads_into_excluded(&self, mut rest: &[u8]) -> bool {
         // Lexically skip `/.` segments and doubled slashes (`<src>/./.git`).
         loop {
             if rest.starts_with(b"/./") || rest == b"/." {
@@ -165,7 +165,7 @@ impl Relocation {
         let needle = self.needles.iter().find(|n| {
             bytes.starts_with(n)
                 && bytes.get(n.len()).is_none_or(|&b| b == b'/')
-                && !self.into_excluded(&bytes[n.len()..])
+                && !self.leads_into_excluded(&bytes[n.len()..])
         })?;
         let mut out = self.replacement.clone();
         out.extend_from_slice(&bytes[needle.len()..]);
@@ -278,7 +278,7 @@ mod tests {
     // other worktrees, submodules, .parhelignore) keep pointing at the source:
     // rewritten, they would name something that does not exist in the copy.
     #[test]
-    fn leaves_references_into_excluded_paths() {
+    fn leaves_references_leads_into_excluded_paths() {
         let r = rel().excluding([Path::new(".git"), Path::new("libs/sub")]);
         assert_eq!(r.rewrite(b"/w/src/.git/objects\n"), Rewrite::Unchanged);
         assert_eq!(r.rewrite(b"/w/src/libs/sub/x"), Rewrite::Unchanged);

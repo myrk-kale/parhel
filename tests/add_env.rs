@@ -250,3 +250,16 @@ fn i65_unicode_branch_name() {
         Some("feat/ação-ç")
     );
 }
+
+// I-64c: without a branch flag the destination's basename becomes git's branch
+// name; one starting with `-` is refused instead of reaching `git branch`.
+#[test]
+fn i64c_option_like_destination_basename_is_refused() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let before = src.snapshot();
+    let out = parhel(&sb.env, &src.root, &["add", "../-m"]);
+    assert_error(&out, "usage");
+    assert!(!sb.path("-m").exists());
+    before.assert_same(&src.snapshot());
+}

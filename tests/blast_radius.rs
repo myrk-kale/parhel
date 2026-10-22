@@ -279,3 +279,30 @@ fn i176_doctor_keeps_unknown_staging_lookalikes() {
         "not parhel's"
     );
 }
+
+// I-175b: the source is a linked worktree whose per-worktree config gives the
+// submodule a different URL than the shared config; reinit must still not write
+// the shared .git/config (reported by a review).
+#[test]
+fn i175b_reinit_with_per_worktree_submodule_config_keeps_shared_config() {
+    let f = fixture();
+    let lib = f.sb.repo("lib");
+    f.src.add_submodule(&lib, "libs/lib");
+    f.src.git(&["config", "extensions.worktreeConfig", "true"]);
+    let linked = f.src.linked_worktree(&f.sb.path("linked-src"), "linked");
+    linked.git(&["submodule", "update", "--init", "-q"]);
+    let own_url = format!("{}/", lib.root.display());
+    linked.git(&["config", "--worktree", "submodule.libs/lib.url", &own_url]);
+    let before = f.foreign(Some("linked"), Some("linked-src"));
+    let out = parhel(
+        &f.sb.env,
+        &linked.root,
+        &add_args(
+            &f.sb.path("feat"),
+            &["--new-branch", "feat", "--submodules=reinit"],
+        ),
+    );
+    assert_success(&out);
+    let after = f.foreign(Some("feat"), Some("feat"));
+    assert_eq!(after.config, before.config, ".git/config changed");
+}
