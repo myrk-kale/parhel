@@ -167,6 +167,8 @@ pub struct World {
     pub links: RefCell<HashMap<PathBuf, PathBuf>>,
     /// Files reported as larger than the relocation limit.
     pub big: RefCell<HashSet<PathBuf>>,
+    /// Message of injected failures (default: a generic one).
+    pub fail_message: RefCell<String>,
     /// With a failing `WorktreeAdd`: create the `-b` branch before failing, as git does.
     pub fail_after_branch: Cell<bool>,
     /// Index of the staged worktree (relative paths).
@@ -254,6 +256,7 @@ impl Default for World {
             symlinks: RefCell::default(),
             links: RefCell::default(),
             big: RefCell::default(),
+            fail_message: RefCell::default(),
             fail_after_branch: Cell::new(false),
             tracked: vec![],
             parhelignored: vec![],
@@ -293,7 +296,13 @@ impl World {
     fn record(&self, call: Call, step: Step) -> Result<()> {
         self.log.borrow_mut().push(call);
         if let Some(code) = self.fail.borrow().get(&step) {
-            return Err(Error::new(*code, format!("injected failure at {step:?}")));
+            let message = self.fail_message.borrow();
+            let message = if message.is_empty() {
+                format!("injected failure at {step:?}")
+            } else {
+                message.clone()
+            };
+            return Err(Error::new(*code, message));
         }
         if self.interrupt_after.get() == Some(step) {
             self.interrupted.store(true, Ordering::SeqCst);

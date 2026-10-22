@@ -107,6 +107,20 @@ fn validate(env: &Env<'_>, request: &AddRequest) -> Result<Plan> {
         ));
     }
     let name = paths::destination_basename(&raw)?.to_owned();
+    // Without a branch flag git turns the basename into a `git branch` argument.
+    if request.branch == BranchMode::Default
+        && request.reference.is_none()
+        && name.as_encoded_bytes().starts_with(b"-")
+    {
+        return Err(Error::new(
+            ErrorCode::Usage,
+            format!(
+                "destination name `{}` starts with `-`, which git would read as an option \
+                 for the implicit branch; pass --new-branch, --branch or --detach",
+                name.to_string_lossy()
+            ),
+        ));
+    }
     ensure_supported(env.git.version()?)?;
     let repo = env
         .git
@@ -358,40 +372,7 @@ fn assemble(
     check_interrupt(env)?;
 
     let staged = paths::staging_worktree_path(staging, &plan.destination);
-    // A branch this run asks git to create. A name that already exists is never
-    // ours: git refuses it, and it must survive the rollback.
-    let new_branch = match (&request.branch, &request.reference) {
-        (BranchMode::New(name), _) => Some(name.clone()),
-        (BranchMode::Default, None) => Some(
-            paths::destination_basename(&plan.destination)?
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        _ => None,
-    };
-    let implicit_branch = match new_branch {
-        Some(name) if !git.branch_exists(&repo.toplevel, &name)? => Some(name),
-        _ => None,
-    };
-    // Journal it before asking: git creates the branch first and can still fail to
-    // add the worktree (e.g. racing another `worktree add`), leaving the branch.
-    if implicit_branch.is_some() {
-        journal.branch_start = Some(match &request.reference {
-            Some(rev) => git.resolve_commit(&repo.toplevel, rev)?,
-            None => repo.head.clone(),
-        });
-        journal.created_branch.clone_from(&implicit_branch);
-        fs.write_file(&journal_path, &journal.encode())?;
-    }
-    git.worktree_add(
-        &repo.toplevel,
-        &WorktreeAddSpec {
-            path: staged.clone(),
-            branch: request.branch.clone(),
-            reference: request.reference.clone(),
-            no_checkout: true,
-        },
-    )?;
+    register(env, request, plan, &staged, journal, &journal_path)?;
     journal.worktree = Some(staged.clone());
     fs.write_file(&journal_path, &journal.encode())?;
     crate::failpoint!("after_worktree_add");
@@ -458,6 +439,62 @@ fn assemble(
     fs.write_file(&journal_path, &journal.encode())?;
     fs.rename_exclusive(&staged, &plan.destination)?;
     Ok(report)
+}
+
+/// `git worktree add --no-checkout` at `staged`, journaling the branch git is
+/// asked to create before asking (git creates it first and can still fail).
+fn register(
+    env: &Env<'_>,
+    request: &AddRequest,
+    plan: &Plan,
+    staged: &Path,
+    journal: &mut Journal,
+    journal_path: &Path,
+) -> Result<()> {
+    let (git, fs, repo) = (env.git, env.fs, &plan.repo);
+    // A branch this run asks git to create. A name that already exists is never
+    // ours: git refuses it, and it must survive the rollback.
+    let new_branch = match (&request.branch, &request.reference) {
+        (BranchMode::New(name), _) => Some(name.clone()),
+        (BranchMode::Default, None) => Some(
+            paths::destination_basename(&plan.destination)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        _ => None,
+    };
+    let implicit_branch = match new_branch {
+        Some(name) if !git.branch_exists(&repo.toplevel, &name)? => Some(name),
+        _ => None,
+    };
+    // Journal it before asking: git creates the branch first and can still fail to
+    // add the worktree (e.g. racing another `worktree add`), leaving the branch.
+    if implicit_branch.is_some() {
+        journal.branch_start = Some(match &request.reference {
+            Some(rev) => git.resolve_commit(&repo.toplevel, rev)?,
+            None => repo.head.clone(),
+        });
+        journal.created_branch.clone_from(&implicit_branch);
+        fs.write_file(journal_path, &journal.encode())?;
+    }
+    let added = git.worktree_add(
+        &repo.toplevel,
+        &WorktreeAddSpec {
+            path: staged.to_path_buf(),
+            branch: request.branch.clone(),
+            reference: request.reference.clone(),
+            no_checkout: true,
+        },
+    );
+    if let Err(e) = added {
+        // Someone created the branch between our check and git's: it is theirs.
+        if e.message.contains("already exists") {
+            journal.created_branch = None;
+            journal.branch_start = None;
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Clone the source into `staged`, minus `exclusions`.
@@ -2012,5 +2049,39 @@ mod tests {
         } else {
             assert_eq!(w.count(|c| *c == Call::RemoveFile(gitfile.clone())), 1);
         }
+    }
+
+    // U-TXN-78: without a branch flag, git derives a branch name from the
+    // destination's basename and passes it to `git branch`: a name starting with
+    // `-` would be read as an option there.
+    #[test]
+    fn refuses_option_like_destination_name_for_the_implicit_branch() {
+        let w = World::default();
+        let mut req = request(BranchMode::Default);
+        req.destination = p("/w/-m");
+        assert_eq!(run(&w, &req).unwrap_err().code, ErrorCode::Usage);
+        assert_no_mutation(&w);
+        // With an explicit branch mode the basename is only a path: fine.
+        let w = World::default();
+        let mut req = new_branch();
+        req.destination = p("/w/-m");
+        run(&w, &req).unwrap();
+    }
+
+    // U-TXN-79: a branch someone else created in the meantime (git refuses with
+    // "already exists") is not this run's, even at the same commit.
+    #[test]
+    fn branch_created_by_someone_else_meanwhile_is_kept() {
+        let w = World::default().failing(Step::WorktreeAdd, ErrorCode::GitFailed);
+        w.fail_message
+            .replace("fatal: a branch named 'feat' already exists".into());
+        w.fail_after_branch.set(true);
+        let _ = run(&w, &new_branch());
+        assert_eq!(
+            w.count(|c| matches!(c, Call::BranchDelete(_))),
+            0,
+            "{:#?}",
+            w.calls()
+        );
     }
 }

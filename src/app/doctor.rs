@@ -886,7 +886,7 @@ mod tests {
 
     /// A staging dir holding a journal written by someone else, pointing at
     /// arbitrary places.
-    fn forged(journal: Journal) -> World {
+    fn forged(journal: &Journal) -> World {
         let w = World::default();
         let staging = p("/w/.parhel-staging-evil");
         w.tree
@@ -911,7 +911,7 @@ mod tests {
     // trusted: nothing outside the staging dir is touched.
     #[test]
     fn forged_journal_cannot_target_paths_outside_its_staging_dir() {
-        let w = forged(Journal {
+        let w = forged(&Journal {
             repo: p("/w/repo"),
             worktree: Some(p("/w/victim")),
             created_branch: Some("victim-branch".into()),
@@ -928,7 +928,7 @@ mod tests {
     // registration really had it checked out.
     #[test]
     fn forged_journal_cannot_delete_branches_it_did_not_check_out() {
-        let w = forged(Journal {
+        let w = forged(&Journal {
             repo: p("/elsewhere/other-repo"),
             worktree: Some(p("/w/.parhel-staging-evil/feat")),
             created_branch: Some("victim-branch".into()),

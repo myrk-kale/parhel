@@ -93,7 +93,16 @@ impl GitCli {
 
     /// Clone each initialized submodule of `source` into `worktree` from the
     /// source's own submodule repository, then recurse.
-    fn reinit_recursive(&self, worktree: &Path, source: &Path, final_path: &Path) -> Result<()> {
+    /// `nested`: `worktree` is a submodule repository created by this run (its
+    /// config belongs to the copy). At the top level the config is the
+    /// repository's shared one, which parhel never writes.
+    fn reinit_recursive(
+        &self,
+        worktree: &Path,
+        source: &Path,
+        final_path: &Path,
+        nested: bool,
+    ) -> Result<()> {
         for path in self.initialized_submodules(source)? {
             let name = self.submodule_name(worktree, &path)?;
             let source_sub = source.join(&path);
@@ -121,9 +130,9 @@ impl GitCli {
             let key = format!("submodule.{name}.url");
             let declared = self.runner.output(source, &["config", "--get", &key])?;
             let current = self.runner.output(worktree, &["config", "--get", &key])?;
-            // Usually already set in the shared config (the source initialized the
-            // submodule): never rewrite a shared file needlessly.
-            if declared.status.success() && declared.stdout != current.stdout {
+            // Only in submodule repositories this run created: the top level's
+            // config is shared with every worktree.
+            if nested && declared.status.success() && declared.stdout != current.stdout {
                 let url = OsStr::from_bytes(declared.stdout.trim_ascii_end()).to_owned();
                 self.run(worktree, &[OsStr::new("config"), OsStr::new(&key), &url])?;
             }
@@ -146,7 +155,7 @@ impl GitCli {
             let mut gitfile = b"gitdir: ".to_vec();
             gitfile.extend_from_slice(module_git_dir.as_os_str().as_bytes());
             gitfile.push(b'\n');
-            self.reinit_recursive(&dest_sub, &source_sub, &final_sub)?;
+            self.reinit_recursive(&dest_sub, &source_sub, &final_sub, true)?;
             fs::write(dest_sub.join(".git"), gitfile)
                 .map_err(|e| Error::new(ErrorCode::Io, format!("{}: {e}", dest_sub.display())))?;
             self.run(
@@ -403,16 +412,15 @@ impl Git for GitCli {
     }
 
     fn resolve_commit(&self, repo: &Path, rev: &str) -> Result<String> {
-        let out = self.stdout(
-            repo,
-            &[
-                "rev-parse",
-                "--verify",
-                "-q",
-                "--end-of-options",
-                &format!("{rev}^{{commit}}"),
-            ],
-        )?;
+        // `rev-parse --end-of-options` needs git 2.30: refuse option-like input here.
+        if rev.starts_with('-') {
+            return Err(Error::new(
+                ErrorCode::Usage,
+                format!("revision `{rev}` looks like an option"),
+            ));
+        }
+        let spec = format!("{rev}^{{commit}}");
+        let out = self.stdout(repo, &["rev-parse", "--verify", "-q", &spec])?;
         parse::parse_object_id(&out)
     }
 
@@ -495,7 +503,7 @@ impl Git for GitCli {
     }
 
     fn submodules_reinit(&self, worktree: &Path, source: &Path, final_path: &Path) -> Result<()> {
-        self.reinit_recursive(worktree, source, final_path)
+        self.reinit_recursive(worktree, source, final_path, false)
     }
 
     fn repoint_worktree(&self, _repo: &Path, old: &Path, new: &Path) -> Result<()> {
@@ -765,5 +773,16 @@ mod tests {
         assert!(!cli.branch_exists(&repo, "gone").unwrap());
         assert!(cli.branch_exists(&repo, "kept").unwrap());
         assert!(!repo.join(".git/packed-refs").exists());
+    }
+
+    // U-GIT-03: a revision that looks like an option never reaches git (works on
+    // git versions whose rev-parse lacks --end-of-options).
+    #[test]
+    fn resolve_commit_refuses_option_like_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = GitCli::default()
+            .resolve_commit(dir.path(), "--output=x")
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage);
     }
 }

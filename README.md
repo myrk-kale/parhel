@@ -291,7 +291,10 @@ runs has `GIT_OPTIONAL_LOCKS=0`, so even `git status` leaves the index alone. It
 does not run `git worktree repair` or `git worktree prune`, because both also
 modify other worktrees' metadata.
 
-`doctor --fix` removes only what a crashed run's journal says it created. It
+`doctor --fix` removes only what a crashed run's journal says it created, and
+it treats the journal as untrusted data: the paths it names must lie inside the
+staging folder it was found in, git only runs in the repository you started
+`doctor` from, and every claim is checked against the disk. It
 deletes that run's branch only if the branch still points at the commit it was
 created on, and it never deletes a `.parhel-staging-*` folder that holds files
 it cannot attribute to parhel.
@@ -380,6 +383,8 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 - Hooks such as `post-checkout` do not run, the same as with
   `git worktree add --no-checkout`. With `--fallback`, git runs them as usual.
 - Destinations inside a submodule's working tree are refused.
+- With `worktree.useRelativePaths` (git 2.48+), the new worktree's links are
+  written as absolute paths. git accepts both forms.
 
 ## FAQ
 

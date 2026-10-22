@@ -363,6 +363,9 @@ fn i150b_references_into_excluded_paths_are_kept() {
     copy.git(&["log", "--oneline", "-1"]);
     let alternates =
         fs::read_to_string(dest.join("vendor/shared/.git/objects/info/alternates")).unwrap();
-    assert!(alternates.starts_with(src.root.to_str().unwrap()), "{alternates}");
+    assert!(
+        alternates.starts_with(src.root.to_str().unwrap()),
+        "{alternates}"
+    );
     assert!(!alternates.contains(dest.to_str().unwrap()), "{alternates}");
 }

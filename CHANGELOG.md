@@ -16,7 +16,24 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 - The declared minimum git version (2.29) was not true: parhel used
-  `rev-parse --path-format=absolute`, which needs git 2.31. It no longer does.
+  `rev-parse --path-format=absolute` (git 2.31) and `rev-parse
+  --end-of-options` (git 2.30). It no longer does.
+- `doctor --fix` trusted any journal it found, so a forged one could make it
+  delete an arbitrary directory or branch. Journals are now validated against
+  the staging folder they sit in, the repository and the disk.
+- Branches are deleted with a compare-and-delete (`git update-ref -d`), which
+  also stops git 2.39 from creating `.git/packed-refs` during a rollback.
+- Relocation no longer rewrites references into paths the copy does not contain
+  (the source's `.git`, other worktrees, submodules, `..`), which broke for
+  example a nested `git clone --shared`.
+- A copied gitfile pointing at a git dir copied along (`--separate-git-dir`)
+  now follows the copy, instead of letting the copy move the source's nested
+  repository.
+- A destination whose name starts with `-` is refused when git would use it as a
+  branch name.
+- A branch created by another process between parhel's check and git's is never
+  deleted by the rollback.
+- Submodule reinit never writes the repository's shared configuration.
 
 ## [0.2.0] - 2026-10-22
 
