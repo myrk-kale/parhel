@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-22
+
 ### Added
 
 - Copied untracked files that recorded the source's absolute path are relocated
@@ -14,6 +16,13 @@ All notable changes to this project are documented here. The format follows
   source's pip and install into the source's environment. Binaries are reported,
   never edited. `--no-relocate` turns this off.
 - `.parhelignore` (gitignore syntax) keeps untracked paths out of the copy.
+
+
+- Visual identity in ASCII ("sun dogs": the source worktree in the middle, its
+  copies on each side). README hero, a banner at the top of `git parhel --help`
+  (not `-h`), the `o(O)o` mark in release titles and a social preview image.
+  Sources live in `assets/`; the README shows the logo as an image with light and
+  dark variants.
 
 ### Fixed
 
@@ -49,14 +58,6 @@ All notable changes to this project are documented here. The format follows
 - A `git worktree add -b` that failed after git had already created the branch
   (racing another `worktree add`) left that branch behind: the branch is now
   journaled before git is asked to create it.
-
-### Added
-
-- Visual identity in ASCII ("sun dogs": the source worktree in the middle, its
-  copies on each side). README hero, a banner at the top of `git parhel --help`
-  (not `-h`), the `o(O)o` mark in release titles and a social preview image.
-  Sources live in `assets/`; the README shows the logo as an image with light and
-  dark variants.
 
 ## [0.1.1] - 2026-10-22
 
@@ -99,6 +100,7 @@ First public release.
 - Submodules no longer keep pointing at the source worktree.
 - Failed runs no longer leave registrations that keep branches "in use".
 
-[Unreleased]: https://github.com/myrk-kale/parhel/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/myrk-kale/parhel/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/myrk-kale/parhel/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/myrk-kale/parhel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/myrk-kale/parhel/releases/tag/v0.1.0
