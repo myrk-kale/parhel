@@ -1,0 +1,56 @@
+[package]
+name = "parhel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Copy-on-write Git worktrees (APFS clonefile) exposed as `git parhel`"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kalemyrk/parhel"
+keywords = ["git", "worktree", "apfs", "copy-on-write", "clonefile"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "git-parhel"
+path = "src/main.rs"
+
+[lib]
+name = "parhel"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compiles in the `failpoint!` hooks driven by the PARHEL_FAILPOINTS env var.
+# Test-only: never enable in release builds.
+failpoints = []
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+libc = "0.2.191"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+assert_fs = "1.1.4"
+predicates = "3.1.4"
+proptest = "1.11.0"
+rstest = "0.28.0"
+serial_test = "4.0.1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
