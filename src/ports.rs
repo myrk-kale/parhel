@@ -83,18 +83,17 @@ pub trait Git {
     fn branch_delete(&self, repo: &Path, name: &str) -> Result<()>;
 }
 
-/// What a path is, without following symlinks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EntryKind {
-    Dir,
-    File {
-        len: u64,
-    },
-    Symlink {
-        target: PathBuf,
-    },
-    /// FIFO, socket, device.
-    Other,
+/// What [`CowFs::scan`] found under a root (paths relative to it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scan {
+    /// Regular files of at most `max_len` bytes containing one of the needles.
+    pub matches: Vec<PathBuf>,
+    /// Regular files named `.git` (gitfiles), wherever they are.
+    pub gitfiles: Vec<PathBuf>,
+    /// Symlinks whose target starts with one of the needles, with that target.
+    pub links: Vec<(PathBuf, PathBuf)>,
+    /// Entries that could not be read.
+    pub unreadable: usize,
 }
 
 /// Filesystem identity of a path's volume.
@@ -129,7 +128,16 @@ pub trait CowFs {
     /// may have copied from the source.
     fn remove_dir_all(&self, path: &Path) -> Result<()>;
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()>;
-    fn entry_kind(&self, path: &Path) -> Result<EntryKind>;
+    /// Walk `root` (not following symlinks, skipping relative paths for which
+    /// `skip` returns true and everything below them) and report candidates for
+    /// relocation. Reads files in parallel: this runs over every untracked file.
+    fn scan(
+        &self,
+        root: &Path,
+        needles: &[Vec<u8>],
+        max_len: u64,
+        skip: &(dyn Fn(&Path) -> bool + Sync),
+    ) -> Result<Scan>;
     /// Overwrite an existing file's contents, keeping its permissions (even when
     /// it is read-only).
     fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()>;

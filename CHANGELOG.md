@@ -46,6 +46,9 @@ All notable changes to this project are documented here. The format follows
   commit it was created on, and never deletes a `.parhel-staging-*` folder that
   holds files other than parhel's journal.
 - Submodule reinit no longer rewrites `.git/config` with values it already has.
+- A `git worktree add -b` that failed after git had already created the branch
+  (racing another `worktree add`) left that branch behind: the branch is now
+  journaled before git is asked to create it.
 
 ### Added
 

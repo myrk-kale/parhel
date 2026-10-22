@@ -20,7 +20,7 @@ use crate::domain::paths::{self, Placement};
 use crate::domain::relocate::{MAX_RELOCATE_BYTES, Relocation, Rewrite};
 use crate::domain::{AddRequest, BranchMode, Error, ErrorCode, Result, SubmodulePolicy};
 use crate::git::parse::ensure_supported;
-use crate::ports::{CowFs, EntryKind, Git, RepoInfo, WorktreeAddSpec};
+use crate::ports::{CowFs, Git, RepoInfo, WorktreeAddSpec};
 
 /// Side-effect providers and process context.
 #[derive(Clone, Copy)]
@@ -358,16 +358,31 @@ fn assemble(
     check_interrupt(env)?;
 
     let staged = paths::staging_worktree_path(staging, &plan.destination);
-    let implicit_branch = match (&request.branch, &request.reference) {
+    // A branch this run asks git to create. A name that already exists is never
+    // ours: git refuses it, and it must survive the rollback.
+    let new_branch = match (&request.branch, &request.reference) {
         (BranchMode::New(name), _) => Some(name.clone()),
-        (BranchMode::Default, None) => {
-            let name = paths::destination_basename(&plan.destination)?
+        (BranchMode::Default, None) => Some(
+            paths::destination_basename(&plan.destination)?
                 .to_string_lossy()
-                .into_owned();
-            (!git.branch_exists(&repo.toplevel, &name)?).then_some(name)
-        }
+                .into_owned(),
+        ),
         _ => None,
     };
+    let implicit_branch = match new_branch {
+        Some(name) if !git.branch_exists(&repo.toplevel, &name)? => Some(name),
+        _ => None,
+    };
+    // Journal it before asking: git creates the branch first and can still fail to
+    // add the worktree (e.g. racing another `worktree add`), leaving the branch.
+    if implicit_branch.is_some() {
+        journal.branch_start = Some(match &request.reference {
+            Some(rev) => git.resolve_commit(&repo.toplevel, rev)?,
+            None => repo.head.clone(),
+        });
+        journal.created_branch.clone_from(&implicit_branch);
+        fs.write_file(&journal_path, &journal.encode())?;
+    }
     git.worktree_add(
         &repo.toplevel,
         &WorktreeAddSpec {
@@ -378,10 +393,6 @@ fn assemble(
         },
     )?;
     journal.worktree = Some(staged.clone());
-    if implicit_branch.is_some() {
-        journal.branch_start = Some(git.head(&staged)?);
-    }
-    journal.created_branch = implicit_branch;
     fs.write_file(&journal_path, &journal.encode())?;
     crate::failpoint!("after_worktree_add");
     check_interrupt(env)?;
@@ -483,105 +494,70 @@ fn relocate_tree(
     exclusions: &Exclusions,
     relocation: Option<Relocation>,
 ) -> Result<RelocationReport> {
-    let walk = Walk {
-        env,
-        staged,
-        source,
-        exclusions,
-        relocation,
-        tracked: env.git.tracked_files(staged)?.into_iter().collect(),
+    let fs = env.fs;
+    let tracked: HashSet<PathBuf> = env.git.tracked_files(staged)?.into_iter().collect();
+    let skip = |rel: &Path| rel == Path::new(".git") || tracked.contains(rel);
+    let needles = relocation.as_ref().map_or(&[][..], Relocation::needles);
+    let scan = fs.scan(staged, needles, MAX_RELOCATE_BYTES, &skip)?;
+    let mut report = RelocationReport {
+        unexamined: scan.unreadable,
+        ..RelocationReport::default()
     };
-    let mut report = RelocationReport::default();
-    walk.dir(Path::new(""), &mut report)?;
+
+    for gitfile in &scan.gitfiles {
+        let dir = gitfile.parent().unwrap_or(Path::new(""));
+        if links_outside(env, source, exclusions, dir, &staged.join(gitfile)) {
+            fs.remove_file(&staged.join(gitfile))?;
+            report.detached.push(dir.to_path_buf());
+        }
+    }
+    let Some(relocation) = relocation else {
+        return Ok(report);
+    };
+    for rel in &scan.matches {
+        let path = staged.join(rel);
+        let Ok(contents) = fs.read_file(&path) else {
+            report.unexamined += 1;
+            continue;
+        };
+        match relocation.rewrite(&contents) {
+            Rewrite::Rewritten(contents) => {
+                fs.replace_contents(&path, &contents)?;
+                report.rewritten += 1;
+            }
+            Rewrite::BinaryReference => report.binaries.push(rel.clone()),
+            Rewrite::Unchanged => {}
+        }
+    }
+    for (rel, target) in &scan.links {
+        if let Some(new_target) = relocation.rewrite_link(target) {
+            fs.replace_symlink(&staged.join(rel), &new_target)?;
+            report.relinked += 1;
+        }
+    }
     Ok(report)
 }
 
-struct Walk<'a> {
-    env: &'a Env<'a>,
-    staged: &'a Path,
-    source: &'a Path,
-    exclusions: &'a Exclusions,
-    relocation: Option<Relocation>,
-    tracked: HashSet<PathBuf>,
-}
-
-impl Walk<'_> {
-    fn dir(&self, dir: &Path, report: &mut RelocationReport) -> Result<()> {
-        let fs = self.env.fs;
-        let Ok(mut names) = fs.list_dir(&self.staged.join(dir)) else {
-            report.unexamined += 1;
-            return Ok(());
-        };
-        names.sort();
-        for name in names {
-            let rel = dir.join(&name);
-            if (dir.as_os_str().is_empty() && name == ".git") || self.tracked.contains(&rel) {
-                continue;
-            }
-            let path = self.staged.join(&rel);
-            // Best effort: an entry that cannot be inspected (a path too long for
-            // the staging location, an unreadable file) is skipped and counted,
-            // never fatal. Writes, on the other hand, must succeed.
-            let Ok(kind) = fs.entry_kind(&path) else {
-                report.unexamined += 1;
-                continue;
-            };
-            match kind {
-                EntryKind::Dir => self.dir(&rel, report)?,
-                EntryKind::File { len } if name == ".git" => {
-                    if len <= MAX_RELOCATE_BYTES && self.links_outside(dir, &path) {
-                        fs.remove_file(&path)?;
-                        report.detached.push(dir.to_path_buf());
-                    }
-                }
-                EntryKind::File { len } if len <= MAX_RELOCATE_BYTES => {
-                    let Some(relocation) = &self.relocation else {
-                        continue;
-                    };
-                    let Ok(contents) = fs.read_file(&path) else {
-                        report.unexamined += 1;
-                        continue;
-                    };
-                    match relocation.rewrite(&contents) {
-                        Rewrite::Rewritten(contents) => {
-                            fs.replace_contents(&path, &contents)?;
-                            report.rewritten += 1;
-                        }
-                        Rewrite::BinaryReference => report.binaries.push(rel),
-                        Rewrite::Unchanged => {}
-                    }
-                }
-                EntryKind::Symlink { target } => {
-                    let new_target = self
-                        .relocation
-                        .as_ref()
-                        .and_then(|r| r.rewrite_link(&target));
-                    if let Some(new_target) = new_target {
-                        fs.replace_symlink(&path, &new_target)?;
-                        report.relinked += 1;
-                    }
-                }
-                EntryKind::File { .. } | EntryKind::Other => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether the gitfile at `path` (copied from `<source>/<dir>/.git`) names a
-    /// git dir that is not part of the copy.
-    fn links_outside(&self, dir: &Path, path: &Path) -> bool {
-        let Ok(contents) = self.env.fs.read_file(path) else {
-            return true;
-        };
-        let text = String::from_utf8_lossy(&contents);
-        let Some(target) = text.trim().strip_prefix("gitdir:") else {
-            return false;
-        };
-        let resolved = paths::resolve_destination(&self.source.join(dir), Path::new(target.trim()));
-        match resolved.strip_prefix(self.source) {
-            Ok(inside) => self.exclusions.is_excluded(inside),
-            Err(_) => true,
-        }
+/// Whether the gitfile at `path` (copied from `<source>/<dir>/.git`) names a git
+/// dir that is not part of the copy.
+fn links_outside(
+    env: &Env<'_>,
+    source: &Path,
+    exclusions: &Exclusions,
+    dir: &Path,
+    path: &Path,
+) -> bool {
+    let Ok(contents) = env.fs.read_file(path) else {
+        return true;
+    };
+    let text = String::from_utf8_lossy(&contents);
+    let Some(target) = text.trim().strip_prefix("gitdir:") else {
+        return false;
+    };
+    let resolved = paths::resolve_destination(&source.join(dir), Path::new(target.trim()));
+    match resolved.strip_prefix(source) {
+        Ok(inside) => exclusions.is_excluded(inside),
+        Err(_) => true,
     }
 }
 
@@ -1341,6 +1317,7 @@ mod tests {
         .failing(Step::CheckoutTwoWay, ErrorCode::CheckoutConflict);
         let mut req = new_branch();
         req.allow_dirty = true;
+        req.reference = Some("v1".into());
         assert_eq!(run(&w, &req).unwrap_err().code, ErrorCode::CheckoutConflict);
         assert_rolled_back(&w, Some("feat"));
     }
@@ -1953,5 +1930,34 @@ mod tests {
         req.allow_dirty = true;
         req.submodules = SubmodulePolicy::Reinit;
         run(&w, &req).unwrap();
+    }
+
+    // U-TXN-75: git creates the `-b` branch before it can fail to add the worktree;
+    // the branch is journaled ahead so the rollback removes it.
+    #[test]
+    fn branch_created_by_a_failed_worktree_add_is_removed() {
+        let w = World::default().failing(Step::WorktreeAdd, ErrorCode::GitFailed);
+        // The fake creates the branch before failing, like git.
+        w.fail_after_branch.set(true);
+        assert_eq!(
+            run(&w, &new_branch()).unwrap_err().code,
+            ErrorCode::GitFailed
+        );
+        assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
+        assert!(!w.branches.borrow().contains("feat"));
+    }
+
+    // U-TXN-76: the journal names the branch before git is asked to create it.
+    #[test]
+    fn branch_is_journaled_before_worktree_add() {
+        let w = World::default().failing(Step::WorktreeAdd, ErrorCode::GitFailed);
+        w.fail
+            .borrow_mut()
+            .insert(Step::RemoveDirAll, ErrorCode::Io);
+        let _ = run(&w, &new_branch());
+        let j =
+            Journal::decode(&w.files.borrow()[&p(&format!("{STAGING}/{JOURNAL_FILE}"))]).unwrap();
+        assert_eq!(j.created_branch.as_deref(), Some("feat"));
+        assert_eq!(j.branch_start.as_deref(), Some(SHA_A));
     }
 }

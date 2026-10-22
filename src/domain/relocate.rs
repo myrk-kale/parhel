@@ -85,6 +85,13 @@ impl Relocation {
         None
     }
 
+    /// The byte strings that may start a reference to the source (for a fast
+    /// pre-filter; [`Self::rewrite`] decides).
+    #[must_use]
+    pub fn needles(&self) -> &[Vec<u8>] {
+        &self.needles
+    }
+
     /// Rewrite every whole-path occurrence of the source in `content`.
     ///
     /// An occurrence must end at a path boundary (end of input, `/`, or a byte that

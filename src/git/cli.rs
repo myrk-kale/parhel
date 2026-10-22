@@ -423,6 +423,12 @@ impl Git for GitCli {
         // git reads every registration while adding one; another `worktree add`
         // running at the same moment can leave one half-written. That race is
         // transient: retry it, and only it.
+        // git creates a `-b` branch before adding the worktree; a failed attempt
+        // can leave it behind, and the retry would then fail on "already exists".
+        let new_branch = match &spec.branch {
+            BranchMode::New(name) if !self.branch_exists(repo, name)? => Some(name),
+            _ => None,
+        };
         let mut attempt = 0;
         loop {
             match self.run(repo, &worktree_add_args(spec)) {
@@ -432,6 +438,11 @@ impl Git for GitCli {
                         && e.message.contains("worktrees/") =>
                 {
                     attempt += 1;
+                    if let Some(name) = new_branch {
+                        if self.branch_exists(repo, name)? {
+                            self.branch_delete(repo, name)?;
+                        }
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
                 }
                 other => return other.map(drop),
