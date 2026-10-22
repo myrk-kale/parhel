@@ -1,25 +1,9 @@
-<div align="center">
-<pre>
-                .  -  ~  -  .
-           .'                 '.
-         /           |           \
-        |        \   |   /        |
-  (o)---+----     ( O )     ----+---(o)
-        |        /   |   \        |
-         \           |           /
-           '.                 .'
-                '  -  ~  -  '
-
-                         __         __
-       ____  ____ ______/ /_  ___  / /
-      / __ \/ __ `/ ___/ __ \/ _ \/ /
-     / /_/ / /_/ / /  / / / /  __/ /
-    / .___/\__,_/_/  /_/ /_/\___/_/
-   /_/
-
-       copy-on-write git worktrees
-</pre>
-</div>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/myrk-kale/parhel/main/assets/logo-dark.png">
+    <img alt="parhel: copy-on-write git worktrees" src="https://raw.githubusercontent.com/myrk-kale/parhel/main/assets/logo-light.png" width="420">
+  </picture>
+</p>
 
 New Git worktrees in under a second, with `node_modules`, `target/` and the rest
 of your build output already in place.
