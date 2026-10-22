@@ -144,3 +144,51 @@ fn i80g_doctor_skips_live_run() {
     assert_success(&finish(child));
     TestRepo::open(&sb.env, &sb.path("dest")).assert_clean();
 }
+
+// I-80h: cleaning a crashed run's registration never drops unrelated worktrees
+// whose directories are unreachable (unmounted disks).
+#[test]
+fn i80h_fix_keeps_unreachable_worktrees_registered() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let external = sb.path("external-wt");
+    src.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "ext",
+        external.to_str().unwrap(),
+    ]);
+    fs::rename(&external, sb.path("external-wt.unmounted")).unwrap();
+    // A crashed run that left a registration inside its staging dir, no journal.
+    let staging = sb.path(".parhel-staging-dead");
+    fs::create_dir(&staging).unwrap();
+    let orphan = staging.join("feat");
+    src.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "orphaned",
+        orphan.to_str().unwrap(),
+    ]);
+    // An immutable file makes `git worktree remove` fail, forcing the fallback path
+    // (the one that used to run a repository-wide `git worktree prune`).
+    fs::write(orphan.join("frozen"), "x").unwrap();
+    let st = std::process::Command::new("chflags")
+        .arg("uchg")
+        .arg(orphan.join("frozen"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    assert_success(&parhel(&sb.env, &src.root, &["doctor", "--fix"]));
+    let paths = src.worktree_paths();
+    assert!(!paths.contains(&orphan), "orphan registration removed");
+    assert!(
+        paths.contains(&external),
+        "unreachable worktree must stay registered"
+    );
+    assert!(!staging.exists());
+}

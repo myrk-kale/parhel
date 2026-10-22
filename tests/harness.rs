@@ -259,3 +259,9 @@ fn publish_failpoint_is_exercised() {
     let src = include_str!("add_rollback.rs");
     assert!(src.contains(&format!("{}=kill", parhel::failpoint::PUBLISH_FAILPOINT)));
 }
+
+#[test]
+fn publish_failpoint_variants_are_exercised() {
+    let src = include_str!("add_rollback.rs");
+    assert!(src.contains("i45c_publication_detected_even_with_lost_journal"));
+}

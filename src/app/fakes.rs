@@ -43,7 +43,9 @@ pub enum Call {
     RemoveForce {
         path: PathBuf,
     },
-    Prune,
+    Unregister {
+        path: PathBuf,
+    },
     BranchDelete(String),
     CreateStaging {
         parent: PathBuf,
@@ -72,6 +74,7 @@ impl Call {
             | Call::SubmodulesReinit { worktree } => vec![worktree],
             Call::Repair { path }
             | Call::RemoveForce { path }
+            | Call::Unregister { path }
             | Call::CreateDir(path)
             | Call::RemoveDirAll(path)
             | Call::WriteFile(path)
@@ -79,7 +82,7 @@ impl Call {
             Call::CreateStaging { parent } => vec![parent],
             Call::Clone { dst, .. } => vec![dst],
             Call::Rename { from, to } => vec![from, to],
-            Call::Prune | Call::BranchDelete(_) => vec![],
+            Call::BranchDelete(_) => vec![],
         }
     }
 }
@@ -374,8 +377,10 @@ impl Git for World {
         self.record(Call::RemoveForce { path: path.into() }, Step::RemoveForce)
     }
 
-    fn worktree_prune(&self, _: &Path) -> Result<()> {
-        self.log.borrow_mut().push(Call::Prune);
+    fn unregister_worktree(&self, _: &Path, path: &Path) -> Result<()> {
+        self.log
+            .borrow_mut()
+            .push(Call::Unregister { path: path.into() });
         Ok(())
     }
 

@@ -360,3 +360,71 @@ fn i45b_crash_after_publish_is_repaired_not_rolled_back() {
     assert_no_staging(&[&sb.root]);
     assert_success(&parhel(&sb.env, &src.root, &["doctor"]));
 }
+
+/// A linked worktree whose directory is unreachable, like one on an unmounted disk.
+fn unreachable_worktree(sb: &Sandbox, src: &TestRepo) -> std::path::PathBuf {
+    let wt = sb.path("external-wt");
+    src.git(&["worktree", "add", "-q", "-b", "ext", wt.to_str().unwrap()]);
+    fs::rename(&wt, sb.path("external-wt.unmounted")).unwrap();
+    wt
+}
+
+// I-46: rollback's fallback cleanup must not drop unrelated registrations.
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[test]
+fn i46_rollback_keeps_unreachable_worktrees_registered() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let external = unreachable_worktree(&sb, &src);
+    // An immutable file makes `git worktree remove` fail, forcing the fallback path.
+    src.write("target/frozen.bin", "frozen");
+    let st = std::process::Command::new("chflags")
+        .arg("uchg")
+        .arg(src.path("target/frozen.bin"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let before = src.snapshot();
+    let out = parhel_with_failpoints(
+        &sb.env,
+        &src.root,
+        &add_args(&sb.path("dest"), &["--new-branch", "d"]),
+        "after_clone=error",
+    );
+    assert_error(&out, "failpoint");
+    assert!(
+        src.worktree_paths().contains(&external),
+        "the unreachable worktree lost its registration"
+    );
+    before.assert_same(&src.snapshot());
+    assert_no_staging(&[&sb.root]);
+}
+
+// I-45c: killed after the rename, and the journal's last write never reached the
+// disk (simulated by truncating it): doctor must still repair, not remove.
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[test]
+fn i45c_publication_detected_even_with_lost_journal() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let dest = sb.path("dest");
+    let out = parhel_with_failpoints(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "published"]),
+        "after_rename=kill",
+    );
+    assert_eq!(out.status.code(), None, "killed by signal");
+    let staging = staging_leftovers(&[&sb.root]);
+    assert_eq!(staging.len(), 1);
+    fs::write(staging[0].join("journal"), b"").unwrap();
+    fs::write(dest.join("work.txt"), "user work").unwrap();
+
+    assert_success(&parhel(&sb.env, &src.root, &["doctor", "--fix"]));
+    let wt = TestRepo::open(&sb.env, &dest);
+    assert_eq!(wt.current_branch().as_deref(), Some("published"));
+    assert_eq!(wt.status(), "?? work.txt");
+    assert!(src.worktree_paths().contains(&wt.root));
+    assert!(src.branch_tip("published").is_some(), "branch kept");
+    assert_no_staging(&[&sb.root]);
+}

@@ -202,8 +202,16 @@ impl CowFs for ApfsFs {
         fs::remove_dir_all(path).map_err(|e| io_error(path, &e))
     }
 
+    /// Durable write: the journal must reach the disk before the step it
+    /// describes. On macOS only `F_FULLFSYNC` flushes the drive's cache.
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        fs::write(path, contents).map_err(|e| io_error(path, &e))
+        let mut file = File::create(path).map_err(|e| io_error(path, &e))?;
+        io::Write::write_all(&mut file, contents).map_err(|e| io_error(path, &e))?;
+        // SAFETY: valid open fd.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            file.sync_all().map_err(|e| io_error(path, &e))?;
+        }
+        Ok(())
     }
 
     fn read_file(&self, path: &Path) -> Result<Vec<u8>> {

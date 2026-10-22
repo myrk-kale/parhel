@@ -67,7 +67,11 @@ pub trait Git {
     fn submodules_reinit(&self, worktree: &Path, source: &Path, final_path: &Path) -> Result<()>;
     fn worktree_repair(&self, repo: &Path, path: &Path) -> Result<()>;
     fn worktree_remove_force(&self, repo: &Path, path: &Path) -> Result<()>;
-    fn worktree_prune(&self, repo: &Path) -> Result<()>;
+    /// Remove only the registration (`.git/worktrees/<id>`) whose gitdir points to
+    /// `path`, even when `path` no longer exists. Unlike `worktree prune`, it never
+    /// touches other worktrees whose directories are merely unreachable (e.g. on an
+    /// unmounted disk). No-op when nothing is registered at `path`.
+    fn unregister_worktree(&self, repo: &Path, path: &Path) -> Result<()>;
     fn branch_delete(&self, repo: &Path, name: &str) -> Result<()>;
 }
 
