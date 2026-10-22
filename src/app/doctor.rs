@@ -152,7 +152,11 @@ fn fix(
             .and_then(|bytes| Journal::decode(&bytes).ok());
         let ok = if let Some(journal) = journal {
             handled.extend(journal.worktree.clone());
-            rollback(env.git, env.fs, staging, &journal).is_ok()
+            if was_published(env, &journal) {
+                complete_publish(env, repo, staging, &journal)
+            } else {
+                rollback(env.git, env.fs, staging, &journal).is_ok()
+            }
         } else {
             let mut ok = true;
             for reg in registrations.iter().filter(|r| r.starts_with(staging)) {
@@ -179,6 +183,24 @@ fn fix(
                 .push(Finding::OrphanRegistration { path: reg.clone() });
         }
     }
+}
+
+/// The run died after its exclusive rename: the staged worktree is gone and the
+/// destination it journaled exists.
+fn was_published(env: &Env<'_>, journal: &Journal) -> bool {
+    let (Some(staged), Some(dest)) = (&journal.worktree, &journal.publish_to) else {
+        return false;
+    };
+    !env.fs.exists_no_follow(staged).unwrap_or(true)
+        && env.fs.exists_no_follow(dest).unwrap_or(false)
+}
+
+/// Finish what the crashed run was doing: point the registration at the destination.
+fn complete_publish(env: &Env<'_>, repo: &RepoInfo, staging: &Path, journal: &Journal) -> bool {
+    let Some(dest) = &journal.publish_to else {
+        return false;
+    };
+    env.git.worktree_repair(&repo.toplevel, dest).is_ok() && env.fs.remove_dir_all(staging).is_ok()
 }
 
 fn remove_registration(env: &Env<'_>, repo: &RepoInfo, path: &Path) -> bool {
@@ -269,6 +291,7 @@ mod tests {
             repo: p("/w/repo"),
             worktree: Some(staging.join("feat")),
             created_branch: Some("feat".into()),
+            publish_to: None,
         };
         w.files
             .borrow_mut()
@@ -461,5 +484,71 @@ mod tests {
         });
         assert_eq!(run(&w, true).findings, vec![]);
         assert_eq!(w.calls(), vec![]);
+    }
+
+    /// `crashed_world`, but the run had recorded its destination before dying.
+    fn crashed_with_publish_intent(renamed: bool) -> World {
+        let w = crashed_world();
+        let staging = p("/w/.parhel-staging-dead");
+        let journal = Journal {
+            repo: p("/w/repo"),
+            worktree: Some(staging.join("feat")),
+            created_branch: Some("feat".into()),
+            publish_to: Some(p("/w/feat")),
+        };
+        w.files
+            .borrow_mut()
+            .insert(staging.join(JOURNAL_FILE), journal.encode());
+        if renamed {
+            w.tree.borrow_mut().remove(&staging.join("feat"));
+            w.tree
+                .borrow_mut()
+                .get_mut(&staging)
+                .unwrap()
+                .retain(|n| n != "feat");
+            w.tree
+                .borrow_mut()
+                .insert(p("/w/feat"), vec![OsString::from(".git")]);
+            w.tree
+                .borrow_mut()
+                .get_mut(&p("/w"))
+                .unwrap()
+                .push(OsString::from("feat"));
+        }
+        w
+    }
+
+    // U-DOC-10: killed between the publishing rename and `worktree repair`: the
+    // destination is a valid worktree and must be repaired, not rolled back.
+    #[test]
+    fn fix_repairs_worktree_published_before_crash() {
+        let w = crashed_with_publish_intent(true);
+        let report = run(&w, true);
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(
+            w.calls(),
+            vec![
+                Call::Repair { path: p("/w/feat") },
+                Call::RemoveDirAll(p("/w/.parhel-staging-dead")),
+            ],
+            "repair, never remove the worktree or its branch"
+        );
+    }
+
+    // U-DOC-11: intent recorded but the rename never happened -> plain rollback.
+    #[test]
+    fn fix_rolls_back_when_rename_did_not_happen() {
+        let w = crashed_with_publish_intent(false);
+        let report = run(&w, true);
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(
+            w.count(|c| *c
+                == Call::RemoveForce {
+                    path: p("/w/.parhel-staging-dead/feat")
+                }),
+            1
+        );
+        assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
+        assert_eq!(w.count(|c| matches!(c, Call::Repair { .. })), 0);
     }
 }

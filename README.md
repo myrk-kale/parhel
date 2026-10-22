@@ -57,7 +57,8 @@ git parhel doctor [--fix]
 - A failed or interrupted run removes the worktree registration, the branch it
   created (never a pre-existing one) and its staging directory. After a crash,
   `git parhel doctor --fix` does the same using the run's journal. A run that is
-  still alive holds a lock on its journal and is never touched by `doctor`.
+  still alive holds a lock on its journal and is never touched by `doctor`. A run
+  killed right after publishing is completed (repaired), never undone.
 - SIGINT, SIGTERM and SIGHUP roll back and exit with `128 + signal`; further signals
   during rollback are ignored until cleanup finishes.
 

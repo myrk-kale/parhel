@@ -140,6 +140,8 @@ pub struct World {
     pub files: RefCell<HashMap<PathBuf, Vec<u8>>>,
     /// Paths whose `flock` is held by another (live) process.
     pub locked: RefCell<HashSet<PathBuf>>,
+    /// Directories in `tree` that are really symlinks to directories.
+    pub symlinks: RefCell<HashSet<PathBuf>>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -210,6 +212,7 @@ impl Default for World {
             tree: RefCell::new(tree),
             files: RefCell::default(),
             locked: RefCell::default(),
+            symlinks: RefCell::default(),
         }
     }
 }
@@ -405,6 +408,10 @@ impl CowFs for World {
 
     fn is_dir(&self, path: &Path) -> Result<bool> {
         Ok(self.is_dir_path(path))
+    }
+
+    fn is_dir_no_follow(&self, path: &Path) -> Result<bool> {
+        Ok(self.is_dir_path(path) && !self.symlinks.borrow().contains(path))
     }
 
     fn create_staging_dir(&self, parent: &Path) -> Result<PathBuf> {

@@ -253,3 +253,9 @@ fn rollback_failpoint_is_exercised() {
     let src = include_str!("add_rollback.rs");
     assert!(src.contains(&format!("\"{}\"", parhel::failpoint::ROLLBACK_FAILPOINT)));
 }
+
+#[test]
+fn publish_failpoint_is_exercised() {
+    let src = include_str!("add_rollback.rs");
+    assert!(src.contains(&format!("{}=kill", parhel::failpoint::PUBLISH_FAILPOINT)));
+}

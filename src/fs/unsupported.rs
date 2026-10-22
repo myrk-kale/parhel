@@ -24,6 +24,9 @@ impl CowFs for UnsupportedFs {
     fn is_dir(&self, _: &Path) -> Result<bool> {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }
+    fn is_dir_no_follow(&self, _: &Path) -> Result<bool> {
+        Err(Error::not_implemented("copy-on-write on this platform"))
+    }
     fn create_staging_dir(&self, _: &Path) -> Result<PathBuf> {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }

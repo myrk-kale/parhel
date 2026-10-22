@@ -319,3 +319,44 @@ fn i44d_signals_during_rollback_do_not_abort_cleanup() {
     assert_error(&out, "failpoint");
     assert_no_trace(&sb, &src, &before, "topic");
 }
+
+// I-45b: killed after the publishing rename, before `worktree repair`. The worktree
+// at the destination is valid; `doctor --fix` must repair it, never roll it back.
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[test]
+fn i45b_crash_after_publish_is_repaired_not_rolled_back() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let dest = sb.path("dest");
+    let out = parhel_with_failpoints(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "published"]),
+        "after_rename=kill",
+    );
+    assert_eq!(out.status.code(), None, "killed by signal");
+    assert!(
+        dest.join(".git").is_file(),
+        "rename happened before the crash"
+    );
+    fs::write(dest.join("first-work.txt"), "user started working").unwrap();
+
+    let report = parhel(&sb.env, &src.root, &["doctor"]);
+    assert_eq!(report.status.code(), Some(1), "{}", stdout(&report));
+
+    assert_success(&parhel(&sb.env, &src.root, &["doctor", "--fix"]));
+    let wt = TestRepo::open(&sb.env, &dest);
+    assert_eq!(wt.current_branch().as_deref(), Some("published"));
+    assert_eq!(
+        wt.status(),
+        "?? first-work.txt",
+        "worktree intact, user file kept"
+    );
+    assert!(
+        src.worktree_paths().contains(&wt.root),
+        "registered at the destination"
+    );
+    assert_eq!(src.worktree_paths().len(), 2);
+    assert_no_staging(&[&sb.root]);
+    assert_success(&parhel(&sb.env, &src.root, &["doctor"]));
+}

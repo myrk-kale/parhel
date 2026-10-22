@@ -30,6 +30,9 @@ pub const ADD_FAILPOINTS: &[&str] = &[
     "before_rename",
 ];
 
+/// Failpoint between the publishing rename and `git worktree repair`.
+pub const PUBLISH_FAILPOINT: &str = "after_rename";
+
 /// Failpoint inside rollback itself (lets tests signal a process that is undoing).
 pub const ROLLBACK_FAILPOINT: &str = "during_rollback";
 

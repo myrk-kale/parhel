@@ -86,7 +86,10 @@ pub trait CowFs {
     fn canonicalize(&self, path: &Path) -> Result<PathBuf>;
     /// `lstat`-based: a dangling symlink exists.
     fn exists_no_follow(&self, path: &Path) -> Result<bool>;
+    /// Follows symlinks (a destination parent may be reached through one).
     fn is_dir(&self, path: &Path) -> Result<bool>;
+    /// `lstat`-based: a symlink to a directory is not a directory.
+    fn is_dir_no_follow(&self, path: &Path) -> Result<bool>;
     /// Atomically create a fresh, uniquely named `.parhel-staging-*` dir in `parent`.
     fn create_staging_dir(&self, parent: &Path) -> Result<PathBuf>;
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>>;
