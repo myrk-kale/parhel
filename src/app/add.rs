@@ -69,6 +69,8 @@ struct RelocationReport {
     binaries: Vec<PathBuf>,
     /// Entries that could not be examined (e.g. paths too long inside staging).
     unexamined: usize,
+    /// Directories whose copied `.git` file linked to another repository's git dir.
+    detached: Vec<PathBuf>,
 }
 
 /// Everything validated before the first mutation.
@@ -421,11 +423,15 @@ fn assemble(
         git.submodules_reinit(&staged, &repo.toplevel, &plan.destination)?;
         check_interrupt(env)?;
     }
-    let report = if request.relocate {
-        relocate_tree(env, &staged, &repo.toplevel, &plan.destination)?
-    } else {
-        RelocationReport::default()
-    };
+    let report = relocate_tree(
+        env,
+        &staged,
+        &repo.toplevel,
+        &exclusions,
+        request
+            .relocate
+            .then(|| Relocation::new(&repo.toplevel, &plan.destination)),
+    )?;
     check_interrupt(env)?;
     crate::failpoint!("before_rename");
     check_interrupt(env)?;
@@ -437,81 +443,119 @@ fn assemble(
     Ok(report)
 }
 
-/// Rewrite references to the source path in the staged worktree's untracked files
-/// (see [`crate::domain::relocate`]). Tracked files and submodules are never
-/// touched; files over the size limit are not examined.
+/// Walk the staged worktree's untracked files (tracked files and submodules are
+/// git's business and never touched):
+/// - copied `.git` files linked to a git dir outside the copy are removed, so the
+///   copy cannot drive another repository's HEAD and index;
+/// - with a [`Relocation`], references to the source path are rewritten (see
+///   [`crate::domain::relocate`]); files over the size limit are not examined.
 fn relocate_tree(
     env: &Env<'_>,
     staged: &Path,
     source: &Path,
-    destination: &Path,
+    exclusions: &Exclusions,
+    relocation: Option<Relocation>,
 ) -> Result<RelocationReport> {
-    let relocation = Relocation::new(source, destination);
-    let tracked: HashSet<PathBuf> = env.git.tracked_files(staged)?.into_iter().collect();
-    let mut report = RelocationReport::default();
-    relocate_dir(
+    let walk = Walk {
         env,
         staged,
-        Path::new(""),
-        &relocation,
-        &tracked,
-        &mut report,
-    )?;
+        source,
+        exclusions,
+        relocation,
+        tracked: env.git.tracked_files(staged)?.into_iter().collect(),
+    };
+    let mut report = RelocationReport::default();
+    walk.dir(Path::new(""), &mut report)?;
     Ok(report)
 }
 
-fn relocate_dir(
-    env: &Env<'_>,
-    staged: &Path,
-    dir: &Path,
-    relocation: &Relocation,
-    tracked: &HashSet<PathBuf>,
-    report: &mut RelocationReport,
-) -> Result<()> {
-    let Ok(mut names) = env.fs.list_dir(&staged.join(dir)) else {
-        report.unexamined += 1;
-        return Ok(());
-    };
-    names.sort();
-    for name in names {
-        let rel = dir.join(&name);
-        if (dir.as_os_str().is_empty() && name == ".git") || tracked.contains(&rel) {
-            continue;
-        }
-        let path = staged.join(&rel);
-        // Relocation is best effort: an entry that cannot be inspected (a path too
-        // long for the staging location, an unreadable file) is skipped and
-        // counted, never fatal. Writes, on the other hand, must succeed.
-        let Ok(kind) = env.fs.entry_kind(&path) else {
+struct Walk<'a> {
+    env: &'a Env<'a>,
+    staged: &'a Path,
+    source: &'a Path,
+    exclusions: &'a Exclusions,
+    relocation: Option<Relocation>,
+    tracked: HashSet<PathBuf>,
+}
+
+impl Walk<'_> {
+    fn dir(&self, dir: &Path, report: &mut RelocationReport) -> Result<()> {
+        let fs = self.env.fs;
+        let Ok(mut names) = fs.list_dir(&self.staged.join(dir)) else {
             report.unexamined += 1;
-            continue;
+            return Ok(());
         };
-        match kind {
-            EntryKind::Dir => relocate_dir(env, staged, &rel, relocation, tracked, report)?,
-            EntryKind::File { len } if len <= MAX_RELOCATE_BYTES => {
-                let Ok(contents) = env.fs.read_file(&path) else {
-                    report.unexamined += 1;
-                    continue;
-                };
-                match relocation.rewrite(&contents) {
-                    Rewrite::Rewritten(contents) => {
-                        env.fs.replace_contents(&path, &contents)?;
-                        report.rewritten += 1;
+        names.sort();
+        for name in names {
+            let rel = dir.join(&name);
+            if (dir.as_os_str().is_empty() && name == ".git") || self.tracked.contains(&rel) {
+                continue;
+            }
+            let path = self.staged.join(&rel);
+            // Best effort: an entry that cannot be inspected (a path too long for
+            // the staging location, an unreadable file) is skipped and counted,
+            // never fatal. Writes, on the other hand, must succeed.
+            let Ok(kind) = fs.entry_kind(&path) else {
+                report.unexamined += 1;
+                continue;
+            };
+            match kind {
+                EntryKind::Dir => self.dir(&rel, report)?,
+                EntryKind::File { len } if name == ".git" => {
+                    if len <= MAX_RELOCATE_BYTES && self.links_outside(dir, &path) {
+                        fs.remove_file(&path)?;
+                        report.detached.push(dir.to_path_buf());
                     }
-                    Rewrite::BinaryReference => report.binaries.push(rel),
-                    Rewrite::Unchanged => {}
                 }
-            }
-            EntryKind::Symlink { target } => {
-                if let Some(new_target) = relocation.rewrite_link(&target) {
-                    env.fs.replace_symlink(&path, &new_target)?;
-                    report.relinked += 1;
+                EntryKind::File { len } if len <= MAX_RELOCATE_BYTES => {
+                    let Some(relocation) = &self.relocation else {
+                        continue;
+                    };
+                    let Ok(contents) = fs.read_file(&path) else {
+                        report.unexamined += 1;
+                        continue;
+                    };
+                    match relocation.rewrite(&contents) {
+                        Rewrite::Rewritten(contents) => {
+                            fs.replace_contents(&path, &contents)?;
+                            report.rewritten += 1;
+                        }
+                        Rewrite::BinaryReference => report.binaries.push(rel),
+                        Rewrite::Unchanged => {}
+                    }
                 }
+                EntryKind::Symlink { target } => {
+                    let new_target = self
+                        .relocation
+                        .as_ref()
+                        .and_then(|r| r.rewrite_link(&target));
+                    if let Some(new_target) = new_target {
+                        fs.replace_symlink(&path, &new_target)?;
+                        report.relinked += 1;
+                    }
+                }
+                EntryKind::File { .. } | EntryKind::Other => {}
             }
-            EntryKind::File { .. } | EntryKind::Other => {}
+        }
+        Ok(())
+    }
+
+    /// Whether the gitfile at `path` (copied from `<source>/<dir>/.git`) names a
+    /// git dir that is not part of the copy.
+    fn links_outside(&self, dir: &Path, path: &Path) -> bool {
+        let Ok(contents) = self.env.fs.read_file(path) else {
+            return true;
+        };
+        let text = String::from_utf8_lossy(&contents);
+        let Some(target) = text.trim().strip_prefix("gitdir:") else {
+            return false;
+        };
+        let resolved = paths::resolve_destination(&self.source.join(dir), Path::new(target.trim()));
+        match resolved.strip_prefix(self.source) {
+            Ok(inside) => self.exclusions.is_excluded(inside),
+            Err(_) => true,
         }
     }
-    Ok(())
 }
 
 /// After the exclusive rename the worktree is ours and valid: never roll it back.
@@ -562,6 +606,20 @@ fn publish(
             } else {
                 String::new()
             }
+        ));
+    }
+    if !report.detached.is_empty() {
+        let shown: Vec<String> = report
+            .detached
+            .iter()
+            .take(5)
+            .map(|p| p.display().to_string())
+            .collect();
+        warnings.push(format!(
+            "{} copied folder(s) were linked to another repository's git data and were \
+             detached in the new worktree (their .git file was removed): {}",
+            report.detached.len(),
+            shown.join(", ")
         ));
     }
     if report.unexamined > 0 {
@@ -1751,5 +1809,48 @@ mod tests {
             1,
             "src/ still cloned"
         );
+    }
+
+    // U-TXN-70: a copied gitfile linked to a git dir outside the copy would let the
+    // copy drive another repository's HEAD and index: it is removed, with a warning.
+    #[rstest]
+    #[case::relocate(true)]
+    #[case::no_relocate(false)]
+    fn detaches_gitfiles_linked_outside_the_copy(#[case] relocate: bool) {
+        let w = World {
+            staged_files: vec![(
+                p("vendor/lib/.git"),
+                b"gitdir: /elsewhere/other/.git/worktrees/lib\n".to_vec(),
+            )],
+            ..World::default()
+        };
+        let mut req = new_branch();
+        req.relocate = relocate;
+        let out = run(&w, &req).unwrap();
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p(&format!("{STAGED_WT}/vendor/lib/.git")))),
+            1
+        );
+        let warning = out
+            .warnings
+            .iter()
+            .find(|m| m.contains("vendor/lib"))
+            .expect("warned");
+        assert!(warning.contains("another repository"), "{warning}");
+    }
+
+    // U-TXN-71: a gitfile whose git dir is copied along (a nested repository with
+    // its own .git dir) keeps working in the copy.
+    #[test]
+    fn keeps_gitfiles_resolving_inside_the_copy() {
+        let w = World {
+            staged_files: vec![(
+                p("vendor/repo/sub/.git"),
+                b"gitdir: ../.git/modules/sub\n".to_vec(),
+            )],
+            ..World::default()
+        };
+        run(&w, &new_branch()).unwrap();
+        assert_eq!(w.count(|c| matches!(c, Call::RemoveFile(_))), 0);
     }
 }

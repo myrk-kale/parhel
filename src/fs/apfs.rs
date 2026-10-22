@@ -251,6 +251,10 @@ impl CowFs for ApfsFs {
         written
     }
 
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        fs::remove_file(path).map_err(|e| io_error(path, &e))
+    }
+
     fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
         fs::remove_file(path).map_err(|e| io_error(path, &e))?;
         std::os::unix::fs::symlink(target, path).map_err(|e| io_error(path, &e))
