@@ -301,3 +301,68 @@ fn i159_foreign_linked_worktree_is_detached_in_the_copy() {
     assert_eq!(other.branch_tip("vend"), other_head);
     TestRepo::open(&sb.env, &nested).assert_clean();
 }
+
+// I-159b: a nested repository whose git dir lives elsewhere in the source
+// (`--separate-git-dir`), both ignored. The copy's gitfile must point at the
+// copy's git dir, so commits in the copy never move the source's nested repo
+// (reported by a review).
+#[test]
+fn i159b_nested_repo_with_separate_git_dir_follows_the_copy() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.ignore(&["nested/", "nestedgit/"]);
+    let nested = src.path("nested");
+    fs::create_dir(&nested).unwrap();
+    git_in(
+        &sb.env,
+        &nested,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            src.path("nestedgit").to_str().unwrap(),
+        ],
+    );
+    let inner = TestRepo::open(&sb.env, &nested);
+    inner.write("f", "v1");
+    inner.commit_all("inner");
+    let inner_head = inner.head();
+
+    let dest = sb.path("dest");
+    add_ok(&sb, &src, &dest, &[]);
+    let copy = TestRepo::open(&sb.env, &dest.join("nested"));
+    copy.write("f", "changed in the copy");
+    copy.commit_all("copy commit");
+
+    assert_eq!(
+        inner.head(),
+        inner_head,
+        "the source's nested repo did not move"
+    );
+    inner.assert_clean();
+    assert_ne!(copy.head(), inner_head);
+}
+
+// I-150b: references into what the copy does not contain stay as they are: a
+// nested `git clone --shared` keeps borrowing the source's objects and works.
+#[test]
+fn i150b_references_into_excluded_paths_are_kept() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.ignore(&["vendor/"]);
+    git_in(
+        &sb.env,
+        &src.root,
+        &["clone", "-q", "--shared", ".", "vendor/shared"],
+    );
+    let dest = sb.path("dest");
+    add_ok(&sb, &src, &dest, &[]);
+    let copy = TestRepo::open(&sb.env, &dest.join("vendor/shared"));
+    copy.git(&["log", "--oneline", "-1"]);
+    let alternates =
+        fs::read_to_string(dest.join("vendor/shared/.git/objects/info/alternates")).unwrap();
+    assert!(alternates.starts_with(src.root.to_str().unwrap()), "{alternates}");
+    assert!(!alternates.contains(dest.to_str().unwrap()), "{alternates}");
+}

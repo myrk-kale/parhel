@@ -34,6 +34,8 @@ pub enum Rewrite {
 pub struct Relocation {
     needles: Vec<Vec<u8>>,
     replacement: Vec<u8>,
+    /// `/<relative path>` of each excluded location.
+    excluded: Vec<Vec<u8>>,
 }
 
 impl Relocation {
@@ -56,6 +58,7 @@ impl Relocation {
         Self {
             needles,
             replacement: destination.as_os_str().as_bytes().to_vec(),
+            excluded: Vec::new(),
         }
     }
 
@@ -76,6 +79,9 @@ impl Relocation {
                     if content[i..].starts_with(needle)
                         && content.get(end).is_none_or(|&b| !continues_name(b))
                     {
+                        if self.into_excluded(&content[end..]) {
+                            break;
+                        }
                         return Some((i, needle.len()));
                     }
                 }
@@ -83,6 +89,40 @@ impl Relocation {
             i += 1;
         }
         None
+    }
+
+    /// Leave references into these source-relative paths unchanged (they are not
+    /// part of the copy).
+    #[must_use]
+    pub fn excluding<'a>(mut self, paths: impl IntoIterator<Item = &'a Path>) -> Self {
+        for path in paths {
+            let mut bytes = b"/".to_vec();
+            bytes.extend_from_slice(path.as_os_str().as_bytes());
+            self.excluded.push(bytes);
+        }
+        self
+    }
+
+    /// Whether the path continuing at `rest` (right after the source prefix) goes
+    /// into an excluded location.
+    fn into_excluded(&self, mut rest: &[u8]) -> bool {
+        // Lexically skip `/.` segments and doubled slashes (`<src>/./.git`).
+        loop {
+            if rest.starts_with(b"/./") || rest == b"/." {
+                rest = &rest[2..];
+            } else if rest.starts_with(b"//") {
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        }
+        // `<src>/..` leaves the source: what it names is not part of the copy.
+        if rest.starts_with(b"/..") && rest.get(3).is_none_or(|&b| b == b'/') {
+            return true;
+        }
+        self.excluded.iter().any(|ex| {
+            rest.starts_with(ex) && rest.get(ex.len()).is_none_or(|&b| !continues_name(b))
+        })
     }
 
     /// The byte strings that may start a reference to the source (for a fast
@@ -122,10 +162,11 @@ impl Relocation {
     #[must_use]
     pub fn rewrite_link(&self, target: &Path) -> Option<PathBuf> {
         let bytes = target.as_os_str().as_bytes();
-        let needle = self
-            .needles
-            .iter()
-            .find(|n| bytes.starts_with(n) && bytes.get(n.len()).is_none_or(|&b| b == b'/'))?;
+        let needle = self.needles.iter().find(|n| {
+            bytes.starts_with(n)
+                && bytes.get(n.len()).is_none_or(|&b| b == b'/')
+                && !self.into_excluded(&bytes[n.len()..])
+        })?;
         let mut out = self.replacement.clone();
         out.extend_from_slice(&bytes[needle.len()..]);
         Some(PathBuf::from(OsStr::from_bytes(&out)))
@@ -230,6 +271,46 @@ mod tests {
         assert_eq!(
             rel().rewrite_link(Path::new(target)),
             want.map(PathBuf::from)
+        );
+    }
+
+    // U-REL-07: paths into what the copy does not contain (the source's `.git`,
+    // other worktrees, submodules, .parhelignore) keep pointing at the source:
+    // rewritten, they would name something that does not exist in the copy.
+    #[test]
+    fn leaves_references_into_excluded_paths() {
+        let r = rel().excluding([Path::new(".git"), Path::new("libs/sub")]);
+        assert_eq!(r.rewrite(b"/w/src/.git/objects\n"), Rewrite::Unchanged);
+        assert_eq!(r.rewrite(b"/w/src/libs/sub/x"), Rewrite::Unchanged);
+        assert_eq!(text(&r.rewrite(b"/w/src/.gitignore")), "/w/feat/.gitignore");
+        assert_eq!(
+            text(&r.rewrite(b"/w/src/libs/subway")),
+            "/w/feat/libs/subway"
+        );
+        assert_eq!(
+            text(&r.rewrite(b"/w/src/.git/x /w/src/a")),
+            "/w/src/.git/x /w/feat/a",
+            "only the excluded occurrence is kept"
+        );
+        assert_eq!(
+            r.rewrite(b"/w/src/./.git/objects"),
+            Rewrite::Unchanged,
+            "dot segment"
+        );
+        assert_eq!(
+            r.rewrite(b"/w/src//.git/objects"),
+            Rewrite::Unchanged,
+            "double slash"
+        );
+        assert_eq!(
+            r.rewrite(b"/w/src/../shared/x"),
+            Rewrite::Unchanged,
+            "leaves the source"
+        );
+        assert_eq!(r.rewrite_link(Path::new("/w/src/.git/objects")), None);
+        assert_eq!(
+            r.rewrite_link(Path::new("/w/src/a")),
+            Some(PathBuf::from("/w/feat/a"))
         );
     }
 
