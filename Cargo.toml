@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/myrk-kale/parhel"
 homepage = "https://github.com/myrk-kale/parhel"
 authors = ["Kale"]
-exclude = [".github/", ".serena/", "proptest-regressions/", "packaging/", "install.sh", "assets/*.png"]
+exclude = [".github/", "skills/", ".serena/", "proptest-regressions/", "packaging/", "install.sh", "assets/*.png"]
 keywords = ["git", "worktree", "apfs", "copy-on-write", "clonefile"]
 categories = ["command-line-utilities", "development-tools"]
 

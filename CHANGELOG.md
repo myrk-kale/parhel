@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- An agent skill (`npx skills add myrk-kale/parhel`) that teaches coding agents
+  when to use parhel and the workflow that keeps copies away from shared
+  services and ignored data from being lost.
+
 ## [0.2.2] - 2026-10-22
 
 ### Fixed
