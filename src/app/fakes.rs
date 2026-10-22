@@ -138,6 +138,8 @@ pub struct World {
     /// Simulates a commit in the source while `add` runs: HEAD reported for the
     /// source once any clone happened.
     pub source_head_after_clone: Option<String>,
+    /// Worktrees (e.g. submodule checkouts) reported dirty, beyond `dirty`.
+    pub dirty_paths: HashSet<PathBuf>,
     /// Simulates an edit in the source while `add` runs.
     pub dirty_after_clone: bool,
     pub submodules: Vec<PathBuf>,
@@ -224,6 +226,7 @@ impl Default for World {
             operation: None,
             source_head_after_clone: None,
             dirty_after_clone: false,
+            dirty_paths: HashSet::new(),
             submodules: vec![],
             worktrees: vec![WorktreeEntry {
                 path: p("/w/repo"),
@@ -330,7 +333,10 @@ impl Git for World {
         }
     }
 
-    fn is_dirty(&self, _: &Path, _exclude: &[PathBuf]) -> Result<bool> {
+    fn is_dirty(&self, worktree: &Path, _exclude: &[PathBuf]) -> Result<bool> {
+        if self.dirty_paths.contains(worktree) {
+            return Ok(true);
+        }
         Ok(self.dirty || (self.dirty_after_clone && self.cloned_anything()))
     }
 

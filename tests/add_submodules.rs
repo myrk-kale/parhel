@@ -194,3 +194,28 @@ fn i22_reinit_works_offline() {
         "keeps the declared URL"
     );
 }
+
+// I-22b: --allow-dirty with reinit and a modified submodule: refused, not silently
+// dropped (reinit checks out the recorded commit).
+#[test]
+fn i22b_dirty_submodule_with_allow_dirty_reinit_is_refused() {
+    let sb = Sandbox::new();
+    let (src, _lib) = with_submodule(&sb);
+    src.write("libs/lib/lib.rs", "local edit\n");
+    src.write("libs/lib/new.rs", "untracked in submodule\n");
+    let before = src.snapshot();
+    let dest = sb.path("dirty-sub");
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(
+            &dest,
+            &["--new-branch", "d", "--allow-dirty", "--submodules=reinit"],
+        ),
+    );
+    assert_error(&out, "dirty-submodule");
+    assert!(stderr(&out).contains("libs/lib"), "{}", stderr(&out));
+    assert!(!dest.exists());
+    before.assert_same(&src.snapshot());
+    assert_no_staging(&[&sb.root]);
+}

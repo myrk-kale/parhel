@@ -32,6 +32,9 @@ pub enum ErrorCode {
     SparseCheckout,
     /// The source has initialized submodules and `--submodules=reinit` was not given.
     SubmodulesPresent,
+    /// `--allow-dirty` with `--submodules=reinit`, but a submodule has uncommitted
+    /// changes: reinit checks out the recorded commit, so they would be lost.
+    DirtySubmodule,
     /// A merge, rebase, cherry-pick, revert or `am` is in progress in the source.
     /// Refused even with `--allow-dirty`: that state lives in the source's admin dir.
     OperationInProgress,
@@ -86,6 +89,7 @@ impl ErrorCode {
             Self::DirtySource => "dirty-source",
             Self::SparseCheckout => "sparse-checkout",
             Self::SubmodulesPresent => "submodules-present",
+            Self::DirtySubmodule => "dirty-submodule",
             Self::OperationInProgress => "operation-in-progress",
             Self::SourceChanged => "source-changed",
             Self::NotApfs => "not-apfs",
