@@ -48,6 +48,7 @@ something looks wrong, please
 
 - [Install](#install)
 - [Quick start](#quick-start)
+  - [Read this before you rely on it](#read-this-before-you-rely-on-it)
 - [Commands](#commands)
 - [Platform support](#platform-support)
 - [How it works](#how-it-works)
@@ -132,6 +133,40 @@ To get rid of a worktree, use git itself:
 ```sh
 git worktree remove ../my-app-login
 ```
+
+### Read this before you rely on it
+
+A copy shares more with your project than its files suggest.
+
+- **It talks to the same services.** Your `.env` files are copied too, so the
+  worktree reaches the same database, bucket or queue as the original. A
+  migration or a cleanup script run there changes the real thing, and removing
+  the worktree does not undo it. If that is not what you want, add the files
+  to `.parhelignore` and give each worktree its own settings:
+
+  ```sh
+  printf '.env\n.env.*\n' >> .parhelignore
+  ```
+
+- **Removing a worktree deletes its ignored files without asking.**
+  `git worktree remove` checks only tracked and untracked files. A local
+  database, a hand-edited config or results you never committed are deleted
+  even though `git status` was clean. Before removing, look at what is there:
+
+  ```sh
+  git -C ../my-app-login status --ignored --short
+  ```
+
+- **Copied paths are rewritten.** Untracked text files that named your
+  project's path now name the copy's (see
+  [Copied files that point at the source](#copied-files-that-point-at-the-source)).
+  When a tool rejects a rewritten file, rebuild it in the worktree, or use
+  `--no-relocate`.
+- **All worktrees share one repository.** parhel changes only its own worktree
+  registration and the branch it created, and the
+  [blast-radius tests](docs/test-catalog.md) check that on every release. Still,
+  push or back up work you cannot lose, as you would before any tool that
+  writes to `.git`.
 
 ## Commands
 
