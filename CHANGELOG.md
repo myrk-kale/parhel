@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Copied untracked files that recorded the source's absolute path are relocated
+  to the new worktree: whole-path occurrences in text files up to 1 MiB and
+  absolute symlinks into the source. A copied Python venv used to run the
+  source's pip and install into the source's environment. Binaries are reported,
+  never edited. `--no-relocate` turns this off.
+- `.parhelignore` (gitignore syntax) keeps untracked paths out of the copy.
+
 ### Fixed
 
 - Rollback and `doctor --fix` no longer run `git worktree prune`, which also
@@ -17,6 +26,17 @@ All notable changes to this project are documented here. The format follows
   of removing its registration and branch.
 - The journal is written with `F_FULLFSYNC`, so it reaches the disk before the
   step it describes.
+- `doctor --fix` finds the staging dir of a run that crashed after publishing to
+  a destination in another folder, instead of removing that worktree's
+  registration.
+- Copied `.git` files that linked a folder to another repository's git data are
+  removed from the copy, so the copy cannot change that repository's state.
+- Directories parhel creates (the worktree root, ancestors of excluded paths)
+  take the source's permissions instead of the defaults.
+- `--allow-dirty --submodules=reinit` refuses dirty submodules
+  (`dirty-submodule`) instead of silently dropping their changes.
+- `git worktree add` is retried on the transient error git reports when another
+  `worktree add` registers at the same moment.
 
 ### Added
 

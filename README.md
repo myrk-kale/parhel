@@ -142,10 +142,51 @@ the commit your current worktree is on. The parent directory of
 | `--allow-dirty` | Copy uncommitted changes too. Staged changes arrive unstaged. Without this flag, a worktree with uncommitted changes is refused |
 | `--submodules=refuse\|reinit` | By default, initialized submodules are refused. `reinit` gives each submodule in the new worktree its own git directory, cloned from your local copy, so it works offline |
 | `--fallback` | If copy-on-write is not possible (unsupported filesystem, or source and destination on different volumes), create a regular worktree instead of failing |
+| `--no-relocate` | Copy untracked files exactly as they are, without rewriting paths that point at the source (see [Copied files that point at the source](#copied-files-that-point-at-the-source)) |
 
 Besides tracked files, the copy brings along ignored files. Untracked files
 that are not ignored only come along with `--allow-dirty`, because without it a
 worktree that has them is refused.
+
+#### Copied files that point at the source
+
+Tools often write the absolute path of the folder they ran in: script shebangs
+in a Python virtualenv, generated configs, caches, symlinks made by `npm link`.
+Copied as they are, those files would keep pointing at the source. Running the
+copy's `.venv/bin/pip`, for example, would install packages into the source's
+environment.
+
+parhel treats the copy as if the folder had been moved. After cloning, it looks
+through the untracked files of the new worktree and replaces the source's path
+with the destination's in text files up to 1 MiB, and re-points absolute
+symlinks that lead into the source. It does this the same way for every
+language and tool. It only replaces whole paths (`/code/app` is not touched
+inside `/code/app2`), never edits tracked files, and only the rewritten files
+stop sharing disk blocks with the source. The command prints how many files it
+relocated.
+
+Binaries are never edited, because changing the length of a path inside one
+would corrupt it. If a binary mentions the source, `add` names it in a warning.
+Files larger than 1 MiB are not examined. Pass `--no-relocate` to skip this step.
+
+A copied `.git` file that links a folder to another repository's git data (for
+example a linked worktree of another project sitting inside `node_modules/`)
+would let the copy change that repository's HEAD and index. parhel removes such
+`.git` files from the copy, always, and lists the folders in a warning.
+
+#### Leaving things out: `.parhelignore`
+
+Some environments cannot be relocated, typically ones whose binaries embed their
+own location (conda environments are the usual example). List them in a
+`.parhelignore` file at the root of the repository, with `.gitignore` syntax, and
+they are not copied at all:
+
+```gitignore
+# rebuilt per worktree
+.conda/
+```
+
+Only untracked paths are affected; tracked files always come from git.
 
 ### `git parhel doctor [--fix] [--from <path>]`
 
@@ -154,8 +195,8 @@ Reports problems in the repository and its environment:
 - the worktree is on a filesystem parhel cannot clone on;
 - an earlier run crashed and left a hidden `.parhel-staging-*` directory, or a
   worktree registration inside one;
-- a `.git` file inside your tree belongs to a different repository, so a clone
-  would carry that repository's state along.
+- a `.git` file inside your tree belongs to a different repository (`add`
+  detaches such files in the copy; `doctor` points them out in the source).
 
 `--fix` cleans up after crashed runs. It reads the journal the run left behind
 and removes only what that run created. If the crash happened after the new
@@ -249,6 +290,14 @@ Other cases the tests cover:
   of your values to git after `--end-of-options`, so none of them can be read as
   an option.
 - Symlinks are copied as symlinks and never followed.
+- Cleaning up after a failure removes only what the run created. It never runs
+  `git worktree prune`, which would also unregister other worktrees whose folders
+  happen to be unreachable, such as one on an unmounted disk.
+- Directories parhel creates get the source's permissions, so a private source
+  does not produce a world-readable copy.
+- With `--allow-dirty --submodules=reinit`, a submodule with uncommitted changes
+  stops the command (`dirty-submodule`): reinit checks out the recorded commit,
+  so those changes would not be in the copy.
 
 ## Limitations
 
@@ -305,6 +354,7 @@ usage errors and `128 + signal` when a signal interrupted the run.
 | `dest-parent-missing` | Create the parent directory first |
 | `not-apfs` / `cross-volume` | Use a destination on the same APFS volume, or pass `--fallback` |
 | `submodules-present` | Pass `--submodules=reinit` |
+| `dirty-submodule` | Commit or stash the changes inside the submodule, or drop `--allow-dirty` |
 | `operation-in-progress` | Finish or abort the merge, rebase or cherry-pick first |
 | `source-changed` | Something changed the source during the run. Run the command again |
 | `checkout-conflict` | With `--allow-dirty`, your local changes conflict with `[ref]` |
