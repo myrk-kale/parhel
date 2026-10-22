@@ -48,6 +48,10 @@ pub enum Call {
     },
     Rewrite(PathBuf),
     RemoveFile(PathBuf),
+    CopyMode {
+        from: PathBuf,
+        to: PathBuf,
+    },
     Relink {
         path: PathBuf,
         target: PathBuf,
@@ -83,6 +87,7 @@ impl Call {
             | Call::Unregister { path }
             | Call::Rewrite(path)
             | Call::RemoveFile(path)
+            | Call::CopyMode { to: path, .. }
             | Call::Relink { path, .. }
             | Call::CreateDir(path)
             | Call::RemoveDirAll(path)
@@ -611,5 +616,15 @@ impl CowFs for World {
         self.record(Call::RemoveFile(path.into()), Step::Clone)?;
         self.files.borrow_mut().remove(path);
         Ok(())
+    }
+
+    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
+        self.record(
+            Call::CopyMode {
+                from: from.into(),
+                to: to.into(),
+            },
+            Step::Clone,
+        )
     }
 }

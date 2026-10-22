@@ -131,6 +131,9 @@ pub trait CowFs {
     /// it is read-only).
     fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
+    /// Give `to` the permission bits of `from` (directories the clone did not copy
+    /// itself must not end up more open than the source).
+    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()>;
     /// Point an existing symlink at `target`.
     fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()>;
     fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
