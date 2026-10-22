@@ -7,6 +7,7 @@ use crate::app::add::Env;
 use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
 use crate::domain::paths::{self, is_staging_name};
 use crate::domain::{DoctorRequest, Result};
+use crate::git::parse::WorktreeEntry;
 use crate::ports::RepoInfo;
 
 /// Something worth reporting. `code()` is printed and is a stable contract.
@@ -136,7 +137,14 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
     find_foreign_gitfiles(env, &repo, &repo.toplevel, &mut report);
 
     if request.fix {
-        fix(env, &repo, &orphans, &registrations, &mut report);
+        fix(
+            env,
+            &repo,
+            &worktrees,
+            &orphans,
+            &registrations,
+            &mut report,
+        );
     }
     Ok(report)
 }
@@ -147,6 +155,7 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
 fn fix(
     env: &Env<'_>,
     repo: &RepoInfo,
+    worktrees: &[WorktreeEntry],
     orphans: &[PathBuf],
     registrations: &[PathBuf],
     report: &mut DoctorReport,
@@ -157,7 +166,8 @@ fn fix(
             .fs
             .read_file(&staging.join(JOURNAL_FILE))
             .ok()
-            .and_then(|bytes| Journal::decode(&bytes).ok());
+            .and_then(|bytes| Journal::decode(&bytes).ok())
+            .and_then(|journal| trusted(journal, repo, worktrees, staging));
         let ok = if let Some(journal) = journal {
             handled.extend(journal.worktree.clone());
             let published = journal.worktree.as_deref().and_then(|staged| {
@@ -213,6 +223,45 @@ fn fix(
     }
 }
 
+/// A journal is plain data in a folder anyone could have created: keep only what
+/// the filesystem and git confirm. The staged worktree must be a direct child of
+/// this staging dir; the repository is always the one doctor runs in; the
+/// destination is the staging dir's sibling, never read from the journal; and the
+/// branch counts only if the staged registration really has it checked out.
+/// Returns `None` when the journal points anywhere else.
+fn trusted(
+    journal: Journal,
+    repo: &RepoInfo,
+    worktrees: &[WorktreeEntry],
+    staging: &Path,
+) -> Option<Journal> {
+    let staged = match journal.worktree {
+        Some(staged) if staged.parent() == Some(staging) && staged.file_name().is_some() => {
+            Some(staged)
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    let created_branch = journal.created_branch.filter(|name| {
+        let checked_out = format!("refs/heads/{name}");
+        staged.as_ref().is_some_and(|staged| {
+            worktrees
+                .iter()
+                .any(|w| &w.path == staged && w.branch.as_deref() == Some(checked_out.as_str()))
+        })
+    });
+    let publish_to = staged
+        .as_ref()
+        .and_then(|s| Some(staging.parent()?.join(s.file_name()?)));
+    Some(Journal {
+        repo: repo.toplevel.clone(),
+        worktree: staged,
+        created_branch,
+        publish_to,
+        branch_start: journal.branch_start,
+    })
+}
+
 /// The `.parhel-staging-*` directory `path` lies in, if any.
 fn staging_of(path: &Path) -> Option<PathBuf> {
     let mut prefix = PathBuf::new();
@@ -249,9 +298,7 @@ fn published_dest(
     if !env.fs.exists_no_follow(&dest).unwrap_or(false) {
         return None;
     }
-    if publish_to.is_some() {
-        return Some(dest);
-    }
+    // Always ask the disk, even with a journaled destination: journals are data.
     let gitfile = env.fs.read_file(&dest.join(".git")).ok()?;
     let admin = String::from_utf8_lossy(&gitfile)
         .trim()
@@ -577,6 +624,14 @@ mod tests {
             .borrow_mut()
             .insert(staging.join(JOURNAL_FILE), journal.encode());
         if renamed {
+            w.files.borrow_mut().insert(
+                p("/w/feat/.git"),
+                b"gitdir: /w/repo/.git/worktrees/feat\n".to_vec(),
+            );
+            w.files.borrow_mut().insert(
+                p("/w/repo/.git/worktrees/feat/gitdir"),
+                b"/w/.parhel-staging-dead/feat/.git\n".to_vec(),
+            );
             w.tree.borrow_mut().remove(&staging.join("feat"));
             w.tree
                 .borrow_mut()
@@ -754,6 +809,14 @@ mod tests {
         w.tree
             .borrow_mut()
             .insert(p("/x/feat"), vec![OsString::from(".git")]);
+        w.files.borrow_mut().insert(
+            p("/x/feat/.git"),
+            b"gitdir: /w/repo/.git/worktrees/feat\n".to_vec(),
+        );
+        w.files.borrow_mut().insert(
+            p("/w/repo/.git/worktrees/feat/gitdir"),
+            b"/x/.parhel-staging-far/feat/.git\n".to_vec(),
+        );
         w.tree
             .borrow_mut()
             .get_mut(&p("/x"))
@@ -819,5 +882,65 @@ mod tests {
                 .contains(&Finding::OrphanStaging { path: lookalike })
         );
         assert_eq!(w.calls(), vec![]);
+    }
+
+    /// A staging dir holding a journal written by someone else, pointing at
+    /// arbitrary places.
+    fn forged(journal: Journal) -> World {
+        let w = World::default();
+        let staging = p("/w/.parhel-staging-evil");
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w"))
+            .unwrap()
+            .push(OsString::from(".parhel-staging-evil"));
+        w.tree
+            .borrow_mut()
+            .insert(staging.clone(), vec![OsString::from(JOURNAL_FILE)]);
+        w.files
+            .borrow_mut()
+            .insert(staging.join(JOURNAL_FILE), journal.encode());
+        w.tree
+            .borrow_mut()
+            .insert(p("/w/victim"), vec![OsString::from("data")]);
+        w.branches.borrow_mut().insert("victim-branch".into());
+        w
+    }
+
+    // U-DOC-18: a journal naming a worktree outside its own staging dir is not
+    // trusted: nothing outside the staging dir is touched.
+    #[test]
+    fn forged_journal_cannot_target_paths_outside_its_staging_dir() {
+        let w = forged(Journal {
+            repo: p("/w/repo"),
+            worktree: Some(p("/w/victim")),
+            created_branch: Some("victim-branch".into()),
+            publish_to: Some(p("/w/victim")),
+            branch_start: Some(SHA_A.into()),
+        });
+        run(&w, true);
+        assert!(!w.touched(Path::new("/w/victim")), "{:#?}", w.calls());
+        assert_eq!(w.count(|c| matches!(c, Call::BranchDelete(_))), 0);
+    }
+
+    // U-DOC-19: the journal's repository is ignored; git only ever runs against the
+    // repository doctor was started in, and a branch is deleted only if the staged
+    // registration really had it checked out.
+    #[test]
+    fn forged_journal_cannot_delete_branches_it_did_not_check_out() {
+        let w = forged(Journal {
+            repo: p("/elsewhere/other-repo"),
+            worktree: Some(p("/w/.parhel-staging-evil/feat")),
+            created_branch: Some("victim-branch".into()),
+            publish_to: None,
+            branch_start: Some(SHA_A.into()),
+        });
+        run(&w, true);
+        assert_eq!(
+            w.count(|c| matches!(c, Call::BranchDelete(_))),
+            0,
+            "{:#?}",
+            w.calls()
+        );
     }
 }

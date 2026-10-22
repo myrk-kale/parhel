@@ -489,7 +489,7 @@ impl Git for World {
         Ok(())
     }
 
-    fn branch_delete(&self, _: &Path, name: &str) -> Result<()> {
+    fn branch_delete(&self, _: &Path, name: &str, _expected: &str) -> Result<()> {
         self.record(Call::BranchDelete(name.into()), Step::BranchDelete)?;
         self.branches.borrow_mut().remove(name);
         Ok(())

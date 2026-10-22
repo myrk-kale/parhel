@@ -440,8 +440,8 @@ impl Git for GitCli {
                 {
                     attempt += 1;
                     if let Some(name) = new_branch {
-                        if self.branch_exists(repo, name)? {
-                            self.branch_delete(repo, name)?;
+                        if let Ok(tip) = self.resolve_commit(repo, &format!("refs/heads/{name}")) {
+                            self.branch_delete(repo, name, &tip)?;
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
@@ -567,8 +567,10 @@ impl Git for GitCli {
         Ok(())
     }
 
-    fn branch_delete(&self, repo: &Path, name: &str) -> Result<()> {
-        self.run(repo, &["branch", "-q", "-D", name]).map(drop)
+    fn branch_delete(&self, repo: &Path, name: &str, expected: &str) -> Result<()> {
+        let reference = format!("refs/heads/{name}");
+        self.run(repo, &["update-ref", "-d", &reference, expected])
+            .map(drop)
     }
 }
 
@@ -704,5 +706,64 @@ mod tests {
             fs::read_to_string(other.join(".git")).unwrap(),
             "gitdir: /nowhere\n"
         );
+    }
+
+    // U-GIT-02: deleting a branch is a compare-and-delete: refused once it moved.
+    // (`update-ref -d` also leaves packed-refs alone, unlike `branch -D` on git 2.39.)
+    #[test]
+    fn branch_delete_only_deletes_an_unmoved_branch() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@b",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "1",
+        ]);
+        let first = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "kept"]);
+        git(&["branch", "gone"]);
+        git(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@b",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "2",
+        ]);
+        git(&["branch", "-f", "kept", "HEAD"]);
+
+        let cli = GitCli::default();
+        assert!(
+            cli.branch_delete(&repo, "kept", &first).is_err(),
+            "moved: must not delete"
+        );
+        cli.branch_delete(&repo, "gone", &first).unwrap();
+        assert!(!cli.branch_exists(&repo, "gone").unwrap());
+        assert!(cli.branch_exists(&repo, "kept").unwrap());
+        assert!(!repo.join(".git/packed-refs").exists());
     }
 }

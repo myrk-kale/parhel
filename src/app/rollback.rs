@@ -172,9 +172,11 @@ pub fn rollback(
         let tip = git
             .resolve_commit(repo, &format!("refs/heads/{branch}"))
             .ok();
-        if tip.is_some() && tip == journal.branch_start {
-            if let Err(e) = git.branch_delete(repo, branch) {
-                failures.push((format!("git branch -D {branch}"), e));
+        if let (Some(tip), Some(start)) = (&tip, &journal.branch_start) {
+            if tip == start {
+                if let Err(e) = git.branch_delete(repo, branch, start) {
+                    failures.push((format!("git branch -D {branch}"), e));
+                }
             }
         }
     }

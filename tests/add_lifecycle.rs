@@ -86,9 +86,12 @@ fn i92_lock_move_remove() {
         "testing",
         wt.root.to_str().unwrap(),
     ]);
-    assert!(
-        src.git(&["worktree", "list", "--porcelain"])
-            .contains("locked testing")
+    // The lock file itself: `worktree list` shows the reason only from git 2.31.
+    assert_eq!(
+        fs::read_to_string(wt.git_dir().join("locked"))
+            .unwrap()
+            .trim(),
+        "testing"
     );
     src.git(&["worktree", "unlock", wt.root.to_str().unwrap()]);
 

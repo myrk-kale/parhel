@@ -141,10 +141,19 @@ fn assert_untouched(before: &Foreign, after: &Foreign) {
     for (p, bytes) in &before.admin {
         assert_eq!(after.admin.get(p), Some(bytes), "{} changed", p.display());
     }
-    assert_eq!(
-        after.admin.len(),
-        before.admin.len(),
-        "admin entries added or removed"
+    let added: Vec<_> = after
+        .admin
+        .keys()
+        .filter(|k| !before.admin.contains_key(*k))
+        .collect();
+    let removed: Vec<_> = before
+        .admin
+        .keys()
+        .filter(|k| !after.admin.contains_key(*k))
+        .collect();
+    assert!(
+        added.is_empty() && removed.is_empty(),
+        "added {added:?}, removed {removed:?}"
     );
     assert_eq!(after.config, before.config, ".git/config changed");
     assert_eq!(after.refs, before.refs, "refs changed");
