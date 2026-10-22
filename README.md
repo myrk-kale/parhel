@@ -78,7 +78,7 @@ checks its SHA-256 before installing:
 curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
 ```
 
-Set `PARHEL_VERSION=0.1.1` to install a specific version, or
+Set `PARHEL_VERSION=0.2.0` to install a specific version, or
 `PARHEL_INSTALL_DIR` to put the binary somewhere else.
 
 With Cargo (Rust 1.85 or newer), from crates.io or straight from the repository:
