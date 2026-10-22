@@ -5,6 +5,7 @@ of your build output already in place.
 
 [![CI](https://github.com/myrk-kale/parhel/actions/workflows/ci.yml/badge.svg)](https://github.com/myrk-kale/parhel/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/myrk-kale/parhel?sort=semver)](https://github.com/myrk-kale/parhel/releases)
+[![crates.io](https://img.shields.io/crates/v/parhel.svg)](https://crates.io/crates/parhel)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(APFS)-lightgrey)
 
@@ -71,12 +72,13 @@ checks its SHA-256 before installing:
 curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
 ```
 
-Set `PARHEL_VERSION=0.1.0` to install a specific version, or
+Set `PARHEL_VERSION=0.1.1` to install a specific version, or
 `PARHEL_INSTALL_DIR` to put the binary somewhere else.
 
-From source, with Rust 1.85 or newer:
+With Cargo (Rust 1.85 or newer), from crates.io or straight from the repository:
 
 ```sh
+cargo install parhel
 cargo install --git https://github.com/myrk-kale/parhel
 ```
 

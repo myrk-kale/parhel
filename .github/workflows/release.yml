@@ -86,3 +86,11 @@ jobs:
       tag: ${{ github.ref_name }}
     secrets:
       HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
+  crates:
+    needs: build
+    uses: ./.github/workflows/crates.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
