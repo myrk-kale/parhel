@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-22
+
 ### Fixed
 
 - `doctor --fix` could delete a legitimate worktree whose directory name only
