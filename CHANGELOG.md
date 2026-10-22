@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-22
+
 ### Added
 
 - Release archives carry a signed build provenance attestation
