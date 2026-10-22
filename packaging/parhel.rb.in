@@ -15,11 +15,10 @@ class Parhel < Formula
   def install
     if build.head?
       system "cargo", "install", *std_cargo_args
-      man1.install Dir["man/*.1"]
     else
       bin.install "git-parhel"
-      man1.install Dir["man/*.1"]
     end
+    man1.install Dir["man/*.1"]
   end
 
   test do

@@ -80,33 +80,9 @@ jobs:
             --notes-file dist/notes.md
 
   homebrew:
-    name: Update Homebrew tap
     needs: build
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: myrk-kale/homebrew-tap
-          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-          path: tap
-      - name: Render formula
-        run: |
-          sed -e "s/@VERSION@/${{ needs.build.outputs.version }}/g" \
-              -e "s/@SHA256@/${{ needs.build.outputs.sha256 }}/g" \
-              packaging/parhel.rb.in > tap/Formula/parhel.rb
-      - name: Audit and test formula
-        run: |
-          brew tap-new --no-git local/verify >/dev/null
-          cp tap/Formula/parhel.rb "$(brew --repository local/verify)/Formula/"
-          brew audit --strict --online local/verify/parhel
-          brew install local/verify/parhel
-          brew test local/verify/parhel
-      - name: Push
-        run: |
-          cd tap
-          git config user.name "parhel release bot"
-          git config user.email "parhel-release@users.noreply.github.com"
-          git add Formula/parhel.rb
-          git commit -m "parhel ${{ needs.build.outputs.version }}"
-          git push
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
