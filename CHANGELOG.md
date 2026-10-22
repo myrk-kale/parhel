@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `doctor --fix` could delete a legitimate worktree whose directory name only
+  looked like parhel's staging (`.parhel-staging-feature`), uncommitted work
+  included. Only `<staging dir>/<name>` counts as parhel's now, and without a
+  journal a registered worktree's files are never deleted: the registration is
+  dropped only once its directory is gone.
+- Relocating into a path with spaces broke scripts whose shebang named the
+  interpreter (for example a virtualenv's `pip`): the kernel splits a shebang
+  at whitespace. Such shebangs are now written as `#!/usr/bin/env -S "<path>"`
+  with the path escaped.
+
 ## [0.2.1] - 2026-10-22
 
 ### Added

@@ -47,7 +47,7 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 | U-PATH-01…19, P1…P3 | Lexical destination resolution, placement (`dest-is-source`, `dest-inside-git-dir`, nested), staging naming | `src/domain/paths.rs` |
 | U-EXCL-01…10, P1…P2 | Exclusion set: root `.git`, nested staging, nested worktrees, submodules, component-wise matching | `src/domain/exclusions.rs` |
 | U-GIT-01…03 | Re-pointing touches only its own registration; branch deletion is compare-and-delete (`update-ref -d`); option-like revisions never reach git | `src/git/cli.rs` |
-| U-REL-01…07, P1 | Relocation of the source path: recorded forms (shebang, JSON, `file://`), boundaries (`/w/src2`, `/w/src.bak`, `/other/w/src`), `/private` alias, binaries reported, symlinks | `src/domain/relocate.rs` |
+| U-REL-01…08, P1 | Relocation of the source path: recorded forms (shebang, JSON, `file://`), boundaries (`/w/src2`, `/w/src.bak`, `/other/w/src`), `/private` alias, binaries reported, symlinks | `src/domain/relocate.rs` |
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
 | U-ENV-01…05 | Child `git` env sanitization, locale, cwd/args, error mapping, `GIT_OPTIONAL_LOCKS=0` | `src/git/runner.rs` |
@@ -171,6 +171,7 @@ or untouched.
 | I-80a…f | Healthy, non-APFS, orphan staging, orphan registration (branch kept without journal), foreign gitfile (never touched), outside repo |
 | I-80g | `doctor --fix` during a live `add` reports `in-progress` and touches nothing; the run then succeeds |
 | I-80h | `doctor --fix` cleaning an orphan registration keeps unrelated, unreachable worktrees registered |
+| I-80k | Legitimate worktrees whose names look like staging (`.parhel-staging-feature`, `.parhel-staging-x/feat`) survive `doctor --fix` |
 | I-80j | A forged journal cannot make `doctor --fix` delete a directory or branch outside its staging folder |
 
 ### Lifecycle — `tests/add_lifecycle.rs`
@@ -229,6 +230,7 @@ or untouched.
 |---|---|
 | I-150 | Script shebang, config and absolute symlink recording the source point at the copy; source untouched |
 | I-151 | Real Python venv: `sys.prefix`, `pip` and `activate` of the copy are the copy's |
+| I-151b | A virtualenv copied to a path with spaces: `pip` runs (shebang through `env -S`) |
 | I-152 | Paths that only look like the source are left alone |
 | I-153 | Tracked files are never rewritten |
 | I-154 | Files over 1 MiB are left as cloned (still sharing blocks) |

@@ -115,7 +115,8 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
             }
         }
     }
-    let in_staging = |path: &Path| path.components().any(|c| is_staging_name(c.as_os_str()));
+    // parhel stages a worktree as `<staging dir>/<name>`, nothing else.
+    let in_staging = |path: &Path| staging_of(path).is_some();
     let registrations: Vec<PathBuf> = worktrees
         .iter()
         .map(|w| w.path.clone())
@@ -183,7 +184,7 @@ fn fix(
             for reg in registrations.iter().filter(|r| r.starts_with(staging)) {
                 ok &= match published_dest(env, staging, reg, None) {
                     Some(dest) => env.git.repoint_worktree(&repo.toplevel, reg, &dest).is_ok(),
-                    None => remove_registration(env, repo, reg),
+                    None => forget_missing(env, repo, reg),
                 };
                 handled.push(reg.clone());
             }
@@ -213,7 +214,7 @@ fn fix(
         let published = staging_of(reg).and_then(|s| published_dest(env, &s, reg, None));
         let fixed = match published {
             Some(dest) => env.git.repoint_worktree(&repo.toplevel, reg, &dest).is_ok(),
-            None => remove_registration(env, repo, reg),
+            None => forget_missing(env, repo, reg),
         };
         if fixed {
             report
@@ -264,14 +265,11 @@ fn trusted(
 
 /// The `.parhel-staging-*` directory `path` lies in, if any.
 fn staging_of(path: &Path) -> Option<PathBuf> {
-    let mut prefix = PathBuf::new();
-    for component in path.components() {
-        prefix.push(component);
-        if is_staging_name(component.as_os_str()) {
-            return Some(prefix);
-        }
-    }
-    None
+    let parent = path.parent()?;
+    parent
+        .file_name()
+        .is_some_and(is_staging_name)
+        .then(|| parent.to_path_buf())
 }
 
 /// Where the crashed run published `staged`, if the exclusive rename happened.
@@ -324,12 +322,12 @@ fn complete_publish(
         && env.fs.remove_dir_all(staging).is_ok()
 }
 
-fn remove_registration(env: &Env<'_>, repo: &RepoInfo, path: &Path) -> bool {
-    if env.git.worktree_remove_force(&repo.toplevel, path).is_ok() {
-        return true;
-    }
-    let removed = env.fs.remove_dir_all(path).is_ok();
-    removed && env.git.unregister_worktree(&repo.toplevel, path).is_ok()
+/// Without a trusted journal nothing proves a registered worktree is parhel's
+/// (its name alone proves nothing): its files are never deleted. Only a
+/// registration whose directory is gone is dropped.
+fn forget_missing(env: &Env<'_>, repo: &RepoInfo, path: &Path) -> bool {
+    !env.fs.exists_no_follow(path).unwrap_or(true)
+        && env.git.unregister_worktree(&repo.toplevel, path).is_ok()
 }
 
 /// Walk the source (not following symlinks, skipping the root `.git`) for `.git`
@@ -375,9 +373,8 @@ fn find_foreign_gitfiles(env: &Env<'_>, repo: &RepoInfo, dir: &Path, report: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fakes::{Call, SHA_A, Step, World, p};
+    use crate::app::fakes::{Call, SHA_A, World, p};
     use crate::app::rollback::{JOURNAL_FILE, Journal};
-    use crate::domain::ErrorCode;
     use crate::git::parse::WorktreeEntry;
     use crate::ports::VolumeInfo;
     use std::ffi::OsString;
@@ -762,11 +759,12 @@ mod tests {
         assert_repaired_not_removed(&w);
     }
 
-    // U-DOC-14: orphan registration (not published) whose removal fails: only that
-    // registration goes, never a global prune.
+    // U-DOC-14: without a journal a registration is parhel's only by its name,
+    // which proves nothing: its files are never deleted; it is dropped (alone,
+    // never with a global prune) only once its directory is gone.
     #[test]
-    fn orphan_registration_cleanup_is_scoped() {
-        let w = crashed_world().failing(Step::RemoveForce, ErrorCode::GitFailed);
+    fn journal_less_registration_is_only_dropped_when_missing() {
+        let w = crashed_world();
         let staging = p("/w/.parhel-staging-dead");
         w.files.borrow_mut().remove(&staging.join(JOURNAL_FILE));
         w.tree
@@ -774,14 +772,23 @@ mod tests {
             .get_mut(&staging)
             .unwrap()
             .retain(|n| n != JOURNAL_FILE);
-        assert!(run(&w, true).healthy());
-        assert_eq!(
-            w.count(|c| *c
-                == Call::Unregister {
-                    path: staging.join("feat")
-                }),
-            1
+        let unregister = Call::Unregister {
+            path: staging.join("feat"),
+        };
+        assert!(!run(&w, true).healthy(), "present: kept and still reported");
+        assert!(
+            w.calls().iter().all(|c| matches!(c, Call::Lock(_))),
+            "{:#?}",
+            w.calls()
         );
+        w.tree.borrow_mut().remove(&staging.join("feat"));
+        w.tree
+            .borrow_mut()
+            .get_mut(&staging)
+            .unwrap()
+            .retain(|n| n != "feat");
+        run(&w, true);
+        assert_eq!(w.count(|c| *c == unregister), 1);
     }
 
     // U-DOC-15: the staging dir of a crashed run may sit next to a destination far
