@@ -42,17 +42,18 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 
 | ID | Area | File |
 |---|---|---|
-| U-CLI-01…14 | Flag parsing, conflicts, defaults, help/version, non-UTF-8 paths, option-like names | `src/cli.rs` |
+| U-CLI-01…16 | Flag parsing, conflicts, defaults, help/version, non-UTF-8 paths, option-like names | `src/cli.rs` |
 | U-ARGS-01…03 | `git worktree add` argv: every mode, values always after `--end-of-options` | `src/git/cli.rs` |
 | U-PATH-01…19, P1…P3 | Lexical destination resolution, placement (`dest-is-source`, `dest-inside-git-dir`, nested), staging naming | `src/domain/paths.rs` |
-| U-EXCL-01…09, P1…P2 | Exclusion set: root `.git`, nested staging, nested worktrees, submodules, component-wise matching | `src/domain/exclusions.rs` |
+| U-EXCL-01…10, P1…P2 | Exclusion set: root `.git`, nested staging, nested worktrees, submodules, component-wise matching | `src/domain/exclusions.rs` |
+| U-REL-01…06, P1 | Relocation of the source path: recorded forms (shebang, JSON, `file://`), boundaries (`/w/src2`, `/w/src.bak`, `/other/w/src`), `/private` alias, binaries reported, symlinks | `src/domain/relocate.rs` |
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
 | U-ENV-01…04 | Child `git` env sanitization, locale, cwd/args, error mapping | `src/git/runner.rs` |
 | U-FS-01…19 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check | `src/fs/apfs.rs` |
 | U-RB-01…08, P1 (U-RB-06: fallback removes only its own registration, never `worktree prune`) | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
-| U-TXN-01…63 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links | `src/app/add.rs` |
-| U-DOC-01…14 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
+| U-TXN-01…74 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs, dirty submodules with reinit | `src/app/add.rs` |
+| U-DOC-01…16 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
 
 ## Integration tests (`tests/*.rs`, real `git`, real APFS)
 
@@ -98,11 +99,12 @@ or untouched.
 | I-20 | Nested submodules re-initialized recursively |
 | I-21 | Declared but uninitialized submodule does not block |
 | I-22 | `reinit` works offline and keeps the declared URL |
+| I-22b | `--allow-dirty --submodules=reinit` with a dirty submodule → `dirty-submodule`, no trace |
 
 ### Fidelity — `tests/add_fidelity.rs`
 | ID | Behavior |
 |---|---|
-| I-23a…h | Symlinks (relative, absolute, dangling, to dir, ignored) not followed; modes; empty dirs; xattrs; NFD names and spaces; hard links decoupled; eol attributes; mtimes |
+| I-23a…i | Symlinks (relative, absolute, dangling, to dir, ignored) not followed; modes; empty dirs; xattrs; NFD names and spaces; hard links decoupled; eol attributes; mtimes; directory permissions not widened |
 | I-24 | Sparse-checkout → `sparse-checkout` refusal |
 
 ### Races — `tests/add_race.rs` (bug 1)
@@ -127,6 +129,7 @@ or untouched.
 | I-45 | SIGKILL → `doctor` reports, `doctor --fix` restores, branch reusable |
 | I-45b | SIGKILL between the publishing rename and `worktree repair` → `doctor --fix` repairs the destination; branch and user files kept |
 | I-45c | Same, with the journal lost (truncated): publication is detected from the disk |
+| I-45d | Same, destination in another folder: the staging dir is found through the registration |
 | I-46 | Rollback's fallback cleanup keeps unrelated, unreachable worktrees (unmounted disk) registered |
 
 ### Filesystems — `tests/add_filesystems.rs` (disk images)
@@ -214,6 +217,20 @@ or untouched.
 | I-135 / I-136 | `uchg` files are cloned with their flag; rollback still removes staging |
 | I-137 | FIFO and socket inside ignored dirs |
 | I-138 | 30k files + 64 MiB in under 10 s |
+
+### Relocation — `tests/add_relocate.rs`
+| ID | Behavior |
+|---|---|
+| I-150 | Script shebang, config and absolute symlink recording the source point at the copy; source untouched |
+| I-151 | Real Python venv: `sys.prefix`, `pip` and `activate` of the copy are the copy's |
+| I-152 | Paths that only look like the source are left alone |
+| I-153 | Tracked files are never rewritten |
+| I-154 | Files over 1 MiB are left as cloned (still sharing blocks) |
+| I-155 | Binaries mentioning the source are reported, not edited |
+| I-156 | `--no-relocate` copies as is |
+| I-157 | Read-only files are relocated and stay read-only |
+| I-158 | `.parhelignore` keeps untracked paths out; tracked files always present |
+| I-159 | A linked worktree of another repository inside an ignored folder is detached in the copy |
 
 ## Not covered (needs infrastructure)
 
