@@ -1,0 +1,252 @@
+//! I-130..I-139: OS and filesystem limits.
+
+mod common;
+
+use std::ffi::OsStr;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use common::cow::write_blob;
+use common::volume::{DiskImage, ImageFs};
+use common::*;
+use serial_test::serial;
+
+fn is_immutable(p: &Path) -> bool {
+    let out = Command::new("ls").arg("-lO").arg(p).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("uchg")
+}
+
+fn chflags(p: &Path, flag: &str) {
+    assert!(
+        Command::new("chflags")
+            .arg(flag)
+            .arg(p)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+// I-130
+#[test]
+fn i130_unwritable_destination_parent() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let parent = sb.path("ro");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = RestoreMode(parent.clone(), 0o755);
+    let before = src.snapshot();
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&parent.join("feat"), &["--new-branch", "f"]),
+    );
+    assert_error(&out, "permission-denied");
+    assert!(
+        stderr(&out).contains(parent.to_str().unwrap()),
+        "{}",
+        stderr(&out)
+    );
+    before.assert_same(&src.snapshot());
+}
+
+// I-131: volume full — whatever step fails, nothing is left behind.
+#[test]
+#[serial(hdiutil)]
+fn i131_disk_full_leaves_no_trace() {
+    let sb = Sandbox::new();
+    let img = DiskImage::new(ImageFs::Apfs, 64);
+    let src = TestRepo::init_at(&sb.env, &img.mount.join("src"));
+    src.ignore(&["filler/"]);
+    let before = src.snapshot();
+    // Fill the volume until writes fail.
+    let mut i = 0;
+    loop {
+        let p = img.mount.join(format!("fill-{i}"));
+        if fs::write(&p, vec![0xA5u8; 1 << 20]).is_err() {
+            let _ = fs::remove_file(&p);
+            break;
+        }
+        i += 1;
+    }
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&img.mount.join("dest"), &["--new-branch", "full"]),
+    );
+    for j in 0..=i {
+        let _ = fs::remove_file(img.mount.join(format!("fill-{j}")));
+    }
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        ["error[git-failed]", "error[clone-failed]", "error[io]"]
+            .iter()
+            .any(|c| err.contains(c)),
+        "disk-full maps to a real failure, not a stub: {err}"
+    );
+    before.assert_same(&src.snapshot());
+    assert!(!img.mount.join("dest").exists());
+    assert_no_staging(&[&img.mount]);
+}
+
+// I-132: very deep trees near PATH_MAX either clone fully or fail cleanly.
+#[test]
+fn i132_paths_near_path_max() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let budget = 1000usize.saturating_sub(src.root.as_os_str().len() + 20);
+    let mut rel = std::path::PathBuf::from("node_modules");
+    while rel.as_os_str().len() + 12 < budget {
+        rel.push("dddddddddd");
+    }
+    src.write(rel.join("leaf.js"), "deep");
+    let before = src.snapshot();
+    let dest = sb.path("deep-feat-with-a-longer-name");
+    let out = parhel(&sb.env, &src.root, &add_args(&dest, &["--new-branch", "d"]));
+    if out.status.success() {
+        assert_eq!(
+            fs::read_to_string(dest.join(&rel).join("leaf.js")).unwrap(),
+            "deep"
+        );
+    } else {
+        assert_error(&out, "clone-failed");
+        before.assert_same(&src.snapshot());
+        assert_no_staging(&[&sb.root]);
+    }
+}
+
+// I-133: APFS cannot store non-UTF-8 names -> refused before anything happens.
+#[test]
+fn i133_non_utf8_destination_is_refused() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let before = src.snapshot();
+    let dest = sb.root.join(OsStr::from_bytes(b"feat-\xff"));
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &[OsStr::new("add"), dest.as_os_str(), OsStr::new("--detach")],
+    );
+    assert_error(&out, "invalid-path");
+    before.assert_same(&src.snapshot());
+    assert_no_staging(&[&sb.root]);
+}
+
+// I-134: APFS is normalization-insensitive: NFC request vs existing NFD dir.
+#[test]
+fn i134_normalization_equivalent_destination_exists() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    fs::create_dir(sb.path("cafe\u{301}")).unwrap();
+    fs::write(sb.path("cafe\u{301}/mine.txt"), "keep").unwrap();
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&sb.path("caf\u{e9}"), &["--new-branch", "c"]),
+    );
+    assert_error(&out, "dest-exists");
+    assert_eq!(
+        fs::read_to_string(sb.path("cafe\u{301}/mine.txt")).unwrap(),
+        "keep"
+    );
+}
+
+// I-135: immutable (uchg) ignored file is cloned with its flag.
+#[test]
+fn i135_immutable_file_is_cloned() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.write("target/frozen.bin", "frozen");
+    chflags(&src.path("target/frozen.bin"), "uchg");
+    let dest = sb.path("dest");
+    assert_success(&parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "u"]),
+    ));
+    assert_eq!(
+        fs::read_to_string(dest.join("target/frozen.bin")).unwrap(),
+        "frozen"
+    );
+    assert!(is_immutable(&dest.join("target/frozen.bin")));
+}
+
+// I-136: rollback removes staging even when it contains immutable files.
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[test]
+fn i136_rollback_with_immutable_file() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.write("target/frozen.bin", "frozen");
+    chflags(&src.path("target/frozen.bin"), "uchg");
+    let before = src.snapshot();
+    let out = parhel_with_failpoints(
+        &sb.env,
+        &src.root,
+        &add_args(&sb.path("dest"), &["--new-branch", "u"]),
+        "after_clone=error",
+    );
+    assert_error(&out, "failpoint");
+    assert_no_staging(&[&sb.root]);
+    before.assert_same(&src.snapshot());
+    assert!(
+        is_immutable(&src.path("target/frozen.bin")),
+        "source flag untouched"
+    );
+}
+
+// I-137: FIFOs and sockets (dev servers) inside ignored dirs do not break the clone.
+#[test]
+fn i137_fifo_and_socket_in_ignored_dir() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.mkdir("target/run");
+    let fifo = src.path("target/run/pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sock_path = src.path("target/run/app.sock");
+    let _sock = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    let dest = sb.path("dest");
+    assert_success(&parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "s"]),
+    ));
+    let md = fs::symlink_metadata(dest.join("target/run/pipe")).unwrap();
+    assert!(md.file_type().is_fifo());
+    TestRepo::open(&sb.env, &dest).assert_clean();
+}
+
+// I-138: performance budget on a large ignored tree (30k files).
+#[test]
+fn i138_large_tree_within_time_budget() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    for d in 0..300 {
+        for f in 0..100 {
+            src.write(format!("node_modules/p{d}/f{f}.js"), "x");
+        }
+    }
+    write_blob(&src.path("target/big.bin"), 64 << 20, 5);
+    let start = Instant::now();
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&sb.path("dest"), &["--new-branch", "p"]),
+    );
+    let elapsed = start.elapsed();
+    assert_success(&out);
+    assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    assert!(sb.path("dest/node_modules/p299/f99.js").is_file());
+}
