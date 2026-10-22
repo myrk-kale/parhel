@@ -337,15 +337,19 @@ impl TestRepo {
             .collect()
     }
 
+    // Without `--path-format=absolute` (git 2.31): the suite also runs on git 2.29.
     pub fn common_dir(&self) -> PathBuf {
-        let p =
-            PathBuf::from(self.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]));
-        fs::canonicalize(p).unwrap()
+        let p = PathBuf::from(self.git(&["rev-parse", "--git-common-dir"]));
+        fs::canonicalize(if p.is_absolute() {
+            p
+        } else {
+            self.root.join(p)
+        })
+        .unwrap()
     }
 
     pub fn git_dir(&self) -> PathBuf {
-        let p = PathBuf::from(self.git(&["rev-parse", "--path-format=absolute", "--git-dir"]));
-        fs::canonicalize(p).unwrap()
+        fs::canonicalize(self.git(&["rev-parse", "--absolute-git-dir"])).unwrap()
     }
 
     /// Plain `git worktree add -b <branch> <path>`; returns a handle to it.

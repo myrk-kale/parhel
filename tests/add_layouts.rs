@@ -333,3 +333,50 @@ fn i109_destination_inside_submodule_is_refused() {
     assert!(!dest.exists());
     before.assert_same(&src.snapshot());
 }
+
+// I-180: with `worktree.useRelativePaths` (git 2.48+) git links worktrees with
+// relative paths; written from the staging dir they would break after the move.
+#[test]
+fn i180_relative_worktree_links() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.git(&["config", "worktree.useRelativePaths", "true"]);
+    with_heavy_ignored(&src);
+    let dest = sb.path("rel-feat");
+    let wt = add_ok(&sb, &src.root, &dest, &["--new-branch", "f"]);
+    wt.assert_clean();
+    assert_eq!(wt.current_branch().as_deref(), Some("f"));
+    src.git(&["worktree", "prune", "--expire", "now"]);
+    assert!(
+        src.worktree_paths().contains(&wt.root),
+        "registration survives a prune"
+    );
+    wt.write("x", "x");
+    wt.commit_all("works");
+}
+
+// I-181: with per-worktree configuration, the new worktree sees exactly what a
+// plain `git worktree add` sees, and the source's own config.worktree is untouched.
+#[test]
+fn i181_worktree_config_matches_plain_git() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.git(&["config", "extensions.worktreeConfig", "true"]);
+    src.git(&["config", "--worktree", "user.name", "Source Only"]);
+    let source_worktree_config = fs::read(src.git_dir().join("config.worktree")).unwrap();
+    let plain = sb.path("plain");
+    src.git(&["worktree", "add", "-q", "-b", "p", plain.to_str().unwrap()]);
+    let expected = TestRepo::open(&sb.env, &plain).git(&["config", "user.name"]);
+    let dest = sb.path("wtc-feat");
+    let wt = add_ok(&sb, &src.root, &dest, &["--new-branch", "f"]);
+    wt.assert_clean();
+    assert_eq!(
+        wt.git(&["config", "user.name"]),
+        expected,
+        "same as plain git"
+    );
+    assert_eq!(
+        fs::read(src.git_dir().join("config.worktree")).unwrap(),
+        source_worktree_config
+    );
+}

@@ -53,6 +53,7 @@ something looks wrong, please
 - [How it works](#how-it-works)
 - [What parhel writes, and where](#what-parhel-writes-and-where)
 - [What happens when things go wrong](#what-happens-when-things-go-wrong)
+- [Security and privacy](#security-and-privacy)
 - [Limitations](#limitations)
 - [FAQ](#faq)
 - [Error codes](#error-codes)
@@ -86,6 +87,14 @@ With Cargo (Rust 1.85 or newer), from crates.io or straight from the repository:
 ```sh
 cargo install parhel
 cargo install --git https://github.com/myrk-kale/parhel
+```
+
+Release binaries carry a signed build provenance attestation, so you can check
+that a download was built by this repository's release workflow from a given
+commit:
+
+```sh
+gh attestation verify parhel-v0.2.0-universal-apple-darwin.tar.gz -R myrk-kale/parhel
 ```
 
 Then check that git can find it:
@@ -328,6 +337,38 @@ Other cases the tests cover:
 - With `--allow-dirty --submodules=reinit`, a submodule with uncommitted changes
   stops the command (`dirty-submodule`): reinit checks out the recorded commit,
   so those changes would not be in the copy.
+
+## Security and privacy
+
+parhel has no telemetry and makes no network requests of its own. The only
+network access that can happen is git's: `--submodules=reinit` clones each
+submodule from your local copy, and git contacts the submodule's remote only if
+a needed commit is missing locally.
+
+Things worth knowing before you use it:
+
+- Secrets come along. Ignored files are copied, and that includes `.env`
+  files and other local credentials. They keep their permissions, and new
+  directories get the source's, but if you create a worktree in a shared or
+  synced folder, those files go with it. List anything that must not be copied
+  in `.parhelignore`.
+- Relocation edits text in the copy. Rewriting the source path changes the
+  length of a file's contents. A format that stores its own length or checksum
+  (some serialized caches, lockfiles with integrity hashes) may then be rejected
+  by its tool, which usually rebuilds it. Your source is never edited. Use
+  `--no-relocate`, or list such paths in `.parhelignore`.
+- Builds running during `add`. parhel stops if tracked or untracked files
+  change while it copies, but ignored files may change freely, so a build
+  writing its cache at that moment can leave a half-written cache file in the
+  copy. Run `add` when nothing is building, or rebuild in the new worktree.
+- The binary is not signed by Apple. Instead of an Apple signature, every
+  release has a build provenance attestation (see [Install](#install)).
+  Homebrew and the install script are not affected by Gatekeeper.
+- Git does the git work. parhel runs the `git` on your `PATH` (2.29 or newer;
+  CI also tests 2.29 and 2.39 built from source), so your git configuration and
+  its safety checks such as `safe.directory` apply.
+
+Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Limitations
 

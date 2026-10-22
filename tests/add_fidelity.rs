@@ -175,7 +175,10 @@ fn i23h_mtimes_are_preserved() {
 fn i24_sparse_checkout_is_refused() {
     let sb = Sandbox::new();
     let src = project(&sb);
-    src.git(&["sparse-checkout", "set", "--no-cone", "/src/"]);
+    // The pre-`sparse-checkout` mechanism, valid on every supported git version.
+    src.git(&["config", "core.sparseCheckout", "true"]);
+    std::fs::write(src.git_dir().join("info/sparse-checkout"), "/src/\n").unwrap();
+    src.git(&["read-tree", "-mu", "HEAD"]);
     let before = src.snapshot();
     let dest = sb.path("sparse");
     let out = parhel(

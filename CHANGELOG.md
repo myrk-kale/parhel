@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Release archives carry a signed build provenance attestation
+  (`gh attestation verify`).
+- CI runs the whole suite against git 2.29 and 2.39 built from source.
+- README "Security and privacy" section.
+
+### Fixed
+
+- The declared minimum git version (2.29) was not true: parhel used
+  `rev-parse --path-format=absolute`, which needs git 2.31. It no longer does.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added

@@ -18,6 +18,11 @@ jobs:
     name: Build universal binary
     needs: ci
     runs-on: macos-15
+    permissions:
+      contents: write
+      # Signed build provenance (SLSA), verifiable with `gh attestation verify`.
+      id-token: write
+      attestations: write
     outputs:
       archive: ${{ steps.package.outputs.archive }}
       sha256: ${{ steps.package.outputs.sha256 }}
@@ -60,6 +65,12 @@ jobs:
           (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
           echo "sha256=$(cut -d' ' -f1 "dist/${archive}.sha256")" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/${{ steps.package.outputs.archive }}
+            git-parhel
       - name: Release notes from CHANGELOG
         run: |
           awk -v v="${{ steps.version.outputs.version }}" '
