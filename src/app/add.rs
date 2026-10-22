@@ -209,6 +209,25 @@ fn check_source_state(
             ),
         ));
     }
+    if request.allow_dirty && request.submodules == SubmodulePolicy::Reinit {
+        let mut dirty = Vec::new();
+        for sub in submodules {
+            if env.git.is_dirty(&repo.toplevel.join(sub), &[])? {
+                dirty.push(sub.clone());
+            }
+        }
+        if !dirty.is_empty() {
+            return Err(Error::new(
+                ErrorCode::DirtySubmodule,
+                format!(
+                    "submodules with uncommitted changes: {}; --submodules=reinit checks out \
+                     their recorded commits, so those changes would not be in the new \
+                     worktree. Commit or stash them inside each submodule first",
+                    list(&dirty)
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -376,28 +395,7 @@ fn assemble(
         exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
         user_excluded: git.parhelignored(&repo.toplevel)?,
     });
-    let ops = clone_plan::plan(
-        &Lister {
-            fs,
-            root: &repo.toplevel,
-        },
-        &exclusions,
-    )?;
-    for (i, op) in ops.iter().enumerate() {
-        match op {
-            CloneOp::CreateDir(rel) => {
-                fs.create_dir(&staged.join(rel))?;
-                fs.copy_mode(&repo.toplevel.join(rel), &staged.join(rel))?;
-            }
-            CloneOp::Clone(rel) => fs.clone_entry(&repo.toplevel.join(rel), &staged.join(rel))?,
-        }
-        if i == 0 {
-            crate::failpoint!("mid_clone");
-        }
-        check_interrupt(env)?;
-    }
-    // `git worktree add` created the root with default permissions.
-    fs.copy_mode(&repo.toplevel, &staged)?;
+    clone_tree(env, &repo.toplevel, &staged, &exclusions)?;
     crate::failpoint!("after_clone");
     check_interrupt(env)?;
 
@@ -446,6 +444,27 @@ fn assemble(
     fs.write_file(&journal_path, &journal.encode())?;
     fs.rename_exclusive(&staged, &plan.destination)?;
     Ok(report)
+}
+
+/// Clone the source into `staged`, minus `exclusions`.
+fn clone_tree(env: &Env<'_>, source: &Path, staged: &Path, exclusions: &Exclusions) -> Result<()> {
+    let fs = env.fs;
+    let ops = clone_plan::plan(&Lister { fs, root: source }, exclusions)?;
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            CloneOp::CreateDir(rel) => {
+                fs.create_dir(&staged.join(rel))?;
+                fs.copy_mode(&source.join(rel), &staged.join(rel))?;
+            }
+            CloneOp::Clone(rel) => fs.clone_entry(&source.join(rel), &staged.join(rel))?,
+        }
+        if i == 0 {
+            crate::failpoint!("mid_clone");
+        }
+        check_interrupt(env)?;
+    }
+    // `git worktree add` created the root with default permissions.
+    fs.copy_mode(source, staged)
 }
 
 /// Walk the staged worktree's untracked files (tracked files and submodules are
@@ -1895,5 +1914,40 @@ mod tests {
         let mode = w.position(|c| matches!(c, Call::CopyMode { .. })).unwrap();
         let rename = w.position(|c| matches!(c, Call::Rename { .. })).unwrap();
         assert!(mode < rename);
+    }
+
+    // U-TXN-73: reinit cannot carry uncommitted submodule changes: refuse instead
+    // of silently dropping them.
+    #[test]
+    fn allow_dirty_with_reinit_refuses_dirty_submodules() {
+        let w = World {
+            submodules: vec![p("libs/a"), p("libs/b")],
+            dirty_paths: [p("/w/repo/libs/b")].into(),
+            ..World::default()
+        };
+        let mut req = new_branch();
+        req.allow_dirty = true;
+        req.submodules = SubmodulePolicy::Reinit;
+        let err = run(&w, &req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::DirtySubmodule);
+        assert!(
+            err.message.contains("libs/b") && !err.message.contains("libs/a"),
+            "{}",
+            err.message
+        );
+        assert_no_mutation(&w);
+    }
+
+    // U-TXN-74: clean submodules with --allow-dirty and reinit are fine.
+    #[test]
+    fn allow_dirty_with_reinit_accepts_clean_submodules() {
+        let w = World {
+            submodules: vec![p("libs/a")],
+            ..World::default()
+        };
+        let mut req = new_branch();
+        req.allow_dirty = true;
+        req.submodules = SubmodulePolicy::Reinit;
+        run(&w, &req).unwrap();
     }
 }
