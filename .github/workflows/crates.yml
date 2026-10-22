@@ -1,17 +1,11 @@
 name: crates.io
 
-# Publishes the crate for a released version. Called by the release workflow and
-# runnable by hand for an existing tag. The token is only read from the
-# CARGO_REGISTRY_TOKEN secret.
+# Publishes the crate for a released tag using crates.io Trusted Publishing:
+# GitHub's OIDC token is exchanged for a short-lived crates.io token, so no
+# long-lived secret is stored. crates.io trusts this workflow file
+# (myrk-kale/parhel, crates.yml); it must run as its own workflow, not as a
+# reusable one, so release.yml dispatches it instead of calling it.
 on:
-  workflow_call:
-    inputs:
-      tag:
-        required: true
-        type: string
-    secrets:
-      CARGO_REGISTRY_TOKEN:
-        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -20,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -33,9 +28,14 @@ jobs:
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           test "v${version}" = "${{ inputs.tag }}"
+      # Authenticate first, even when the version is already published, so a
+      # manual run against an existing tag verifies the Trusted Publishing setup.
+      - name: Authenticate with crates.io (OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish (skips if this version is already on crates.io)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           if curl -fsS -A "parhel-release (github.com/myrk-kale/parhel)" \

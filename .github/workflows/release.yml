@@ -88,9 +88,13 @@ jobs:
       HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
 
   crates:
+    name: Dispatch crates.io publish
     needs: build
-    uses: ./.github/workflows/crates.yml
-    with:
-      tag: ${{ github.ref_name }}
-    secrets:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Run crates.yml for this tag (Trusted Publishing needs its own run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run crates.yml -R "$GITHUB_REPOSITORY" -f tag="${GITHUB_REF_NAME}"
