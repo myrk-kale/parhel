@@ -192,3 +192,35 @@ fn i80h_fix_keeps_unreachable_worktrees_registered() {
     );
     assert!(!staging.exists());
 }
+
+// I-80j: a journal is plain data anyone can drop in a `.parhel-staging-*` folder.
+// doctor --fix must not follow it outside that folder (reported by a review:
+// a forged journal made it delete an arbitrary directory).
+#[test]
+fn i80j_forged_journal_cannot_delete_outside_its_folder() {
+    use parhel::app::rollback::Journal;
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let victim = sb.path("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::write(victim.join("precious.txt"), "keep me").unwrap();
+    src.git(&["branch", "victim-branch"]);
+    let tip = src.branch_tip("victim-branch");
+    let staging = sb.path(".parhel-staging-evil");
+    fs::create_dir(&staging).unwrap();
+    let journal = Journal {
+        repo: src.root.clone(),
+        worktree: Some(victim.clone()),
+        created_branch: Some("victim-branch".into()),
+        publish_to: Some(victim.clone()),
+        branch_start: tip.clone(),
+    };
+    fs::write(staging.join("journal"), journal.encode()).unwrap();
+
+    parhel(&sb.env, &src.root, &["doctor", "--fix"]);
+    assert_eq!(
+        fs::read_to_string(victim.join("precious.txt")).unwrap(),
+        "keep me"
+    );
+    assert_eq!(src.branch_tip("victim-branch"), tip, "branch kept");
+}

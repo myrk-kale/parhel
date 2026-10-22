@@ -80,7 +80,9 @@ pub trait Git {
     /// touches other worktrees whose directories are merely unreachable (e.g. on an
     /// unmounted disk). No-op when nothing is registered at `path`.
     fn unregister_worktree(&self, repo: &Path, path: &Path) -> Result<()>;
-    fn branch_delete(&self, repo: &Path, name: &str) -> Result<()>;
+    /// Delete `refs/heads/<name>` only if it still points at `expected`, atomically
+    /// (`git update-ref -d`): a branch that moved meanwhile is never deleted.
+    fn branch_delete(&self, repo: &Path, name: &str, expected: &str) -> Result<()>;
 }
 
 /// What [`CowFs::scan`] found under a root (paths relative to it).
