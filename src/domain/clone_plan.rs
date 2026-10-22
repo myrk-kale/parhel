@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::error::Result;
+use super::error::{Error, ErrorCode, Result};
 use super::exclusions::Exclusions;
 
 /// Read-only view of the source tree, relative to its root (`""` is the root).
@@ -29,8 +29,57 @@ pub enum CloneOp {
 /// Build the plan. Ops are ordered parent-before-child and, within a directory,
 /// by entry name, so runs are deterministic. Listing failures map to `clone-failed`.
 pub fn plan(tree: &dyn DirLister, exclusions: &Exclusions) -> Result<Vec<CloneOp>> {
-    let _ = (tree, exclusions);
-    todo!("clone_plan::plan")
+    let mut ops = Vec::new();
+    let root = list(tree, Path::new(""))?.unwrap_or_default();
+    descend(tree, exclusions, Path::new(""), root, &mut ops)?;
+    Ok(ops)
+}
+
+/// Sorted entries of `dir`, or `None` when it is not a directory (a file that merely
+/// sits where an exclusion path would continue).
+fn list(tree: &dyn DirLister, dir: &Path) -> Result<Option<Vec<OsString>>> {
+    match tree.list(dir) {
+        Ok(mut names) => {
+            names.sort();
+            Ok(Some(names))
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(Error::new(
+            ErrorCode::CloneFailed,
+            format!("cannot list `{}`: {e}", dir.display()),
+        )),
+    }
+}
+
+fn descend(
+    tree: &dyn DirLister,
+    exclusions: &Exclusions,
+    dir: &Path,
+    names: Vec<OsString>,
+    ops: &mut Vec<CloneOp>,
+) -> Result<()> {
+    for name in names {
+        let relative = dir.join(&name);
+        if exclusions.is_excluded(&relative) {
+            continue;
+        }
+        if exclusions.is_ancestor_of_excluded(&relative) {
+            if let Some(children) = list(tree, &relative)? {
+                ops.push(CloneOp::CreateDir(relative.clone()));
+                descend(tree, exclusions, &relative, children, ops)?;
+                continue;
+            }
+        }
+        ops.push(CloneOp::Clone(relative));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

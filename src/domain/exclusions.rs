@@ -34,23 +34,46 @@ impl Exclusions {
     /// redundant and dropped.
     #[must_use]
     pub fn compute(input: &ExclusionInput) -> Self {
-        let _ = input;
-        todo!("Exclusions::compute")
+        let root = &input.source_root;
+        let nested = |abs: &PathBuf| -> Option<PathBuf> {
+            abs.strip_prefix(root)
+                .ok()
+                .filter(|rel| rel.components().next().is_some())
+                .map(Path::to_path_buf)
+        };
+        let mut candidates: BTreeSet<PathBuf> = BTreeSet::from([PathBuf::from(".git")]);
+        candidates.extend(input.staging_dir.iter().filter_map(nested));
+        candidates.extend(input.other_worktrees.iter().filter_map(nested));
+        if input.exclude_submodules {
+            candidates.extend(
+                input
+                    .submodule_paths
+                    .iter()
+                    .filter(|p| p.components().next().is_some())
+                    .cloned(),
+            );
+        }
+        let paths = candidates
+            .iter()
+            .filter(|p| !candidates.iter().any(|q| q != *p && p.starts_with(q)))
+            .cloned()
+            .collect();
+        Self { paths }
     }
 
     /// Whether `relative` itself is excluded (component-wise, not string prefix).
     #[must_use]
     pub fn is_excluded(&self, relative: &Path) -> bool {
-        let _ = relative;
-        todo!("Exclusions::is_excluded")
+        self.paths.iter().any(|p| relative.starts_with(p))
     }
 
     /// Whether `relative` is a strict ancestor of an excluded path, i.e. the clone
     /// must descend into it instead of cloning it whole.
     #[must_use]
     pub fn is_ancestor_of_excluded(&self, relative: &Path) -> bool {
-        let _ = relative;
-        todo!("Exclusions::is_ancestor_of_excluded")
+        self.paths
+            .iter()
+            .any(|p| p != relative && p.starts_with(relative))
     }
 
     /// Excluded paths in sorted order.

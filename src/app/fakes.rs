@@ -276,7 +276,7 @@ impl Git for World {
         }
     }
 
-    fn is_dirty(&self, _: &Path) -> Result<bool> {
+    fn is_dirty(&self, _: &Path, _exclude: &[PathBuf]) -> Result<bool> {
         Ok(self.dirty || (self.dirty_after_clone && self.cloned_anything()))
     }
 
@@ -354,7 +354,7 @@ impl Git for World {
         )
     }
 
-    fn submodules_reinit(&self, worktree: &Path, _source: &Path) -> Result<()> {
+    fn submodules_reinit(&self, worktree: &Path, _source: &Path, _final: &Path) -> Result<()> {
         self.record(
             Call::SubmodulesReinit {
                 worktree: worktree.into(),

@@ -2,9 +2,9 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
-use crate::domain::Result;
+use crate::domain::{Error, ErrorCode, Result};
 
 /// Variables that would redirect git away from the repository we target with
 /// `-C`/`current_dir`. They are removed from every child `git` process.
@@ -46,15 +46,47 @@ impl GitRunner {
     /// and `LC_ALL=C` so messages are parseable.
     #[must_use]
     pub fn command<S: AsRef<OsStr>>(&self, cwd: &Path, args: &[S]) -> Command {
-        let _ = (cwd, args, &self.program);
-        todo!("GitRunner::command")
+        let mut cmd = Command::new(&self.program);
+        cmd.current_dir(cwd).args(args).stdin(Stdio::null());
+        for var in SANITIZED_ENV {
+            cmd.env_remove(var);
+        }
+        cmd.env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0");
+        cmd
     }
 
     /// Run to completion. Non-zero exit maps to `git-failed` with git's stderr.
     pub fn run<S: AsRef<OsStr>>(&self, cwd: &Path, args: &[S]) -> Result<Output> {
-        let _ = (cwd, args);
-        todo!("GitRunner::run")
+        let out = self.output(cwd, args)?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        Err(Error::new(
+            ErrorCode::GitFailed,
+            format!(
+                "`git {}` failed: {}",
+                display_args(args),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ))
     }
+
+    /// Run to completion and return the output whatever the exit status.
+    pub fn output<S: AsRef<OsStr>>(&self, cwd: &Path, args: &[S]) -> Result<Output> {
+        self.command(cwd, args).output().map_err(|e| {
+            Error::new(
+                ErrorCode::GitFailed,
+                format!("cannot run `{}`: {e}", self.program.display()),
+            )
+        })
+    }
+}
+
+fn display_args<S: AsRef<OsStr>>(args: &[S]) -> String {
+    args.iter()
+        .map(|a| a.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]

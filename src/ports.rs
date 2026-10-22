@@ -37,7 +37,9 @@ pub trait Git {
     fn version(&self) -> Result<GitVersion>;
     /// Errors: `not-a-repo`, `bare-repo`, `unborn-head`, `inside-git-dir`.
     fn discover(&self, from: &Path) -> Result<RepoInfo>;
-    fn is_dirty(&self, worktree: &Path) -> Result<bool>;
+    /// Uncommitted changes (ignored files excluded), skipping paths under `exclude`
+    /// (relative to `worktree`; used to ignore parhel's own staging dir).
+    fn is_dirty(&self, worktree: &Path, exclude: &[PathBuf]) -> Result<bool>;
     fn sparse_checkout_enabled(&self, worktree: &Path) -> Result<bool>;
     /// Index entries flagged `assume-unchanged` or `skip-worktree`: `status` cannot
     /// vouch for them, so they count as dirty.
@@ -60,7 +62,9 @@ pub trait Git {
     fn checkout_two_way(&self, worktree: &Path, from: &str, to: &str) -> Result<()>;
     /// Initialize submodules in `worktree` with their own git dirs, borrowing objects
     /// from `source` so no network is needed when they are present locally.
-    fn submodules_reinit(&self, worktree: &Path, source: &Path) -> Result<()>;
+    /// `worktree` is still in staging; links are written for its final location
+    /// `final_path`, so they stay valid after the publishing rename.
+    fn submodules_reinit(&self, worktree: &Path, source: &Path, final_path: &Path) -> Result<()>;
     fn worktree_repair(&self, repo: &Path, path: &Path) -> Result<()>;
     fn worktree_remove_force(&self, repo: &Path, path: &Path) -> Result<()>;
     fn worktree_prune(&self, repo: &Path) -> Result<()>;

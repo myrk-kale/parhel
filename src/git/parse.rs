@@ -1,8 +1,29 @@
 //! Parsers for git's machine-readable output. Pure functions over bytes.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use crate::domain::Result;
+use crate::domain::{Error, ErrorCode, Result};
+
+fn malformed(what: &str, detail: impl std::fmt::Display) -> Error {
+    Error::new(
+        ErrorCode::GitFailed,
+        format!("unexpected `git {what}` output: {detail}"),
+    )
+}
+
+fn path_from(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// NUL-separated fields, without the empty tail after the final NUL.
+fn fields(output: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let trimmed = output.strip_suffix(b"\0").unwrap_or(output);
+    trimmed
+        .split(|&b| b == 0)
+        .filter(move |_| !trimmed.is_empty())
+}
 
 /// Oldest git supported: `git worktree repair` appeared in 2.29.
 pub const MIN_GIT_VERSION: GitVersion = GitVersion {
@@ -21,14 +42,42 @@ pub struct GitVersion {
 /// Parse `git --version` output, tolerating vendor suffixes
 /// (`git version 2.39.5 (Apple Git-154)`, `2.45.1.windows.1`). Errors: `git-failed`.
 pub fn parse_version(output: &str) -> Result<GitVersion> {
-    let _ = output;
-    todo!("parse_version")
+    let rest = output
+        .trim()
+        .strip_prefix("git version ")
+        .ok_or_else(|| malformed("--version", output.trim()))?;
+    let token = rest.split_whitespace().next().unwrap_or_default();
+    let mut parts = token.split('.');
+    let mut number = |required: bool| -> Result<u32> {
+        match parts.next().map(str::parse::<u32>) {
+            Some(Ok(n)) => Ok(n),
+            None | Some(Err(_)) if !required => Ok(0),
+            _ => Err(malformed("--version", output.trim())),
+        }
+    };
+    Ok(GitVersion {
+        major: number(true)?,
+        minor: number(true)?,
+        patch: number(false)?,
+    })
 }
 
 /// `git-too-old` when `version < MIN_GIT_VERSION`.
 pub fn ensure_supported(version: GitVersion) -> Result<()> {
-    let _ = version;
-    todo!("ensure_supported")
+    if version < MIN_GIT_VERSION {
+        return Err(Error::new(
+            ErrorCode::GitTooOld,
+            format!(
+                "git {}.{}.{} is too old; parhel needs git {}.{} or newer",
+                version.major,
+                version.minor,
+                version.patch,
+                MIN_GIT_VERSION.major,
+                MIN_GIT_VERSION.minor
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// One record of `git worktree list --porcelain -z`.
@@ -49,41 +98,114 @@ pub struct WorktreeEntry {
 
 /// Parse `git worktree list --porcelain -z`. Errors: `git-failed` on malformed input.
 pub fn parse_worktree_list(output: &[u8]) -> Result<Vec<WorktreeEntry>> {
-    let _ = output;
-    todo!("parse_worktree_list")
+    let mut entries = Vec::new();
+    let mut current: Option<WorktreeEntry> = None;
+    for field in output.split(|&b| b == 0) {
+        if field.is_empty() {
+            entries.extend(current.take());
+            continue;
+        }
+        let (key, value) = match field.iter().position(|&b| b == b' ') {
+            Some(i) => (&field[..i], Some(&field[i + 1..])),
+            None => (field, None),
+        };
+        if key == b"worktree" {
+            entries.extend(current.take());
+            current = Some(WorktreeEntry {
+                path: path_from(value.unwrap_or_default()),
+                ..WorktreeEntry::default()
+            });
+            continue;
+        }
+        let entry = current
+            .as_mut()
+            .ok_or_else(|| malformed("worktree list", "attribute before `worktree` line"))?;
+        let text = || String::from_utf8_lossy(value.unwrap_or_default()).into_owned();
+        match key {
+            b"HEAD" => entry.head = Some(text()),
+            b"branch" => entry.branch = Some(text()),
+            b"bare" => entry.bare = true,
+            b"detached" => entry.detached = true,
+            b"locked" => entry.locked = Some(text()),
+            b"prunable" => entry.prunable = Some(text()),
+            _ => {}
+        }
+    }
+    entries.extend(current);
+    Ok(entries)
 }
 
 /// Whether `git status --porcelain=v1 -z --untracked-files=all --ignored=no` output
 /// describes any change. Ignored entries (`!!`) never count.
 #[must_use]
 pub fn status_is_dirty(output: &[u8]) -> bool {
-    let _ = output;
-    todo!("status_is_dirty")
+    let mut records = fields(output);
+    while let Some(record) = records.next() {
+        if record.len() < 2 {
+            continue;
+        }
+        if record.starts_with(b"!!") {
+            continue;
+        }
+        if matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C') {
+            records.next();
+        }
+        return true;
+    }
+    false
 }
 
 /// Gitlink (submodule) paths from `git ls-files --stage -z` (mode `160000`).
 pub fn parse_gitlinks(output: &[u8]) -> Result<Vec<PathBuf>> {
-    let _ = output;
-    todo!("parse_gitlinks")
+    let mut links = Vec::new();
+    for record in fields(output) {
+        let tab = record
+            .iter()
+            .position(|&b| b == b'\t')
+            .ok_or_else(|| malformed("ls-files --stage", "missing tab"))?;
+        if record.starts_with(b"160000 ") {
+            links.push(path_from(&record[tab + 1..]));
+        }
+    }
+    Ok(links)
 }
 
 /// Parse `git rev-parse <rev>` output into a full object id (SHA-1 or SHA-256).
 pub fn parse_object_id(output: &str) -> Result<String> {
-    let _ = output;
-    todo!("parse_object_id")
+    let oid = output.trim();
+    let valid = matches!(oid.len(), 40 | 64)
+        && oid
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if valid {
+        Ok(oid.to_owned())
+    } else {
+        Err(malformed("rev-parse", oid))
+    }
 }
 
 /// Parse `git config --type=bool --get <key>` output; absent key (`None`) is `false`.
 pub fn parse_config_bool(output: Option<&str>) -> Result<bool> {
-    let _ = output;
-    todo!("parse_config_bool")
+    match output.map(str::trim) {
+        None | Some("" | "false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(other) => Err(malformed("config --type=bool", other)),
+    }
 }
 
 /// Paths flagged `assume-unchanged` (lowercase tag) or `skip-worktree` (`S`) in
 /// `git ls-files -v -z` output.
 pub fn parse_flagged_entries(output: &[u8]) -> Result<Vec<PathBuf>> {
-    let _ = output;
-    todo!("parse_flagged_entries")
+    let mut flagged = Vec::new();
+    for record in fields(output) {
+        let (Some(&tag), Some(b' ')) = (record.first(), record.get(1)) else {
+            return Err(malformed("ls-files -v", "missing tag"));
+        };
+        if tag.is_ascii_lowercase() || tag == b'S' {
+            flagged.push(path_from(&record[2..]));
+        }
+    }
+    Ok(flagged)
 }
 
 /// Operation in progress given the names of marker files present in the worktree's
@@ -92,8 +214,20 @@ pub fn parse_flagged_entries(output: &[u8]) -> Result<Vec<PathBuf>> {
 /// leaves files modified, so it is ignored.
 #[must_use]
 pub fn operation_from_markers(present: &[&str]) -> Option<&'static str> {
-    let _ = present;
-    todo!("operation_from_markers")
+    let has = |m: &str| present.contains(&m);
+    if has("rebase-apply/applying") {
+        Some("am")
+    } else if has("rebase-merge") || has("rebase-apply") {
+        Some("rebase")
+    } else if has("MERGE_HEAD") {
+        Some("merge")
+    } else if has("CHERRY_PICK_HEAD") {
+        Some("cherry-pick")
+    } else if has("REVERT_HEAD") {
+        Some("revert")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

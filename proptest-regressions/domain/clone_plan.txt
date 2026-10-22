@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc d10bba2c536d7cac125ccd7e3993f243ca22bded478ab6a02da7b609bf8e1c83 # shrinks to leaves = {"a"}, excluded = []
+cc 92aa40689759d94a056493c7154c4bb9c3089b357ea7481850b4771e8bd2b24e # shrinks to leaves = {"a"}, excluded = ["a/a"]

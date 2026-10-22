@@ -198,7 +198,7 @@ fn i118_skip_worktree_counts_as_dirty() {
 fn changed_during_run(mutate: impl FnOnce(&TestRepo)) {
     let sb = Sandbox::new();
     let src = project(&sb);
-    let worktrees = src.git(&["worktree", "list", "--porcelain"]);
+    let worktrees = src.worktree_paths();
     let barrier = Barrier::new(&sb.root, "src");
     let mut child = spawn_parhel(
         &sb.env,
@@ -212,7 +212,7 @@ fn changed_during_run(mutate: impl FnOnce(&TestRepo)) {
     let out = finish(child);
     assert_error(&out, "source-changed");
     assert!(!sb.path("dest").exists());
-    assert_eq!(src.git(&["worktree", "list", "--porcelain"]), worktrees);
+    assert_eq!(src.worktree_paths(), worktrees);
     assert_eq!(src.branch_tip("n"), None);
     assert_no_staging(&[&sb.root]);
 }

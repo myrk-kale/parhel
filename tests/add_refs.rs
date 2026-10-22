@@ -139,8 +139,14 @@ fn i10c_checkout_unrelated_branch() {
         &add_args(&dest, &["--branch", "docs"]),
     ));
     let wt = TestRepo::open(&sb.env, &dest);
-    wt.assert_clean();
     assert!(wt.exists("index.md") && !wt.exists("src/main.rs") && !wt.exists("Cargo.toml"));
+    // `docs` has no .gitignore, so the carried-over build output is untracked there —
+    // exactly what `git switch docs` would show in the source itself.
+    assert_eq!(
+        wt.status(),
+        "?? node_modules/pkg/index.js\n?? target/debug/app"
+    );
+    assert_eq!(wt.git(&["diff", "HEAD", "--stat"]), "");
 }
 
 // I-11: an ignored file in the source that is tracked in the target is replaced by

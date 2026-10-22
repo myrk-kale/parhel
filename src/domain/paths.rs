@@ -4,9 +4,9 @@
 //! (source root, destination parent) before calling in.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use super::error::Result;
+use super::error::{Error, ErrorCode, Result};
 
 /// Prefix of the per-run staging directory created next to the destination.
 /// `doctor` recognizes leftovers by this prefix.
@@ -26,15 +26,36 @@ pub enum Placement {
 /// the filesystem or following symlinks. Trailing slashes are dropped.
 #[must_use]
 pub fn resolve_destination(cwd: &Path, raw: &Path) -> PathBuf {
-    let _ = (cwd, raw);
-    todo!("paths::resolve_destination")
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+    let mut out = PathBuf::from("/");
+    for component in joined.components() {
+        match component {
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    out
 }
 
 /// The final component of the destination, which also becomes the worktree id in
 /// `.git/worktrees/<id>`. Fails with `usage` for paths without one (e.g. `/`).
 pub fn destination_basename(destination: &Path) -> Result<&OsStr> {
-    let _ = destination;
-    todo!("paths::destination_basename")
+    destination.file_name().ok_or_else(|| {
+        Error::new(
+            ErrorCode::Usage,
+            format!(
+                "destination `{}` has no final component",
+                destination.display()
+            ),
+        )
+    })
 }
 
 /// Classify an absolute, normalized destination against the source worktree root
@@ -47,23 +68,49 @@ pub fn classify_destination(
     git_common_dir: &Path,
     destination: &Path,
 ) -> Result<Placement> {
-    let _ = (source_root, git_common_dir, destination);
-    todo!("paths::classify_destination")
+    if destination == source_root {
+        return Err(Error::new(
+            ErrorCode::DestIsSource,
+            format!(
+                "destination `{}` is the source worktree itself",
+                destination.display()
+            ),
+        ));
+    }
+    if destination.starts_with(git_common_dir) || destination.starts_with(source_root.join(".git"))
+    {
+        return Err(Error::new(
+            ErrorCode::DestInsideGitDir,
+            format!(
+                "destination `{}` is inside the repository's git dir",
+                destination.display()
+            ),
+        ));
+    }
+    match destination.strip_prefix(source_root) {
+        Ok(relative) => Ok(Placement::InsideSource {
+            relative: relative.to_path_buf(),
+        }),
+        Err(_) => Ok(Placement::Outside),
+    }
 }
 
 /// Path where the worktree is assembled before being published: inside the
 /// staging dir, named exactly like the destination so git's worktree id matches.
 #[must_use]
 pub fn staging_worktree_path(staging_dir: &Path, destination: &Path) -> PathBuf {
-    let _ = (staging_dir, destination);
-    todo!("paths::staging_worktree_path")
+    match destination.file_name() {
+        Some(name) => staging_dir.join(name),
+        None => staging_dir.join("worktree"),
+    }
 }
 
 /// Whether a directory entry name is a parhel staging directory.
 #[must_use]
 pub fn is_staging_name(name: &OsStr) -> bool {
-    let _ = name;
-    todo!("paths::is_staging_name")
+    name.as_encoded_bytes()
+        .strip_prefix(STAGING_PREFIX.as_bytes())
+        .is_some_and(|suffix| !suffix.is_empty())
 }
 
 #[cfg(test)]

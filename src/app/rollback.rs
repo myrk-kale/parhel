@@ -4,13 +4,54 @@
 //! describes, so a crashed run (SIGKILL, power loss) leaves enough information
 //! for `doctor --fix` to undo exactly what this run created and nothing else.
 
+use std::ffi::OsStr;
+use std::fmt::Write as _;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::domain::Result;
+use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::{CowFs, Git};
 
 /// File name of the journal inside the staging dir.
 pub const JOURNAL_FILE: &str = "journal";
+
+const MAGIC: &[u8] = b"parhel-journal-v1\0";
+
+fn put(out: &mut Vec<u8>, field: Option<&[u8]>) {
+    match field {
+        None => out.push(0),
+        Some(bytes) => {
+            out.push(1);
+            let len = u32::try_from(bytes.len()).expect("journal field under 4 GiB");
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.0.len() < n {
+            return Err(Error::new(ErrorCode::Io, "truncated parhel journal"));
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn field(&mut self) -> Result<Option<&'a [u8]>> {
+        match self.take(1)?[0] {
+            0 => Ok(None),
+            1 => {
+                let len = u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes"));
+                Ok(Some(self.take(len as usize)?))
+            }
+            _ => Err(Error::new(ErrorCode::Io, "malformed parhel journal")),
+        }
+    }
+}
 
 /// What an `add` run has created so far.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -28,13 +69,44 @@ impl Journal {
     /// Serialize; must round-trip any path (spaces, newlines, non-UTF-8 bytes).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        todo!("Journal::encode")
+        let mut out = MAGIC.to_vec();
+        put(&mut out, Some(self.repo.as_os_str().as_bytes()));
+        put(
+            &mut out,
+            self.worktree.as_ref().map(|p| p.as_os_str().as_bytes()),
+        );
+        put(&mut out, self.created_branch.as_ref().map(String::as_bytes));
+        out
     }
 
     /// Errors: `io` on malformed content.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let _ = bytes;
-        todo!("Journal::decode")
+        let mut r = Reader(bytes);
+        if r.take(MAGIC.len()).ok() != Some(MAGIC) {
+            return Err(Error::new(ErrorCode::Io, "not a parhel journal"));
+        }
+        let path = |b: &[u8]| PathBuf::from(OsStr::from_bytes(b));
+        let repo = r
+            .field()?
+            .map(path)
+            .ok_or_else(|| Error::new(ErrorCode::Io, "journal without repo"))?;
+        let worktree = r.field()?.map(path);
+        let created_branch = r
+            .field()?
+            .map(|b| String::from_utf8(b.to_vec()))
+            .transpose()
+            .map_err(|_| Error::new(ErrorCode::Io, "journal branch is not UTF-8"))?;
+        if !r.0.is_empty() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                "trailing bytes in parhel journal",
+            ));
+        }
+        Ok(Self {
+            repo,
+            worktree,
+            created_branch,
+        })
     }
 }
 
@@ -53,8 +125,37 @@ pub fn rollback(
     staging_dir: &Path,
     journal: &Journal,
 ) -> Result<()> {
-    let _ = (git, fs, staging_dir, journal);
-    todo!("rollback")
+    let mut failures: Vec<(String, Error)> = Vec::new();
+    let repo = &journal.repo;
+    if let Some(worktree) = &journal.worktree {
+        if git.worktree_remove_force(repo, worktree).is_err() {
+            if let Err(e) = fs.remove_dir_all(worktree) {
+                failures.push((format!("rm -rf '{}'", worktree.display()), e));
+            }
+            if let Err(e) = git.worktree_prune(repo) {
+                failures.push(("git worktree prune".to_owned(), e));
+            }
+        }
+    }
+    if let Some(branch) = &journal.created_branch {
+        if let Err(e) = git.branch_delete(repo, branch) {
+            failures.push((format!("git branch -D {branch}"), e));
+        }
+    }
+    if let Err(e) = fs.remove_dir_all(staging_dir) {
+        failures.push((format!("rm -rf '{}'", staging_dir.display()), e));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!(
+        "rollback incomplete; finish the cleanup manually in `{}`:",
+        repo.display()
+    );
+    for (command, cause) in &failures {
+        let _ = write!(message, "\n    {command}    # {cause}");
+    }
+    Err(Error::new(ErrorCode::RollbackFailed, message))
 }
 
 #[cfg(test)]
