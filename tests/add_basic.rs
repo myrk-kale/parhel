@@ -305,3 +305,53 @@ fn i09_nested_linked_worktree_is_excluded() {
     assert_eq!(other.current_branch().as_deref(), Some("other"));
     other.assert_clean();
 }
+
+// I-09c: a registration recorded through a symlink (git canonicalizes paths, so this
+// only happens if the admin `gitdir` file is edited by hand) must not turn the
+// symlink into a real directory in the destination.
+#[test]
+fn i09c_symlink_on_path_to_exclusion_stays_a_symlink() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let elsewhere = sb.path("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("outside.txt"), "outside").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, src.path("node_modules/linked")).unwrap();
+    let real_wt = elsewhere.join("wt");
+    src.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        real_wt.to_str().unwrap(),
+    ]);
+    let admin = TestRepo::open(&sb.env, &real_wt).git_dir();
+    let through_link = src.path("node_modules/linked/wt/.git");
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", through_link.display()),
+    )
+    .unwrap();
+    assert!(
+        src.git(&["worktree", "list", "--porcelain"])
+            .contains("node_modules/linked/wt"),
+        "setup: registration goes through the symlink"
+    );
+
+    let dest = sb.path("dest");
+    assert_success(&parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "s"]),
+    ));
+    let md = fs::symlink_metadata(dest.join("node_modules/linked")).unwrap();
+    assert!(md.file_type().is_symlink(), "must remain a symlink");
+    assert_eq!(
+        fs::read_link(dest.join("node_modules/linked")).unwrap(),
+        elsewhere
+    );
+    assert_eq!(
+        fs::read_to_string(elsewhere.join("outside.txt")).unwrap(),
+        "outside"
+    );
+}

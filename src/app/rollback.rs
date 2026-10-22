@@ -63,6 +63,10 @@ pub struct Journal {
     /// Branch created by this run (`--new-branch`, or the implicit basename branch).
     /// Never set for a branch that existed before the run.
     pub created_branch: Option<String>,
+    /// Final destination, recorded right before the publishing rename. After a crash,
+    /// a missing staged worktree plus an existing `publish_to` means the rename
+    /// happened: the worktree must be repaired, never rolled back.
+    pub publish_to: Option<PathBuf>,
 }
 
 impl Journal {
@@ -76,6 +80,10 @@ impl Journal {
             self.worktree.as_ref().map(|p| p.as_os_str().as_bytes()),
         );
         put(&mut out, self.created_branch.as_ref().map(String::as_bytes));
+        put(
+            &mut out,
+            self.publish_to.as_ref().map(|p| p.as_os_str().as_bytes()),
+        );
         out
     }
 
@@ -96,6 +104,7 @@ impl Journal {
             .map(|b| String::from_utf8(b.to_vec()))
             .transpose()
             .map_err(|_| Error::new(ErrorCode::Io, "journal branch is not UTF-8"))?;
+        let publish_to = r.field()?.map(path);
         if !r.0.is_empty() {
             return Err(Error::new(
                 ErrorCode::Io,
@@ -106,6 +115,7 @@ impl Journal {
             repo,
             worktree,
             created_branch,
+            publish_to,
         })
     }
 }
@@ -171,6 +181,7 @@ mod tests {
             repo: p("/w/repo"),
             worktree: Some(p("/w/.parhel-staging-test/feat")),
             created_branch: Some("feat".into()),
+            publish_to: Some(p("/w/feat")),
         }
     }
 
@@ -196,6 +207,7 @@ mod tests {
             repo: weird.clone(),
             worktree: Some(weird.join("x")),
             created_branch: Some("feat/with=equals".into()),
+            publish_to: Some(weird.join("dest")),
         };
         assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
     }
@@ -307,8 +319,9 @@ mod tests {
                 repo in path(),
                 worktree in prop::option::of(path()),
                 branch in prop::option::of("[^\\x00]{1,30}"),
+                publish_to in prop::option::of(path()),
             ) {
-                let j = Journal { repo, worktree, created_branch: branch };
+                let j = Journal { repo, worktree, created_branch: branch, publish_to };
                 prop_assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
             }
 

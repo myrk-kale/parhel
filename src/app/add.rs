@@ -406,12 +406,17 @@ fn assemble(
     }
     crate::failpoint!("before_rename");
     check_interrupt(env)?;
+    // Record where the worktree is going *before* moving it: if the process dies right
+    // after the rename, `doctor --fix` must repair the destination, not undo it.
+    journal.publish_to = Some(plan.destination.clone());
+    fs.write_file(&journal_path, &journal.encode())?;
     fs.rename_exclusive(&staged, &plan.destination)?;
     Ok(staged)
 }
 
 /// After the exclusive rename the worktree is ours and valid: never roll it back.
 fn publish(env: &Env<'_>, plan: &Plan, staging: &Path, _staged: &Path) -> Result<AddOutcome> {
+    crate::failpoint!("after_rename");
     let mut warnings = Vec::new();
     env.git
         .worktree_repair(&plan.repo.toplevel, &plan.destination)
@@ -451,7 +456,8 @@ struct Lister<'a> {
 impl DirLister for Lister<'_> {
     fn list(&self, relative: &Path) -> io::Result<Vec<OsString>> {
         let path = self.root.join(relative);
-        match self.fs.is_dir(&path) {
+        // No-follow: a symlink is cloned as a link, never descended into.
+        match self.fs.is_dir_no_follow(&path) {
             Ok(true) => {}
             Ok(false) => return Err(io::Error::from(io::ErrorKind::NotADirectory)),
             Err(e) => return Err(io::Error::other(e.to_string())),
@@ -1436,5 +1442,59 @@ mod tests {
         req.destination = p("/w/repo");
         assert_eq!(run(&w, &req).unwrap_err().code, ErrorCode::DestIsSource);
         assert_no_mutation(&w);
+    }
+
+    // U-TXN-63: the destination is journaled before the rename (crash recovery).
+    #[test]
+    fn publish_intent_is_journaled_before_rename() {
+        let w = World::default();
+        run(&w, &new_branch()).unwrap();
+        let journal = p(&format!("{STAGING}/{JOURNAL_FILE}"));
+        let last_write = w
+            .calls()
+            .iter()
+            .rposition(|c| *c == Call::WriteFile(journal.clone()))
+            .unwrap();
+        let rename = w.position(|c| matches!(c, Call::Rename { .. })).unwrap();
+        assert!(last_write < rename, "journal updated before publishing");
+        let j = Journal::decode(&w.files.borrow()[&journal]).unwrap();
+        assert_eq!(j.publish_to, Some(p(DEST)));
+        assert_eq!(j.worktree, Some(p(STAGED_WT)));
+    }
+
+    // U-TXN-62: a symlink on the path to an exclusion is cloned as a link, never
+    // descended into (that would turn the link into a real directory).
+    #[test]
+    fn symlink_ancestor_of_exclusion_is_cloned_as_link() {
+        let mut w = World::default();
+        w.worktrees.push(WorktreeEntry {
+            path: p("/w/repo/lnk/wt"),
+            ..WorktreeEntry::default()
+        });
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w/repo"))
+            .unwrap()
+            .push(OsString::from("lnk"));
+        w.tree.borrow_mut().insert(
+            p("/w/repo/lnk"),
+            vec![OsString::from("wt"), OsString::from("f")],
+        );
+        w.symlinks.borrow_mut().insert(p("/w/repo/lnk"));
+        run(&w, &new_branch()).unwrap();
+        assert_eq!(
+            w.count(|c| *c
+                == Call::Clone {
+                    src: p("/w/repo/lnk"),
+                    dst: p(&format!("{STAGED_WT}/lnk"))
+                }),
+            1,
+            "{:#?}",
+            w.calls()
+        );
+        assert_eq!(
+            w.count(|c| matches!(c, Call::CreateDir(d) if d.ends_with("lnk"))),
+            0
+        );
     }
 }

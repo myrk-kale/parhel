@@ -49,10 +49,10 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
 | U-ENV-01…04 | Child `git` env sanitization, locale, cwd/args, error mapping | `src/git/runner.rs` |
-| U-FS-01…18 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD | `src/fs/apfs.rs` |
+| U-FS-01…19 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check | `src/fs/apfs.rs` |
 | U-RB-01…08, P1 | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
-| U-TXN-01…61 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination | `src/app/add.rs` |
-| U-DOC-01…09 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored | `src/app/doctor.rs` |
+| U-TXN-01…63 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links | `src/app/add.rs` |
+| U-DOC-01…11 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) | `src/app/doctor.rs` |
 
 ## Integration tests (`tests/*.rs`, real `git`, real APFS)
 
@@ -73,6 +73,7 @@ or untouched.
 | I-07 | Relative destination resolves against cwd |
 | I-08 | Destination nested inside the source never contains itself |
 | I-09 | Nested linked worktree of the same repo is excluded and unaffected |
+| I-09c | Registration recorded through a symlink (hand-edited `gitdir`; git itself canonicalizes): the symlink stays a symlink |
 
 ### Target ref ≠ source HEAD — `tests/add_refs.rs`
 | ID | Behavior |
@@ -124,6 +125,7 @@ or untouched.
 | I-44b/c | SIGTERM (143), SIGHUP (129) → rollback |
 | I-44d | Repeated SIGINT/SIGTERM during rollback do not abort the cleanup |
 | I-45 | SIGKILL → `doctor` reports, `doctor --fix` restores, branch reusable |
+| I-45b | SIGKILL between the publishing rename and `worktree repair` → `doctor --fix` repairs the destination; branch and user files kept |
 
 ### Filesystems — `tests/add_filesystems.rs` (disk images)
 | ID | Behavior |

@@ -129,6 +129,10 @@ impl CowFs for ApfsFs {
         Ok(fs::metadata(path).is_ok_and(|m| m.is_dir()))
     }
 
+    fn is_dir_no_follow(&self, path: &Path) -> Result<bool> {
+        Ok(fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
+    }
+
     fn create_staging_dir(&self, parent: &Path) -> Result<PathBuf> {
         let parent = self.canonicalize(parent)?;
         let dir = tempfile::Builder::new()
@@ -511,5 +515,22 @@ mod tests {
             .rename_exclusive(&d.path().join("s"), &d.path().join("caf\u{e9}"))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::DestExists);
+    }
+
+    // U-FS-19
+    #[test]
+    fn is_dir_no_follow_rejects_symlinks() {
+        let d = tmp();
+        fs::create_dir(d.path().join("dir")).unwrap();
+        fs::write(d.path().join("file"), b"x").unwrap();
+        symlink("dir", d.path().join("link")).unwrap();
+        assert!(ApfsFs.is_dir_no_follow(&d.path().join("dir")).unwrap());
+        assert!(!ApfsFs.is_dir_no_follow(&d.path().join("link")).unwrap());
+        assert!(
+            ApfsFs.is_dir(&d.path().join("link")).unwrap(),
+            "is_dir still follows"
+        );
+        assert!(!ApfsFs.is_dir_no_follow(&d.path().join("file")).unwrap());
+        assert!(!ApfsFs.is_dir_no_follow(&d.path().join("absent")).unwrap());
     }
 }
