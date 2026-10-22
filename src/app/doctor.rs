@@ -91,6 +91,14 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         .filter_map(|w| w.path.parent().map(Path::to_path_buf))
         .collect();
     scan_dirs.extend(repo.toplevel.parent().map(Path::to_path_buf));
+    // A crashed run's registration points inside its staging dir, which sits next
+    // to the destination, possibly far from the source: look there too.
+    scan_dirs.extend(
+        worktrees
+            .iter()
+            .filter_map(|w| staging_of(&w.path))
+            .filter_map(|s| s.parent().map(Path::to_path_buf)),
+    );
     let mut live = Vec::new();
     let mut orphans = Vec::new();
     for dir in &scan_dirs {
@@ -182,12 +190,31 @@ fn fix(
         }
     }
     for reg in registrations.iter().filter(|r| !handled.contains(r)) {
-        if remove_registration(env, repo, reg) {
+        // The staging dir itself may be gone; the worktree may still have been
+        // published next to where it was.
+        let published = staging_of(reg).and_then(|s| published_dest(env, &s, reg, None));
+        let fixed = match published {
+            Some(dest) => env.git.worktree_repair(&repo.toplevel, &dest).is_ok(),
+            None => remove_registration(env, repo, reg),
+        };
+        if fixed {
             report
                 .fixed
                 .push(Finding::OrphanRegistration { path: reg.clone() });
         }
     }
+}
+
+/// The `.parhel-staging-*` directory `path` lies in, if any.
+fn staging_of(path: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        if is_staging_name(component.as_os_str()) {
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 /// Where the crashed run published `staged`, if the exclusive rename happened.
@@ -680,5 +707,67 @@ mod tests {
                 }),
             1
         );
+    }
+
+    // U-DOC-15: the staging dir of a crashed run may sit next to a destination far
+    // from the source; it is found through the registration.
+    #[test]
+    fn finds_staging_next_to_a_distant_destination() {
+        let mut w = World::default();
+        let staging = p("/x/.parhel-staging-far");
+        w.tree
+            .borrow_mut()
+            .insert(p("/x"), vec![OsString::from(".parhel-staging-far")]);
+        w.tree
+            .borrow_mut()
+            .insert(staging.clone(), vec![OsString::from(JOURNAL_FILE)]);
+        let journal = Journal {
+            repo: p("/w/repo"),
+            worktree: Some(staging.join("feat")),
+            created_branch: None,
+            publish_to: Some(p("/x/feat")),
+        };
+        w.files
+            .borrow_mut()
+            .insert(staging.join(JOURNAL_FILE), journal.encode());
+        w.tree
+            .borrow_mut()
+            .insert(p("/x/feat"), vec![OsString::from(".git")]);
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/x"))
+            .unwrap()
+            .push(OsString::from("feat"));
+        w.worktrees.push(WorktreeEntry {
+            path: staging.join("feat"),
+            ..WorktreeEntry::default()
+        });
+        let report = run(&w, true);
+        assert!(report.findings.contains(&Finding::OrphanStaging {
+            path: staging.clone()
+        }));
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(
+            w.calls(),
+            vec![
+                Call::Repair { path: p("/x/feat") },
+                Call::RemoveDirAll(staging)
+            ]
+        );
+    }
+
+    // U-DOC-16: staging dir deleted entirely, worktree published: repair it.
+    #[test]
+    fn repairs_publication_whose_staging_dir_is_gone() {
+        let w = published_before_repair(None);
+        let staging = p("/w/.parhel-staging-dead");
+        w.tree.borrow_mut().remove(&staging);
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w"))
+            .unwrap()
+            .retain(|n| n != ".parhel-staging-dead");
+        assert!(run(&w, true).healthy());
+        assert_eq!(w.calls(), vec![Call::Repair { path: p("/w/feat") }]);
     }
 }

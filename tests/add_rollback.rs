@@ -428,3 +428,35 @@ fn i45c_publication_detected_even_with_lost_journal() {
     assert!(src.branch_tip("published").is_some(), "branch kept");
     assert_no_staging(&[&sb.root]);
 }
+
+// I-45d: same crash, destination in a different folder than the source. doctor
+// must find the staging dir through the registration, not only next to the
+// source, or it removes the published worktree's registration.
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[test]
+fn i45d_publication_in_another_folder_is_repaired() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    fs::create_dir(sb.path("elsewhere")).unwrap();
+    let dest = sb.path("elsewhere/dest");
+    let out = parhel_with_failpoints(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "published"]),
+        "after_rename=kill",
+    );
+    assert_eq!(out.status.code(), None, "killed by signal");
+    let report = parhel(&sb.env, &src.root, &["doctor"]);
+    assert!(
+        stdout(&report).contains("orphan-staging"),
+        "{}",
+        stdout(&report)
+    );
+
+    assert_success(&parhel(&sb.env, &src.root, &["doctor", "--fix"]));
+    let wt = TestRepo::open(&sb.env, &dest);
+    assert_eq!(wt.current_branch().as_deref(), Some("published"));
+    wt.assert_clean();
+    assert!(src.worktree_paths().contains(&wt.root));
+    assert_no_staging(&[&sb.path("elsewhere")]);
+}
