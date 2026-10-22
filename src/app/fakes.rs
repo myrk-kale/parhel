@@ -145,6 +145,8 @@ pub struct World {
     pub submodules: Vec<PathBuf>,
     pub worktrees: Vec<WorktreeEntry>,
     pub branches: RefCell<HashSet<String>>,
+    /// Tip of each branch; branches without an entry point at `staging_head`.
+    pub branch_tips: RefCell<HashMap<String, String>>,
     /// `rev -> oid` for `resolve_commit`.
     pub commits: HashMap<String, String>,
     /// HEAD reported for the staging worktree after `worktree add` (the target commit).
@@ -235,6 +237,7 @@ impl Default for World {
                 ..WorktreeEntry::default()
             }],
             branches: RefCell::new(HashSet::from(["main".to_owned()])),
+            branch_tips: RefCell::default(),
             commits: HashMap::from([
                 ("HEAD".to_owned(), SHA_A.to_owned()),
                 ("main".to_owned(), SHA_A.to_owned()),
@@ -373,6 +376,16 @@ impl Git for World {
     }
 
     fn resolve_commit(&self, _: &Path, rev: &str) -> Result<String> {
+        if let Some(name) = rev.strip_prefix("refs/heads/") {
+            if self.branches.borrow().contains(name) {
+                return Ok(self
+                    .branch_tips
+                    .borrow()
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| self.staging_head.clone()));
+            }
+        }
         self.commits
             .get(rev)
             .cloned()
@@ -392,8 +405,19 @@ impl Git for World {
 
     fn worktree_add(&self, _: &Path, spec: &WorktreeAddSpec) -> Result<()> {
         self.record(Call::WorktreeAdd(spec.clone()), Step::WorktreeAdd)?;
-        if let BranchMode::New(name) = &spec.branch {
-            self.branches.borrow_mut().insert(name.clone());
+        match (&spec.branch, &spec.reference) {
+            (BranchMode::New(name), _) => {
+                self.branches.borrow_mut().insert(name.clone());
+            }
+            // Like git: no branch flag and no ref -> a branch named after the path.
+            (BranchMode::Default, None) => {
+                if let Some(name) = spec.path.file_name() {
+                    self.branches
+                        .borrow_mut()
+                        .insert(name.to_string_lossy().into_owned());
+                }
+            }
+            _ => {}
         }
         self.tree
             .borrow_mut()
@@ -441,8 +465,8 @@ impl Git for World {
         )
     }
 
-    fn worktree_repair(&self, _: &Path, path: &Path) -> Result<()> {
-        self.record(Call::Repair { path: path.into() }, Step::Repair)
+    fn repoint_worktree(&self, _: &Path, _old: &Path, new: &Path) -> Result<()> {
+        self.record(Call::Repair { path: new.into() }, Step::Repair)
     }
 
     fn worktree_remove_force(&self, _: &Path, path: &Path) -> Result<()> {
@@ -545,6 +569,11 @@ impl CowFs for World {
     fn remove_dir_all(&self, path: &Path) -> Result<()> {
         self.record(Call::RemoveDirAll(path.into()), Step::RemoveDirAll)?;
         self.tree.borrow_mut().retain(|k, _| !k.starts_with(path));
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            if let Some(entries) = self.tree.borrow_mut().get_mut(parent) {
+                entries.retain(|e| e != name);
+            }
+        }
         Ok(())
     }
 

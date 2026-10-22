@@ -109,7 +109,10 @@ impl GitCli {
             // would leave the submodule inactive: record the source's value.
             let key = format!("submodule.{name}.url");
             let declared = self.runner.output(source, &["config", "--get", &key])?;
-            if declared.status.success() {
+            let current = self.runner.output(worktree, &["config", "--get", &key])?;
+            // Usually already set in the shared config (the source initialized the
+            // submodule): never rewrite a shared file needlessly.
+            if declared.status.success() && declared.stdout != current.stdout {
                 let url = OsStr::from_bytes(declared.stdout.trim_ascii_end()).to_owned();
                 self.run(worktree, &[OsStr::new("config"), OsStr::new(&key), &url])?;
             }
@@ -483,16 +486,39 @@ impl Git for GitCli {
         self.reinit_recursive(worktree, source, final_path)
     }
 
-    fn worktree_repair(&self, repo: &Path, path: &Path) -> Result<()> {
-        self.run(
-            repo,
-            &[
-                OsStr::new("worktree"),
-                OsStr::new("repair"),
-                path.as_os_str(),
-            ],
-        )
-        .map(drop)
+    fn repoint_worktree(&self, _repo: &Path, old: &Path, new: &Path) -> Result<()> {
+        let io = |p: &Path, e: std::io::Error| {
+            Error::new(ErrorCode::Io, format!("{}: {e}", p.display()))
+        };
+        let gitfile = new.join(".git");
+        let contents = fs::read(&gitfile).map_err(|e| io(&gitfile, e))?;
+        let target = contents
+            .trim_ascii()
+            .strip_prefix(b"gitdir:")
+            .map(<[u8]>::trim_ascii)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::GitFailed,
+                    format!("{} is not a gitfile", gitfile.display()),
+                )
+            })?;
+        let target = Path::new(OsStr::from_bytes(target));
+        let admin = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            // A relative link was written from the old location.
+            crate::domain::paths::resolve_destination(old, target)
+        };
+        if !target.is_absolute() {
+            let mut line = b"gitdir: ".to_vec();
+            line.extend_from_slice(admin.as_os_str().as_bytes());
+            line.push(b'\n');
+            fs::write(&gitfile, line).map_err(|e| io(&gitfile, e))?;
+        }
+        let backlink = admin.join("gitdir");
+        let mut line = gitfile.as_os_str().as_bytes().to_vec();
+        line.push(b'\n');
+        fs::write(&backlink, line).map_err(|e| io(&backlink, e))
     }
 
     fn worktree_remove_force(&self, repo: &Path, path: &Path) -> Result<()> {
@@ -606,5 +632,69 @@ mod tests {
         let reference = got.iter().position(|a| a == "--orphan").unwrap();
         assert!(eoo < path && path < reference, "{got:?}");
         assert_eq!(got.iter().filter(|a| *a == "--orphan").count(), 1);
+    }
+
+    // U-GIT-01: after the staged worktree is moved, only its own registration is
+    // updated. `git worktree repair` would also rewrite other worktrees' .git files.
+    #[test]
+    fn repoint_updates_only_the_moved_worktree() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let repo = root.join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@b",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let other = root.join("other");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "o", other.to_str().unwrap()],
+        );
+        fs::write(other.join(".git"), "gitdir: /nowhere\n").unwrap();
+        let staged = root.join("staging/feat");
+        fs::create_dir(root.join("staging")).unwrap();
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "f", staged.to_str().unwrap()],
+        );
+        let dest = root.join("feat");
+        fs::rename(&staged, &dest).unwrap();
+
+        GitCli::default()
+            .repoint_worktree(&repo, &staged, &dest)
+            .unwrap();
+
+        assert_eq!(git(&dest, &["rev-parse", "--abbrev-ref", "HEAD"]), "f");
+        assert!(git(&repo, &["worktree", "list", "--porcelain"]).contains(dest.to_str().unwrap()));
+        assert_eq!(
+            fs::read_to_string(other.join(".git")).unwrap(),
+            "gitdir: /nowhere\n"
+        );
     }
 }

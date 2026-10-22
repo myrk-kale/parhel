@@ -70,7 +70,10 @@ pub trait Git {
     /// `worktree` is still in staging; links are written for its final location
     /// `final_path`, so they stay valid after the publishing rename.
     fn submodules_reinit(&self, worktree: &Path, source: &Path, final_path: &Path) -> Result<()>;
-    fn worktree_repair(&self, repo: &Path, path: &Path) -> Result<()>;
+    /// Point the registration of the worktree moved from `old` to `new` at its new
+    /// location. Touches only that worktree's admin entry and `.git` file (unlike
+    /// `git worktree repair`, which also rewrites other worktrees' links).
+    fn repoint_worktree(&self, repo: &Path, old: &Path, new: &Path) -> Result<()>;
     fn worktree_remove_force(&self, repo: &Path, path: &Path) -> Result<()>;
     /// Remove only the registration (`.git/worktrees/<id>`) whose gitdir points to
     /// `path`, even when `path` no longer exists. Unlike `worktree prune`, it never

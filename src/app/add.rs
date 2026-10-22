@@ -378,6 +378,9 @@ fn assemble(
         },
     )?;
     journal.worktree = Some(staged.clone());
+    if implicit_branch.is_some() {
+        journal.branch_start = Some(git.head(&staged)?);
+    }
     journal.created_branch = implicit_branch;
     fs.write_file(&journal_path, &journal.encode())?;
     crate::failpoint!("after_worktree_add");
@@ -591,8 +594,9 @@ fn publish(
 ) -> Result<AddOutcome> {
     crate::failpoint!("after_rename");
     let mut warnings = Vec::new();
+    let staged = paths::staging_worktree_path(staging, &plan.destination);
     env.git
-        .worktree_repair(&plan.repo.toplevel, &plan.destination)
+        .repoint_worktree(&plan.repo.toplevel, &staged, &plan.destination)
         .map_err(|e| {
             Error::new(
                 e.code,

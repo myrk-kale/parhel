@@ -162,21 +162,29 @@ fn fix(
             handled.extend(journal.worktree.clone());
             let published = journal.worktree.as_deref().and_then(|staged| {
                 published_dest(env, staging, staged, journal.publish_to.as_deref())
+                    .map(|dest| (staged, dest))
             });
             match published {
-                Some(dest) => complete_publish(env, repo, staging, &dest),
+                Some((staged, dest)) => complete_publish(env, repo, staging, staged, &dest),
                 None => rollback(env.git, env.fs, staging, &journal).is_ok(),
             }
         } else {
             let mut ok = true;
             for reg in registrations.iter().filter(|r| r.starts_with(staging)) {
                 ok &= match published_dest(env, staging, reg, None) {
-                    Some(dest) => env.git.worktree_repair(&repo.toplevel, &dest).is_ok(),
+                    Some(dest) => env.git.repoint_worktree(&repo.toplevel, reg, &dest).is_ok(),
                     None => remove_registration(env, repo, reg),
                 };
                 handled.push(reg.clone());
             }
-            ok && env.fs.remove_dir_all(staging).is_ok()
+            // Without a readable journal nothing proves the remaining contents are
+            // parhel's: only a folder holding nothing but parhel's (unreadable)
+            // journal file is removed.
+            let empty = env
+                .fs
+                .list_dir(staging)
+                .is_ok_and(|names| names.iter().all(|n| n == JOURNAL_FILE));
+            ok && empty && env.fs.remove_dir_all(staging).is_ok()
         };
         if ok {
             report.fixed.push(Finding::OrphanStaging {
@@ -194,7 +202,7 @@ fn fix(
         // published next to where it was.
         let published = staging_of(reg).and_then(|s| published_dest(env, &s, reg, None));
         let fixed = match published {
-            Some(dest) => env.git.worktree_repair(&repo.toplevel, &dest).is_ok(),
+            Some(dest) => env.git.repoint_worktree(&repo.toplevel, reg, &dest).is_ok(),
             None => remove_registration(env, repo, reg),
         };
         if fixed {
@@ -256,8 +264,17 @@ fn published_dest(
 }
 
 /// Finish what the crashed run was doing: point the registration at the destination.
-fn complete_publish(env: &Env<'_>, repo: &RepoInfo, staging: &Path, dest: &Path) -> bool {
-    env.git.worktree_repair(&repo.toplevel, dest).is_ok() && env.fs.remove_dir_all(staging).is_ok()
+fn complete_publish(
+    env: &Env<'_>,
+    repo: &RepoInfo,
+    staging: &Path,
+    staged: &Path,
+    dest: &Path,
+) -> bool {
+    env.git
+        .repoint_worktree(&repo.toplevel, staged, dest)
+        .is_ok()
+        && env.fs.remove_dir_all(staging).is_ok()
 }
 
 fn remove_registration(env: &Env<'_>, repo: &RepoInfo, path: &Path) -> bool {
@@ -350,6 +367,7 @@ mod tests {
             worktree: Some(staging.join("feat")),
             created_branch: Some("feat".into()),
             publish_to: None,
+            branch_start: Some(SHA_A.into()),
         };
         w.files
             .borrow_mut()
@@ -553,6 +571,7 @@ mod tests {
             worktree: Some(staging.join("feat")),
             created_branch: Some("feat".into()),
             publish_to: Some(p("/w/feat")),
+            branch_start: Some(SHA_A.into()),
         };
         w.files
             .borrow_mut()
@@ -673,6 +692,7 @@ mod tests {
             worktree: Some(p("/w/.parhel-staging-dead/feat")),
             created_branch: Some("feat".into()),
             publish_to: None,
+            branch_start: Some(SHA_A.into()),
         };
         let w = published_before_repair(Some(old));
         assert!(run(&w, true).healthy());
@@ -726,6 +746,7 @@ mod tests {
             worktree: Some(staging.join("feat")),
             created_branch: None,
             publish_to: Some(p("/x/feat")),
+            branch_start: None,
         };
         w.files
             .borrow_mut()
@@ -769,5 +790,34 @@ mod tests {
             .retain(|n| n != ".parhel-staging-dead");
         assert!(run(&w, true).healthy());
         assert_eq!(w.calls(), vec![Call::Repair { path: p("/w/feat") }]);
+    }
+
+    // U-DOC-17: without a journal nothing proves parhel owns the folder's
+    // contents: a non-empty lookalike is reported, never deleted.
+    #[test]
+    fn never_deletes_a_non_empty_folder_without_journal() {
+        let w = World::default();
+        let lookalike = p("/w/.parhel-staging-mine");
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w"))
+            .unwrap()
+            .push(OsString::from(".parhel-staging-mine"));
+        w.tree
+            .borrow_mut()
+            .insert(lookalike.clone(), vec![OsString::from("important.txt")]);
+        w.files
+            .borrow_mut()
+            .insert(lookalike.join("important.txt"), b"mine".to_vec());
+        let report = run(&w, true);
+        assert!(report.findings.contains(&Finding::OrphanStaging {
+            path: lookalike.clone()
+        }));
+        assert!(
+            !report
+                .fixed
+                .contains(&Finding::OrphanStaging { path: lookalike })
+        );
+        assert_eq!(w.calls(), vec![]);
     }
 }

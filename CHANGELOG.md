@@ -37,6 +37,15 @@ All notable changes to this project are documented here. The format follows
   (`dirty-submodule`) instead of silently dropping their changes.
 - `git worktree add` is retried on the transient error git reports when another
   `worktree add` registers at the same moment.
+- parhel no longer runs `git worktree repair`, which also rewrote the `.git`
+  files of other worktrees with broken links. It updates only its own
+  registration.
+- Every git command runs with `GIT_OPTIONAL_LOCKS=0`: a refused `add` used to
+  let `git status` rewrite the source's index.
+- `doctor --fix` deletes a crashed run's branch only if it still points at the
+  commit it was created on, and never deletes a `.parhel-staging-*` folder that
+  holds files other than parhel's journal.
+- Submodule reinit no longer rewrites `.git/config` with values it already has.
 
 ### Added
 

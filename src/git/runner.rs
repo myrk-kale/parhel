@@ -51,7 +51,11 @@ impl GitRunner {
         for var in SANITIZED_ENV {
             cmd.env_remove(var);
         }
-        cmd.env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0");
+        // GIT_OPTIONAL_LOCKS=0: `status` and friends must not refresh and rewrite
+        // the source's index (or take its index.lock) behind the user's back.
+        cmd.env("LC_ALL", "C")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
         cmd
     }
 
@@ -151,6 +155,17 @@ mod tests {
             err.message.contains("rev-parse"),
             "message names the command: {}",
             err.message
+        );
+    }
+
+    // U-ENV-05: read-only commands (e.g. `status`) must not opportunistically
+    // rewrite another worktree's index or hold its index.lock.
+    #[test]
+    fn disables_optional_locks() {
+        let cmd = GitRunner::default().command(Path::new("/tmp"), &["status"]);
+        assert_eq!(
+            envs(&cmd).get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+            Some(&Some(OsString::from("0")))
         );
     }
 }

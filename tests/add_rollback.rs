@@ -460,3 +460,32 @@ fn i45d_publication_in_another_folder_is_repaired() {
     assert!(src.worktree_paths().contains(&wt.root));
     assert_no_staging(&[&sb.path("elsewhere")]);
 }
+
+// I-45e: after a crash, someone commits on the run's branch; doctor --fix must
+// keep the branch (and its commit) while cleaning everything else.
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[test]
+fn i45e_doctor_keeps_a_branch_that_gained_commits() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let out = parhel_with_failpoints(
+        &sb.env,
+        &src.root,
+        &add_args(&sb.path("dest"), &["--new-branch", "crashed"]),
+        "before_rename=kill",
+    );
+    assert_eq!(out.status.code(), None);
+    let staged = staging_leftovers(&[&sb.root])[0].join("dest");
+    let wt = TestRepo::open(&sb.env, &staged);
+    wt.write("rescued.txt", "work done in the crashed worktree");
+    wt.git(&["add", "rescued.txt"]);
+    wt.git(&["commit", "-q", "-m", "work after the crash"]);
+    let tip = src.branch_tip("crashed");
+
+    parhel(&sb.env, &src.root, &["doctor", "--fix"]);
+    assert_eq!(
+        src.branch_tip("crashed"),
+        tip,
+        "the branch and its commit survive"
+    );
+}
