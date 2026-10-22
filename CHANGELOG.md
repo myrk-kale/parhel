@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-22
+
+### Changed
+
+- Descriptions (README, `--help`, man pages, crate and formula metadata) describe
+  filesystem copy-on-write in general; APFS is the first supported backend.
+  A new "Platform support" section in the README states that only macOS/APFS
+  works today, with Linux and Windows planned.
+
+### Added
+
+- Published on crates.io: `cargo install parhel`.
+
+### Fixed
+
+- Homebrew formula passes `brew audit --strict` (the 0.1.0 tap update failed on it).
+
 ## [0.1.0] - 2026-10-22
 
 First public release.
@@ -30,5 +47,6 @@ First public release.
 - Submodules no longer keep pointing at the source worktree.
 - Failed runs no longer leave registrations that keep branches "in use".
 
-[Unreleased]: https://github.com/myrk-kale/parhel/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/myrk-kale/parhel/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/myrk-kale/parhel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/myrk-kale/parhel/releases/tag/v0.1.0
