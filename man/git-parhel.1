@@ -2,13 +2,15 @@
 .el .ds Aq '
 .TH git-parhel 1  "parhel 0.1.0" "Git Manual"
 .SH NAME
-git\-parhel \- Copy\-on\-write Git worktrees: new worktrees in milliseconds, including node_modules, target/ and other ignored build output
+git\-parhel \- Create Git worktrees with copy\-on\-write, so node_modules, target/ and other ignored build output come along without using extra disk
 .SH SYNOPSIS
 \fBgit parhel\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
-git parhel creates regular Git worktrees by cloning the source worktree with APFS copy\-on\-write (clonefile) instead of checking files out. Ignored heavyweights (node_modules/, target/, build caches) come along for free: they share disk blocks with the source until either side writes to them.
+git parhel creates regular Git worktrees by cloning the source worktree with the filesystem\*(Aqs copy\-on\-write support instead of checking files out. Ignored directories such as node_modules/ and target/ come along and share disk blocks with the source until one side changes them.
 .PP
 The result is an ordinary worktree: list, move, lock and remove it with `git worktree`.
+.PP
+Platform support: macOS on APFS (clonefile). Linux and Windows are planned. Elsewhere, `add \-\-fallback` creates a regular worktree.
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
