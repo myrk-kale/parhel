@@ -67,6 +67,10 @@ pub struct Journal {
     /// a missing staged worktree plus an existing `publish_to` means the rename
     /// happened: the worktree must be repaired, never rolled back.
     pub publish_to: Option<PathBuf>,
+    /// Commit `created_branch` pointed to when this run created it. The branch is
+    /// deleted on rollback only while it still points there, so commits made on it
+    /// after a crash are never lost. Missing (older journals): never deleted.
+    pub branch_start: Option<String>,
 }
 
 impl Journal {
@@ -84,6 +88,7 @@ impl Journal {
             &mut out,
             self.publish_to.as_ref().map(|p| p.as_os_str().as_bytes()),
         );
+        put(&mut out, self.branch_start.as_ref().map(String::as_bytes));
         out
     }
 
@@ -105,6 +110,12 @@ impl Journal {
             .transpose()
             .map_err(|_| Error::new(ErrorCode::Io, "journal branch is not UTF-8"))?;
         let publish_to = r.field()?.map(path);
+        // Added in 0.2: absent from journals written by older versions.
+        let branch_start = if r.0.is_empty() {
+            None
+        } else {
+            r.field()?.map(|b| String::from_utf8_lossy(b).into_owned())
+        };
         if !r.0.is_empty() {
             return Err(Error::new(
                 ErrorCode::Io,
@@ -116,6 +127,7 @@ impl Journal {
             worktree,
             created_branch,
             publish_to,
+            branch_start,
         })
     }
 }
@@ -155,8 +167,15 @@ pub fn rollback(
         }
     }
     if let Some(branch) = &journal.created_branch {
-        if let Err(e) = git.branch_delete(repo, branch) {
-            failures.push((format!("git branch -D {branch}"), e));
+        // Only while the branch is exactly as this run created it: commits made on
+        // it since (e.g. after a crash) must never be lost.
+        let tip = git
+            .resolve_commit(repo, &format!("refs/heads/{branch}"))
+            .ok();
+        if tip.is_some() && tip == journal.branch_start {
+            if let Err(e) = git.branch_delete(repo, branch) {
+                failures.push((format!("git branch -D {branch}"), e));
+            }
         }
     }
     if let Err(e) = fs.remove_dir_all(staging_dir) {
@@ -178,7 +197,7 @@ pub fn rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fakes::{Call, Step, World, p};
+    use crate::app::fakes::{Call, SHA_A, SHA_B, Step, World, p};
     use crate::domain::ErrorCode;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -189,6 +208,7 @@ mod tests {
             worktree: Some(p("/w/.parhel-staging-test/feat")),
             created_branch: Some("feat".into()),
             publish_to: Some(p("/w/feat")),
+            branch_start: Some(SHA_A.into()),
         }
     }
 
@@ -215,6 +235,7 @@ mod tests {
             worktree: Some(weird.join("x")),
             created_branch: Some("feat/with=equals".into()),
             publish_to: Some(weird.join("dest")),
+            branch_start: Some(SHA_A.into()),
         };
         assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
     }
@@ -232,6 +253,7 @@ mod tests {
     #[test]
     fn undoes_worktree_then_branch_then_staging() {
         let w = World::default();
+        w.branches.borrow_mut().insert("feat".into());
         rollback(&w, &w, &p("/w/.parhel-staging-test"), &full_journal()).unwrap();
         assert_eq!(
             w.calls(),
@@ -266,6 +288,7 @@ mod tests {
     #[test]
     fn failed_worktree_remove_unregisters_only_this_worktree() {
         let w = World::default().failing(Step::RemoveForce, ErrorCode::GitFailed);
+        w.branches.borrow_mut().insert("feat".into());
         rollback(&w, &w, &p("/w/.parhel-staging-test"), &full_journal()).unwrap();
         let wt = p("/w/.parhel-staging-test/feat");
         let rm = w
@@ -282,6 +305,7 @@ mod tests {
     #[test]
     fn keeps_going_and_reports_when_a_step_fails() {
         let w = World::default().failing(Step::BranchDelete, ErrorCode::GitFailed);
+        w.branches.borrow_mut().insert("feat".into());
         let err = rollback(&w, &w, &p("/w/.parhel-staging-test"), &full_journal()).unwrap_err();
         assert_eq!(err.code, ErrorCode::RollbackFailed);
         assert!(
@@ -331,8 +355,9 @@ mod tests {
                 worktree in prop::option::of(path()),
                 branch in prop::option::of("[^\\x00]{1,30}"),
                 publish_to in prop::option::of(path()),
+                branch_start in prop::option::of("[0-9a-f]{40}"),
             ) {
-                let j = Journal { repo, worktree, created_branch: branch, publish_to };
+                let j = Journal { repo, worktree, created_branch: branch, publish_to, branch_start };
                 prop_assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
             }
 
@@ -341,5 +366,45 @@ mod tests {
                 let _ = Journal::decode(&bytes);
             }
         }
+    }
+
+    // U-RB-10: commits made on the branch after it was created keep it alive.
+    #[test]
+    fn keeps_branch_that_moved_since_creation() {
+        let w = World::default();
+        w.branches.borrow_mut().insert("feat".into());
+        w.branch_tips
+            .borrow_mut()
+            .insert("feat".into(), SHA_B.into());
+        rollback(&w, &w, &p("/w/.parhel-staging-test"), &full_journal()).unwrap();
+        assert_eq!(w.count(|c| matches!(c, Call::BranchDelete(_))), 0);
+    }
+
+    // U-RB-11: an older journal without the start commit cannot prove the branch
+    // is unused: keep it.
+    #[test]
+    fn keeps_branch_without_recorded_start() {
+        let w = World::default();
+        w.branches.borrow_mut().insert("feat".into());
+        let j = Journal {
+            branch_start: None,
+            ..full_journal()
+        };
+        rollback(&w, &w, &p("/w/.parhel-staging-test"), &j).unwrap();
+        assert_eq!(w.count(|c| matches!(c, Call::BranchDelete(_))), 0);
+    }
+
+    // U-RB-12: journals written before `branch_start` existed still decode.
+    #[test]
+    fn decodes_journal_without_branch_start() {
+        let mut bytes = Journal {
+            branch_start: None,
+            ..full_journal()
+        }
+        .encode();
+        bytes.pop(); // drop the trailing "absent" marker of the newest field
+        let j = Journal::decode(&bytes).unwrap();
+        assert_eq!(j.branch_start, None);
+        assert_eq!(j.created_branch.as_deref(), Some("feat"));
     }
 }

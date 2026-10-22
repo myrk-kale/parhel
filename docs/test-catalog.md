@@ -46,14 +46,15 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 | U-ARGS-01…03 | `git worktree add` argv: every mode, values always after `--end-of-options` | `src/git/cli.rs` |
 | U-PATH-01…19, P1…P3 | Lexical destination resolution, placement (`dest-is-source`, `dest-inside-git-dir`, nested), staging naming | `src/domain/paths.rs` |
 | U-EXCL-01…10, P1…P2 | Exclusion set: root `.git`, nested staging, nested worktrees, submodules, component-wise matching | `src/domain/exclusions.rs` |
+| U-GIT-01 | Re-pointing a moved worktree touches only its own registration (other worktrees' `.git` files intact) | `src/git/cli.rs` |
 | U-REL-01…06, P1 | Relocation of the source path: recorded forms (shebang, JSON, `file://`), boundaries (`/w/src2`, `/w/src.bak`, `/other/w/src`), `/private` alias, binaries reported, symlinks | `src/domain/relocate.rs` |
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
-| U-ENV-01…04 | Child `git` env sanitization, locale, cwd/args, error mapping | `src/git/runner.rs` |
+| U-ENV-01…05 | Child `git` env sanitization, locale, cwd/args, error mapping, `GIT_OPTIONAL_LOCKS=0` | `src/git/runner.rs` |
 | U-FS-01…19 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check | `src/fs/apfs.rs` |
-| U-RB-01…08, P1 (U-RB-06: fallback removes only its own registration, never `worktree prune`) | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
+| U-RB-01…12, P1 (U-RB-10…12: a branch is deleted only while it still points at its start commit; U-RB-06: fallback removes only its own registration, never `worktree prune`) | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
 | U-TXN-01…74 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs, dirty submodules with reinit | `src/app/add.rs` |
-| U-DOC-01…16 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
+| U-DOC-01…17 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
 
 ## Integration tests (`tests/*.rs`, real `git`, real APFS)
 
@@ -130,6 +131,7 @@ or untouched.
 | I-45b | SIGKILL between the publishing rename and `worktree repair` → `doctor --fix` repairs the destination; branch and user files kept |
 | I-45c | Same, with the journal lost (truncated): publication is detected from the disk |
 | I-45d | Same, destination in another folder: the staging dir is found through the registration |
+| I-45e | A crashed run's branch that gained a commit is kept by `doctor --fix` |
 | I-46 | Rollback's fallback cleanup keeps unrelated, unreachable worktrees (unmounted disk) registered |
 
 ### Filesystems — `tests/add_filesystems.rs` (disk images)
@@ -231,6 +233,21 @@ or untouched.
 | I-157 | Read-only files are relocated and stay read-only |
 | I-158 | `.parhelignore` keeps untracked paths out; tracked files always present |
 | I-159 | A linked worktree of another repository inside an ignored folder is detached in the copy |
+
+### Blast radius — `tests/blast_radius.rs`
+Fixture: four other worktrees (dirty, broken `.git` link, unreachable, nested in
+the source). Every byte of them, of `.git/config`, the refs and the other
+registrations must be identical after the run.
+
+| ID | Behavior |
+|---|---|
+| I-170 | Successful `add` |
+| I-171 | Refused `add` (the source index is not rewritten) |
+| I-172 | Failure at every failpoint, then rollback |
+| I-173 | Crash before and after publishing, then `doctor --fix` |
+| I-174 | Relocation and gitfile detaching |
+| I-175 | Submodule reinit does not rewrite the shared configuration |
+| I-176 | `doctor --fix` keeps a non-empty folder that only looks like staging |
 
 ## Not covered (needs infrastructure)
 

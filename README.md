@@ -51,6 +51,7 @@ something looks wrong, please
 - [Commands](#commands)
 - [Platform support](#platform-support)
 - [How it works](#how-it-works)
+- [What parhel writes, and where](#what-parhel-writes-and-where)
 - [What happens when things go wrong](#what-happens-when-things-go-wrong)
 - [Limitations](#limitations)
 - [FAQ](#faq)
@@ -244,7 +245,7 @@ On macOS, `add` goes through five steps:
    a two-way checkout rewrites the files that differ.
 5. It moves the finished worktree to the destination with
    `renamex_np(RENAME_EXCL)`, which fails instead of overwriting anything, and
-   then runs `git worktree repair`.
+   then points this worktree's registration at its final path.
 
 ```
  source worktree                      .parhel-staging-xxxx/ (next to the destination)
@@ -255,12 +256,41 @@ On macOS, `add` goes through five steps:
                                           └── target/
                                                 │  index ← read-tree (+ two-way checkout if [ref] differs)
                                                 ▼
-                     renamex_np(RENAME_EXCL) ─▶ ../my-feature   then `git worktree repair`
+                     renamex_np(RENAME_EXCL) ─▶ ../my-feature   then re-point its registration
 ```
 
 An APFS clone shares data blocks with the original. When either side writes to
 a block, APFS copies that block first, so from the moment the clone exists the
 two worktrees change independently.
+
+## What parhel writes, and where
+
+A new tool that runs inside your repositories should be able to say exactly what
+it touches. These are all the writes `add` makes:
+
+| Write | Where |
+|---|---|
+| Hidden staging folder, journal | `.parhel-staging-*` next to the destination; removed at the end |
+| New worktree registration and, if requested, a new branch | `.git/worktrees/<id>` and `refs/heads/<branch>`, through `git worktree add` |
+| Cloned files, rewritten paths, removed foreign `.git` files | Only inside the new worktree |
+| Pointing the registration at the final path | Only that registration's `gitdir` file |
+
+It never writes to other worktrees, never changes `.git/config` (submodule
+settings are written only if they differ, and only for the new worktree's
+submodules), and never rewrites another worktree's index: every git command it
+runs has `GIT_OPTIONAL_LOCKS=0`, so even `git status` leaves the index alone. It
+does not run `git worktree repair` or `git worktree prune`, because both also
+modify other worktrees' metadata.
+
+`doctor --fix` removes only what a crashed run's journal says it created. It
+deletes that run's branch only if the branch still points at the commit it was
+created on, and it never deletes a `.parhel-staging-*` folder that holds files
+it cannot attribute to parhel.
+
+The test suite checks this directly: in every scenario (success, refusal,
+failure at each step, crash plus `doctor --fix`, relocation, submodules) it
+compares every other worktree, the shared configuration, the refs and the
+registrations byte for byte with their state before the run.
 
 ## What happens when things go wrong
 
