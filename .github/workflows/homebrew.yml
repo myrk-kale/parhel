@@ -1,0 +1,64 @@
+name: Homebrew
+
+# Publishes Formula/parhel.rb to myrk-kale/homebrew-tap for a released version.
+# Called by the release workflow (a release created with GITHUB_TOKEN does not
+# trigger `release` events), and can be run by hand for any existing tag.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_DEPLOY_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  tap:
+    runs-on: macos-15
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: myrk-kale/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Render formula from the release checksum
+        run: |
+          version="${TAG#v}"
+          archive="parhel-${TAG}-universal-apple-darwin.tar.gz"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "${archive}.sha256" -D dist
+          sha="$(cut -d' ' -f1 "dist/${archive}.sha256")"
+          test "${#sha}" = 64
+          mkdir -p tap/Formula
+          sed -e "s/@VERSION@/${version}/g" -e "s/@SHA256@/${sha}/g" \
+            packaging/parhel.rb.in > tap/Formula/parhel.rb
+      - name: Audit, install and test
+        run: |
+          brew tap-new --no-git local/verify >/dev/null
+          cp tap/Formula/parhel.rb "$(brew --repository local/verify)/Formula/"
+          brew audit --strict --online local/verify/parhel
+          brew install local/verify/parhel
+          brew test local/verify/parhel
+      - name: Push to the tap
+        run: |
+          cd tap
+          git config user.name "parhel release bot"
+          git config user.email "parhel-release@users.noreply.github.com"
+          git add Formula/parhel.rb
+          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
+          git commit -m "parhel ${TAG#v}"
+          git push

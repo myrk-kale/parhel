@@ -64,3 +64,17 @@ jobs:
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target x86_64-apple-darwin --bin git-parhel
+
+  formula:
+    name: Homebrew formula audit
+    needs: lint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit the formula template (style only; checksum is a placeholder)
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          brew tap-new --no-git local/verify >/dev/null
+          sed -e "s/@VERSION@/${version}/g" -e "s/@SHA256@/$(printf '0%.0s' $(seq 64))/g" \
+            packaging/parhel.rb.in > "$(brew --repository local/verify)/Formula/parhel.rb"
+          brew audit --strict local/verify/parhel
