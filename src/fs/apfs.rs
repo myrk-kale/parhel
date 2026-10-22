@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::paths::STAGING_PREFIX;
 use crate::domain::{Error, ErrorCode, Result};
-use crate::ports::{CowFs, FileLock, VolumeInfo};
+use crate::ports::{CowFs, EntryKind, FileLock, VolumeInfo};
 
 /// `CLONE_NOFOLLOW` from `<sys/clonefile.h>` (not exported by `libc`): clone a
 /// symlink itself instead of its target.
@@ -216,6 +216,44 @@ impl CowFs for ApfsFs {
 
     fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
         fs::read(path).map_err(|e| io_error(path, &e))
+    }
+
+    fn entry_kind(&self, path: &Path) -> Result<EntryKind> {
+        let md = fs::symlink_metadata(path).map_err(|e| io_error(path, &e))?;
+        let kind = md.file_type();
+        Ok(if kind.is_symlink() {
+            EntryKind::Symlink {
+                target: fs::read_link(path).map_err(|e| io_error(path, &e))?,
+            }
+        } else if kind.is_dir() {
+            EntryKind::Dir
+        } else if kind.is_file() {
+            EntryKind::File { len: md.len() }
+        } else {
+            EntryKind::Other
+        })
+    }
+
+    fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::metadata(path)
+            .map_err(|e| io_error(path, &e))?
+            .permissions();
+        let read_only = perms.mode() & 0o200 == 0;
+        if read_only {
+            fs::set_permissions(path, fs::Permissions::from_mode(perms.mode() | 0o200))
+                .map_err(|e| io_error(path, &e))?;
+        }
+        let written = fs::write(path, contents).map_err(|e| io_error(path, &e));
+        if read_only {
+            fs::set_permissions(path, perms).map_err(|e| io_error(path, &e))?;
+        }
+        written
+    }
+
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        fs::remove_file(path).map_err(|e| io_error(path, &e))?;
+        std::os::unix::fs::symlink(target, path).map_err(|e| io_error(path, &e))
     }
 
     fn lock_exclusive(&self, path: &Path) -> Result<FileLock> {

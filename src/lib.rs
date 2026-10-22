@@ -104,6 +104,12 @@ fn report_added(outcome: &AddOutcome) {
         "Created {how} worktree at {}",
         outcome.destination.display()
     );
+    if outcome.relocated > 0 {
+        println!(
+            "Relocated {} copied file(s) that pointed at the source",
+            outcome.relocated
+        );
+    }
     println!("HEAD {}", outcome.head.get(..12).unwrap_or(&outcome.head));
 }
 

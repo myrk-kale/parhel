@@ -49,6 +49,11 @@ pub trait Git {
     /// Gitlink paths (relative) whose submodule is initialized in `worktree`.
     fn initialized_submodules(&self, worktree: &Path) -> Result<Vec<PathBuf>>;
     fn worktrees(&self, repo: &Path) -> Result<Vec<WorktreeEntry>>;
+    /// Paths in the index of `worktree` (files and gitlinks), relative.
+    fn tracked_files(&self, worktree: &Path) -> Result<Vec<PathBuf>>;
+    /// Untracked paths of `worktree` matching its `.parhelignore` (gitignore
+    /// syntax), relative; directories are reported once. Empty without the file.
+    fn parhelignored(&self, worktree: &Path) -> Result<Vec<PathBuf>>;
     fn branch_exists(&self, repo: &Path, name: &str) -> Result<bool>;
     /// Full object id of the commit `rev` points to.
     fn resolve_commit(&self, repo: &Path, rev: &str) -> Result<String>;
@@ -73,6 +78,20 @@ pub trait Git {
     /// unmounted disk). No-op when nothing is registered at `path`.
     fn unregister_worktree(&self, repo: &Path, path: &Path) -> Result<()>;
     fn branch_delete(&self, repo: &Path, name: &str) -> Result<()>;
+}
+
+/// What a path is, without following symlinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File {
+        len: u64,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+    /// FIFO, socket, device.
+    Other,
 }
 
 /// Filesystem identity of a path's volume.
@@ -107,6 +126,12 @@ pub trait CowFs {
     /// may have copied from the source.
     fn remove_dir_all(&self, path: &Path) -> Result<()>;
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    fn entry_kind(&self, path: &Path) -> Result<EntryKind>;
+    /// Overwrite an existing file's contents, keeping its permissions (even when
+    /// it is read-only).
+    fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    /// Point an existing symlink at `target`.
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()>;
     fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
     /// Exclusive advisory lock (`flock`) on `path`, held until the guard drops.
     /// Released by the kernel if the process dies, so crashes stay recoverable.

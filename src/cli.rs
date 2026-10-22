@@ -85,6 +85,8 @@ created is removed, and a worktree that was already published is repaired, not r
     Doctor(DoctorArgs),
 }
 
+// Each bool is an independent command-line switch.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Any path inside the source worktree.
@@ -106,6 +108,10 @@ pub struct AddArgs {
     /// (not APFS, different volumes).
     #[arg(long)]
     pub fallback: bool,
+    /// Leave copied files that mention the source's path as they are (by default
+    /// such paths are rewritten to the new worktree's).
+    #[arg(long)]
+    pub no_relocate: bool,
     /// Initialized submodules: `refuse`, or `reinit` them with their own git dirs.
     #[arg(long, value_enum, value_name = "policy", default_value = "refuse")]
     pub submodules: SubmodulesArg,
@@ -226,6 +232,7 @@ impl AddArgs {
             branch,
             allow_dirty: self.allow_dirty,
             fallback: self.fallback,
+            relocate: !self.no_relocate,
             submodules: match self.submodules {
                 SubmodulesArg::Refuse => SubmodulePolicy::Refuse,
                 SubmodulesArg::Reinit => SubmodulePolicy::Reinit,
@@ -268,6 +275,7 @@ mod tests {
                 allow_dirty: false,
                 fallback: false,
                 submodules: SubmodulePolicy::Refuse,
+                relocate: true,
             }
         );
     }
@@ -441,5 +449,11 @@ mod tests {
         );
         assert!(help("--help").contains("o   -( O )-   o"));
         assert!(!help("-h").contains("( O )"));
+    }
+
+    // U-CLI-16
+    #[test]
+    fn no_relocate_flag() {
+        assert!(!add(&["--no-relocate", "d"]).unwrap().relocate);
     }
 }

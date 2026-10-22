@@ -125,6 +125,7 @@ mod tests {
             other_worktrees: worktrees.iter().map(PathBuf::from).collect(),
             submodule_paths: submodules.iter().map(PathBuf::from).collect(),
             exclude_submodules: true,
+            user_excluded: vec![],
         })
     }
 

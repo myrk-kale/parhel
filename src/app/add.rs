@@ -7,6 +7,7 @@
 //! - any failure before publish undoes the registration, the branch this run
 //!   created, and the staging dir.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,9 +17,10 @@ use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
 use crate::domain::clone_plan::{self, CloneOp, DirLister};
 use crate::domain::exclusions::{ExclusionInput, Exclusions};
 use crate::domain::paths::{self, Placement};
+use crate::domain::relocate::{MAX_RELOCATE_BYTES, Relocation, Rewrite};
 use crate::domain::{AddRequest, BranchMode, Error, ErrorCode, Result, SubmodulePolicy};
 use crate::git::parse::ensure_supported;
-use crate::ports::{CowFs, Git, RepoInfo, WorktreeAddSpec};
+use crate::ports::{CowFs, EntryKind, Git, RepoInfo, WorktreeAddSpec};
 
 /// Side-effect providers and process context.
 #[derive(Clone, Copy)]
@@ -54,6 +56,19 @@ pub struct AddOutcome {
     pub strategy: Strategy,
     /// Printed to stderr as `warning: ...`.
     pub warnings: Vec<String>,
+    /// Copied files and symlinks whose references to the source path were rewritten.
+    pub relocated: usize,
+}
+
+/// What relocation changed in the staged worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RelocationReport {
+    rewritten: usize,
+    relinked: usize,
+    /// Binaries (relative paths) that mention the source and were left as is.
+    binaries: Vec<PathBuf>,
+    /// Entries that could not be examined (e.g. paths too long inside staging).
+    unexamined: usize,
 }
 
 /// Everything validated before the first mutation.
@@ -253,6 +268,7 @@ fn fallback(
         destination: plan.destination.clone(),
         head: env.git.head(&plan.destination)?,
         strategy: Strategy::Fallback,
+        relocated: 0,
         warnings: vec![format!(
             "copy-on-write unavailable ({}); created a regular worktree instead",
             problem.message
@@ -288,7 +304,7 @@ fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOu
         ))
     });
     match assembled {
-        Ok(staged) => publish(env, plan, &staging, &staged),
+        Ok(report) => publish(env, plan, &staging, &report),
         Err(cause) => {
             #[cfg(feature = "failpoints")]
             let _ = crate::failpoint::eval(crate::failpoint::ROLLBACK_FAILPOINT);
@@ -313,7 +329,7 @@ fn assemble(
     staging: &Path,
     journal: &mut Journal,
     lock: &mut Option<crate::ports::FileLock>,
-) -> Result<PathBuf> {
+) -> Result<RelocationReport> {
     let (git, fs, repo) = (env.git, env.fs, &plan.repo);
     let journal_path = staging.join(JOURNAL_FILE);
     *lock = Some(fs.lock_exclusive(&journal_path)?);
@@ -356,6 +372,7 @@ fn assemble(
             .collect(),
         submodule_paths: plan.submodules.clone(),
         exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
+        user_excluded: git.parhelignored(&repo.toplevel)?,
     });
     let ops = clone_plan::plan(
         &Lister {
@@ -404,6 +421,12 @@ fn assemble(
         git.submodules_reinit(&staged, &repo.toplevel, &plan.destination)?;
         check_interrupt(env)?;
     }
+    let report = if request.relocate {
+        relocate_tree(env, &staged, &repo.toplevel, &plan.destination)?
+    } else {
+        RelocationReport::default()
+    };
+    check_interrupt(env)?;
     crate::failpoint!("before_rename");
     check_interrupt(env)?;
     // Record where the worktree is going *before* moving it: if the process dies right
@@ -411,11 +434,93 @@ fn assemble(
     journal.publish_to = Some(plan.destination.clone());
     fs.write_file(&journal_path, &journal.encode())?;
     fs.rename_exclusive(&staged, &plan.destination)?;
-    Ok(staged)
+    Ok(report)
+}
+
+/// Rewrite references to the source path in the staged worktree's untracked files
+/// (see [`crate::domain::relocate`]). Tracked files and submodules are never
+/// touched; files over the size limit are not examined.
+fn relocate_tree(
+    env: &Env<'_>,
+    staged: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<RelocationReport> {
+    let relocation = Relocation::new(source, destination);
+    let tracked: HashSet<PathBuf> = env.git.tracked_files(staged)?.into_iter().collect();
+    let mut report = RelocationReport::default();
+    relocate_dir(
+        env,
+        staged,
+        Path::new(""),
+        &relocation,
+        &tracked,
+        &mut report,
+    )?;
+    Ok(report)
+}
+
+fn relocate_dir(
+    env: &Env<'_>,
+    staged: &Path,
+    dir: &Path,
+    relocation: &Relocation,
+    tracked: &HashSet<PathBuf>,
+    report: &mut RelocationReport,
+) -> Result<()> {
+    let Ok(mut names) = env.fs.list_dir(&staged.join(dir)) else {
+        report.unexamined += 1;
+        return Ok(());
+    };
+    names.sort();
+    for name in names {
+        let rel = dir.join(&name);
+        if (dir.as_os_str().is_empty() && name == ".git") || tracked.contains(&rel) {
+            continue;
+        }
+        let path = staged.join(&rel);
+        // Relocation is best effort: an entry that cannot be inspected (a path too
+        // long for the staging location, an unreadable file) is skipped and
+        // counted, never fatal. Writes, on the other hand, must succeed.
+        let Ok(kind) = env.fs.entry_kind(&path) else {
+            report.unexamined += 1;
+            continue;
+        };
+        match kind {
+            EntryKind::Dir => relocate_dir(env, staged, &rel, relocation, tracked, report)?,
+            EntryKind::File { len } if len <= MAX_RELOCATE_BYTES => {
+                let Ok(contents) = env.fs.read_file(&path) else {
+                    report.unexamined += 1;
+                    continue;
+                };
+                match relocation.rewrite(&contents) {
+                    Rewrite::Rewritten(contents) => {
+                        env.fs.replace_contents(&path, &contents)?;
+                        report.rewritten += 1;
+                    }
+                    Rewrite::BinaryReference => report.binaries.push(rel),
+                    Rewrite::Unchanged => {}
+                }
+            }
+            EntryKind::Symlink { target } => {
+                if let Some(new_target) = relocation.rewrite_link(&target) {
+                    env.fs.replace_symlink(&path, &new_target)?;
+                    report.relinked += 1;
+                }
+            }
+            EntryKind::File { .. } | EntryKind::Other => {}
+        }
+    }
+    Ok(())
 }
 
 /// After the exclusive rename the worktree is ours and valid: never roll it back.
-fn publish(env: &Env<'_>, plan: &Plan, staging: &Path, _staged: &Path) -> Result<AddOutcome> {
+fn publish(
+    env: &Env<'_>,
+    plan: &Plan,
+    staging: &Path,
+    report: &RelocationReport,
+) -> Result<AddOutcome> {
     crate::failpoint!("after_rename");
     let mut warnings = Vec::new();
     env.git
@@ -439,11 +544,39 @@ fn publish(env: &Env<'_>, plan: &Plan, staging: &Path, _staged: &Path) -> Result
             e.message
         ));
     }
+    if !report.binaries.is_empty() {
+        let shown: Vec<String> = report
+            .binaries
+            .iter()
+            .take(5)
+            .map(|p| p.display().to_string())
+            .collect();
+        let more = report.binaries.len().saturating_sub(shown.len());
+        warnings.push(format!(
+            "{} binary file(s) mention the source path and were copied as is: {}{}. If \
+             they misbehave, list them in .parhelignore so they are not copied.",
+            report.binaries.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    if report.unexamined > 0 {
+        warnings.push(format!(
+            "{} copied path(s) could not be checked for references to the source \
+             (unreadable or too long); they were copied as is",
+            report.unexamined
+        ));
+    }
     Ok(AddOutcome {
         destination: plan.destination.clone(),
         head: env.git.head(&plan.destination)?,
         strategy: Strategy::CopyOnWrite,
         warnings,
+        relocated: report.rewritten + report.relinked,
     })
 }
 
@@ -493,6 +626,7 @@ mod tests {
             allow_dirty: false,
             fallback: false,
             submodules: SubmodulePolicy::Refuse,
+            relocate: true,
         }
     }
 
@@ -601,6 +735,7 @@ mod tests {
                 head: SHA_A.into(),
                 strategy: Strategy::CopyOnWrite,
                 warnings: vec![],
+                relocated: 0,
             }
         );
     }
@@ -1495,6 +1630,126 @@ mod tests {
         assert_eq!(
             w.count(|c| matches!(c, Call::CreateDir(d) if d.ends_with("lnk"))),
             0
+        );
+    }
+
+    // ---------------------------------------------------------------- relocation
+
+    /// Staged worktree content: a script, a binary and a tracked file that all
+    /// mention the source, plus an absolute symlink into the source.
+    fn world_with_references() -> World {
+        World {
+            staged_files: vec![
+                (p("env/bin/tool"), b"#!/w/repo/env/bin/python\n".to_vec()),
+                (p("env/data.bin"), b"\0/w/repo/lib\0".to_vec()),
+                (p("tracked.txt"), b"see /w/repo\n".to_vec()),
+            ],
+            staged_links: vec![(p("env/link"), p("/w/repo/env/bin"))],
+            tracked: vec![p("tracked.txt")],
+            ..World::default()
+        }
+    }
+
+    // U-TXN-64
+    #[test]
+    fn relocates_untracked_text_and_symlinks_before_publishing() {
+        let w = world_with_references();
+        let out = run(&w, &new_branch()).unwrap();
+        let tool = p(&format!("{STAGED_WT}/env/bin/tool"));
+        let rewrite = w
+            .position(|c| *c == Call::Rewrite(tool.clone()))
+            .expect("script rewritten");
+        assert_eq!(w.files.borrow()[&tool], b"#!/w/feat/env/bin/python\n");
+        let relink = w
+            .position(|c| {
+                *c == Call::Relink {
+                    path: p(&format!("{STAGED_WT}/env/link")),
+                    target: p("/w/feat/env/bin"),
+                }
+            })
+            .expect("symlink relinked");
+        let index = w
+            .position(|c| matches!(c, Call::ResetIndex { .. }))
+            .unwrap();
+        let rename = w.position(|c| matches!(c, Call::Rename { .. })).unwrap();
+        assert!(index < rewrite && rewrite < rename && relink < rename);
+        assert_eq!(out.relocated, 2);
+    }
+
+    // U-TXN-65
+    #[test]
+    fn never_touches_tracked_files_or_binaries() {
+        let w = world_with_references();
+        let out = run(&w, &new_branch()).unwrap();
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Rewrite(p) if p.ends_with("tracked.txt"))),
+            0
+        );
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Rewrite(p) if p.ends_with("data.bin"))),
+            0
+        );
+        let warning = out
+            .warnings
+            .iter()
+            .find(|m| m.contains("env/data.bin"))
+            .expect("warned");
+        assert!(warning.contains(".parhelignore"), "{warning}");
+    }
+
+    // U-TXN-66
+    #[test]
+    fn no_relocate_leaves_everything_as_cloned() {
+        let w = world_with_references();
+        let mut req = new_branch();
+        req.relocate = false;
+        let out = run(&w, &req).unwrap();
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Rewrite(_) | Call::Relink { .. })),
+            0
+        );
+        assert_eq!(out.relocated, 0);
+    }
+
+    // U-TXN-67: large files are not examined.
+    #[test]
+    fn large_files_are_not_examined() {
+        let w = world_with_references();
+        w.big
+            .borrow_mut()
+            .insert(p(&format!("{STAGED_WT}/env/bin/tool")));
+        run(&w, &new_branch()).unwrap();
+        assert_eq!(w.count(|c| matches!(c, Call::Rewrite(_))), 0);
+    }
+
+    // U-TXN-68: submodules (gitlinks in the index) are other repositories.
+    #[test]
+    fn does_not_descend_into_submodules() {
+        let w = World {
+            staged_files: vec![(p("libs/a/conf"), b"/w/repo\n".to_vec())],
+            tracked: vec![p("libs/a")],
+            ..World::default()
+        };
+        run(&w, &new_branch()).unwrap();
+        assert_eq!(w.count(|c| matches!(c, Call::Rewrite(_))), 0);
+    }
+
+    // U-TXN-69: .parhelignore paths are not cloned at all.
+    #[test]
+    fn parhelignored_paths_are_not_cloned() {
+        let w = World {
+            parhelignored: vec![p("node_modules")],
+            ..World::default()
+        };
+        run(&w, &new_branch()).unwrap();
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Clone { src, .. } if src.ends_with("node_modules"))),
+            0
+        );
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Clone { .. })),
+            1,
+            "src/ still cloned"
         );
     }
 }
