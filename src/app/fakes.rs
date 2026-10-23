@@ -1216,6 +1216,9 @@ impl Default for FakeHost {
             "systemctl",
             "systemd-escape",
             "modprobe",
+            "blkid",
+            "mount",
+            "umount",
         ];
         Self {
             log: RefCell::default(),

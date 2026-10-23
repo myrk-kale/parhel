@@ -207,7 +207,7 @@ fn iset01_setup_creates_image_unit_mount_and_marker() {
         format!("What={}", image().display()),
         format!("Where={}", store_root().display()),
         "Type=btrfs".to_owned(),
-        "Options=loop,discard,noatime".to_owned(),
+        "Options=loop,discard,noatime,nosuid,nodev".to_owned(),
         "WantedBy=local-fs.target".to_owned(),
     ] {
         assert!(

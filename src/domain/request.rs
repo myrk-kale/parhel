@@ -110,6 +110,34 @@ pub fn parse_size(text: &str) -> crate::domain::Result<u64> {
     Ok(bytes)
 }
 
+/// `name` as an account name `setup` will build paths, unit names and mount options from:
+/// lowercase letters, digits, `_`, `.` and `-`, not starting with a digit, a dot or a dash
+/// (`^[a-z_][a-z0-9_.-]*$`). A `%` (systemd expands it in units), a space, a backslash, a
+/// slash or a newline would turn the name into something else wherever it lands.
+/// Errors: `usage`.
+pub fn check_user_name(name: &str) -> crate::domain::Result<()> {
+    use crate::domain::{Error, ErrorCode};
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+    if first_ok
+        && name.len() <= 255
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'))
+    {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorCode::Usage,
+        format!(
+            "the user name `{}` cannot be used for a store: it must match [a-z_][a-z0-9_.-]* \
+             (lowercase letters, digits, `_`, `.` and `-`; no `%`, spaces or backslashes)",
+            name.escape_debug()
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +175,37 @@ mod tests {
         let err = parse_size(text).unwrap_err();
         assert_eq!(err.code, ErrorCode::Usage, "{text:?}");
         assert!(err.message.contains("--size"), "{}", err.message);
+    }
+
+    // U-CLI-26: the user name ends up in paths, a unit file and an image name, so it is
+    // held to what accounts are on the systems that matter.
+    #[rstest]
+    #[case("alice")]
+    #[case("root")]
+    #[case("_apt")]
+    #[case("mary-ann")]
+    #[case("j.doe_2")]
+    fn accepts_account_names(#[case] name: &str) {
+        check_user_name(name).unwrap();
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::uppercase("Alice")]
+    #[case::digit_first("1abc")]
+    #[case::dash_first("-x")]
+    #[case::dot_first(".hidden")]
+    #[case::percent("a%b")]
+    #[case::unit_specifier("a%n")]
+    #[case::space("a b")]
+    #[case::backslash("a\\b")]
+    #[case::slash("a/b")]
+    #[case::dots_and_slashes("../etc")]
+    #[case::newline("a\nb")]
+    #[case::quote("a\"b")]
+    #[case::non_ascii("josé")]
+    fn rejects_names_that_would_become_something_else(#[case] name: &str) {
+        let err = check_user_name(name).unwrap_err();
+        assert_eq!(err.code, crate::domain::ErrorCode::Usage, "{name:?}");
     }
 }

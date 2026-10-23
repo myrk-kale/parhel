@@ -263,6 +263,7 @@ impl SetupArgs {
         }
         if let Some(user) = &self.user {
             check_name("--user", user)?;
+            crate::domain::request::check_user_name(user)?;
         }
         let size = match &self.size {
             Some(text) => parse_size(text)?,
@@ -644,6 +645,11 @@ mod tests {
     #[case::size_without_value(&["--size"])]
     #[case::empty_user(&["--user="])]
     #[case::option_like_user(&["--user=-x"])]
+    #[case::uppercase_user(&["--user=Alice"])]
+    #[case::percent_user(&["--user=a%b"])]
+    #[case::space_user(&["--user", "a b"])]
+    #[case::backslash_user(&["--user=a\\b"])]
+    #[case::path_user(&["--user=../x"])]
     #[case::positional(&["alice"])]
     #[case::unknown_flag(&["--frobnicate"])]
     fn setup_rejects_invalid_usage(#[case] args: &[&str]) {
