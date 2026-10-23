@@ -1059,3 +1059,134 @@ fn il43_copy_to_tmpfs_when_available() {
     assert_success(&add(&src, &sb, &dest, &["--copy"]));
     TestRepo::open(&sb.env, &dest).assert_clean();
 }
+
+// ------------------------------------------------------------ POSIX ACLs
+
+use common::xattr::{self, acl};
+
+/// An access ACL naming user 4242 (`named` permissions, masked by `mask`) on top of
+/// the owner's `owner`; the group and others get nothing, but `group`.
+fn acl_for(owner: u16, named: u16, group: u16, mask: u16, other: u16) -> Vec<u8> {
+    acl::encode(&[
+        (acl::USER_OBJ, owner, acl::NOBODY),
+        (acl::USER, named, 4242),
+        (acl::GROUP_OBJ, group, acl::NOBODY),
+        (acl::MASK, mask, acl::NOBODY),
+        (acl::OTHER, other, acl::NOBODY),
+    ])
+}
+
+fn acl_of(path: &Path, name: &str) -> Option<Vec<u8>> {
+    xattr::get(path, name).unwrap()
+}
+
+/// The filesystem/mode matrix of the ACL tests: ext4 can only be copied to.
+fn acl_cases() -> Vec<(MountedFs, Vec<&'static str>)> {
+    vec![
+        (MountedFs::Btrfs, vec![]),
+        (MountedFs::Btrfs, vec!["--copy"]),
+        (MountedFs::Xfs, vec![]),
+        (MountedFs::Xfs, vec!["--copy"]),
+        (MountedFs::Ext4, vec!["--copy"]),
+    ]
+}
+
+// I-L44: POSIX ACLs are part of who may read a file: they are copied with the files,
+// the directories created for `.parhelignore` and the root of the worktree, so a
+// `.env` that only its owner and one named user could read stays that way.
+#[test]
+fn il44_posix_acls_are_preserved() {
+    for (fs_kind, mode) in acl_cases() {
+        let Some(sb) = sandbox_on(fs_kind) else {
+            continue;
+        };
+        let src = project(&sb);
+        src.ignore(&["secrets/", "src/skipped/"]);
+        src.write(".parhelignore", "src/skipped/\n");
+        src.commit_all("parhelignore");
+        src.write("secrets/.env", "TOKEN=1\n");
+        src.write("src/skipped/log.txt", "left out");
+        let file_acl = acl_for(0o6, 0o4, 0o0, 0o4, 0o0);
+        let dir_acl = acl_for(0o7, 0o5, 0o0, 0o5, 0o0);
+        xattr::set(&src.path("secrets/.env"), acl::ACCESS, &file_acl).unwrap();
+        for dir in ["secrets", "src"] {
+            xattr::set(&src.path(dir), acl::ACCESS, &dir_acl).unwrap();
+            xattr::set(&src.path(dir), acl::DEFAULT, &dir_acl).unwrap();
+        }
+        let root_acl = acl_for(0o7, 0o5, 0o5, 0o5, 0o5);
+        xattr::set(&src.root, acl::ACCESS, &root_acl).unwrap();
+
+        let dest = sb.path("dest");
+        assert_success(&add(&src, &sb, &dest, &mode));
+        let label = format!("{} {mode:?}", fs_kind.fs_type());
+        for rel in ["secrets/.env", "secrets", "src", ""] {
+            assert_eq!(
+                acl_of(&dest.join(rel), acl::ACCESS),
+                acl_of(&src.path(rel), acl::ACCESS),
+                "access ACL of `{rel}` ({label})"
+            );
+            assert_eq!(
+                acl_of(&dest.join(rel), acl::DEFAULT),
+                acl_of(&src.path(rel), acl::DEFAULT),
+                "default ACL of `{rel}` ({label})"
+            );
+            assert_eq!(
+                mode_of(&dest.join(rel)),
+                mode_of(&src.path(rel)),
+                "mode of `{rel}` ({label})"
+            );
+        }
+        assert_eq!(
+            acl_of(&dest.join("secrets/.env"), acl::ACCESS),
+            Some(file_acl)
+        );
+    }
+}
+
+// I-L45: the reverse: a default ACL on the directory the worktree is created in must
+// not leak into the copies. Entries made there inherit its named users, and a mode
+// restored on top would give them access the source never had.
+#[test]
+fn il45_inherited_acls_do_not_widen_access() {
+    for (fs_kind, mode) in acl_cases() {
+        let Some(sb) = sandbox_on(fs_kind) else {
+            continue;
+        };
+        let src = project(&sb);
+        src.ignore(&["secrets/"]);
+        src.write("secrets/.env", "TOKEN=1\n");
+        src.chmod("secrets/.env", 0o640);
+        src.mkdir("secrets/empty");
+        // Everything created in the sandbox from now on inherits user 4242's rwx.
+        let inherit = acl_for(0o7, 0o7, 0o5, 0o7, 0o5);
+        xattr::set(&sb.root, acl::DEFAULT, &inherit).unwrap();
+
+        let dest = sb.path("dest");
+        assert_success(&add(&src, &sb, &dest, &mode));
+        let label = format!("{} {mode:?}", fs_kind.fs_type());
+        for rel in [
+            "secrets/.env",
+            "secrets",
+            "secrets/empty",
+            "target/debug/app",
+        ] {
+            assert_eq!(
+                acl_of(&dest.join(rel), acl::ACCESS),
+                None,
+                "`{rel}` gained an access ACL ({label})"
+            );
+            assert_eq!(
+                acl_of(&dest.join(rel), acl::DEFAULT),
+                None,
+                "`{rel}` gained a default ACL ({label})"
+            );
+            assert_eq!(
+                mode_of(&dest.join(rel)),
+                mode_of(&src.path(rel)),
+                "mode of `{rel}` ({label})"
+            );
+        }
+        assert_eq!(acl_of(&dest, acl::ACCESS), None, "worktree root ({label})");
+        assert_eq!(acl_of(&dest, acl::DEFAULT), None, "worktree root ({label})");
+    }
+}
