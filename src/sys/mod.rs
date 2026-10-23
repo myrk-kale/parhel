@@ -30,6 +30,10 @@ const FS_IMMUTABLE_FL: libc::c_int = 0x0000_0010;
 /// Flags that make `open` refuse a symbolic link at the last component.
 const NO_FOLLOW: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
+/// The most `read_text` reads: what it is used for (a marker, a unit, `/proc/filesystems`)
+/// is a few hundred bytes, and a user can make the files it reads as large as they like.
+const MAX_TEXT_BYTES: usize = 64 * 1024;
+
 /// Programs are looked up in the absolute directories of `PATH` only: an empty or
 /// relative entry would make root run whatever the current directory holds.
 fn resolve(program: &str) -> Option<PathBuf> {
@@ -185,11 +189,14 @@ impl Host for SystemHost {
     }
 
     fn read_text(&self, path: &Path) -> Result<Option<String>> {
+        // Root reads files a user can write: opening a FIFO for reading blocks until
+        // somebody writes to it, so the file is opened without blocking, must turn out
+        // to be a regular file, and is read up to a cap and no further.
         let opened = OpenOptions::new()
             .read(true)
-            .custom_flags(NO_FOLLOW)
+            .custom_flags(NO_FOLLOW | libc::O_NONBLOCK)
             .open(path);
-        let mut file = match opened {
+        let file = match opened {
             Ok(file) => file,
             Err(e) if matches!(errno_of(&e), Some(libc::ENOENT | libc::ENOTDIR)) => {
                 return Ok(None);
@@ -205,8 +212,30 @@ impl Host for SystemHost {
             }
             Err(e) => return Err(io_error(path, &e)),
         };
+        if !file.metadata().map_err(|e| io_error(path, &e))?.is_file() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!(
+                    "`{}` is not a regular file: refusing to read it",
+                    path.display()
+                ),
+            ));
+        }
         let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_error(path, &e))?;
+        io::Read::read_to_end(
+            &mut io::Read::take(&file, MAX_TEXT_BYTES as u64 + 1),
+            &mut bytes,
+        )
+        .map_err(|e| io_error(path, &e))?;
+        if bytes.len() > MAX_TEXT_BYTES {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!(
+                    "`{}` is larger than {MAX_TEXT_BYTES} bytes: refusing to read it",
+                    path.display()
+                ),
+            ));
+        }
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
@@ -663,6 +692,58 @@ mod tests {
             host.read_text(&secret).unwrap().as_deref(),
             Some("root's business")
         );
+    }
+
+    // U-SYS-06b: root reads files a user can write (the marker, a unit): a FIFO planted
+    // there must not hang it (open for reading blocks until a writer shows up), and a
+    // device, a socket or a directory is not text either.
+    #[test]
+    fn read_text_refuses_what_is_not_a_regular_file_without_blocking() {
+        let dir = tmp();
+        let fifo = dir.path().join("marker");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        // A read that blocks is a thread that never returns: the test reports it instead
+        // of hanging with it.
+        std::thread::spawn(move || {
+            let _ = tx.send(SystemHost.read_text(&path));
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_text blocked on a FIFO");
+        let err = answer.unwrap_err();
+        assert!(
+            err.message.contains("not a regular file"),
+            "{}",
+            err.message
+        );
+        let err = SystemHost.read_text(dir.path()).unwrap_err();
+        assert!(
+            err.message.contains("not a regular file"),
+            "{}",
+            err.message
+        );
+    }
+
+    // U-SYS-06c: ... nor may it read without end: a file a user made huge is refused
+    // (the biggest thing parhel reads this way is a few hundred bytes).
+    #[test]
+    fn read_text_refuses_a_file_larger_than_the_cap() {
+        let dir = tmp();
+        let host = SystemHost;
+        let at_cap = dir.path().join("at-cap");
+        fs::write(&at_cap, vec![b'a'; MAX_TEXT_BYTES]).unwrap();
+        assert_eq!(
+            host.read_text(&at_cap).unwrap().map(|t| t.len()),
+            Some(MAX_TEXT_BYTES)
+        );
+        let big = dir.path().join("big");
+        fs::write(&big, vec![b'a'; MAX_TEXT_BYTES + 1]).unwrap();
+        let err = host.read_text(&big).unwrap_err();
+        assert!(err.message.contains("larger than"), "{}", err.message);
     }
 
     // U-SYS-07: listing does not look through a link.
