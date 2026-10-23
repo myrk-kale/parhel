@@ -555,6 +555,20 @@ impl Git for GitCli {
         .map(drop)
     }
 
+    fn worktree_lock(&self, repo: &Path, path: &Path, reason: &str) -> Result<()> {
+        self.run(
+            repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("lock"),
+                OsStr::new("--reason"),
+                OsStr::new(reason),
+                path.as_os_str(),
+            ],
+        )
+        .map(drop)
+    }
+
     fn unregister_worktree(&self, repo: &Path, path: &Path) -> Result<()> {
         let admin_root = self.common_dir(repo)?.join("worktrees");
         let Ok(entries) = fs::read_dir(&admin_root) else {
@@ -773,6 +787,110 @@ mod tests {
         assert!(!cli.branch_exists(&repo, "gone").unwrap());
         assert!(cli.branch_exists(&repo, "kept").unwrap());
         assert!(!repo.join(".git/packed-refs").exists());
+    }
+
+    /// A repository with two linked worktrees, `keep` and `drop`, and their directories.
+    fn two_worktrees() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@b",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ]);
+        let (keep, dropped) = (root.join("keep"), root.join("drop"));
+        for (path, branch) in [(&keep, "k"), (&dropped, "d")] {
+            git(&[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+            ]);
+        }
+        (dir, repo, keep, dropped)
+    }
+
+    // U-GIT-04: a locked worktree survives `git worktree prune` (and so `git gc`) when its
+    // directory is out of reach, an unlocked one does not; git reports the reason; and
+    // the removals parhel does still work on a locked worktree.
+    #[test]
+    fn a_locked_worktree_survives_prune_and_can_still_be_removed() {
+        use std::process::Command;
+        let (_dir, repo, keep, dropped) = two_worktrees();
+        let cli = GitCli::default();
+        cli.worktree_lock(&repo, &keep, "parhel store: /parhel/alice")
+            .unwrap();
+
+        let listed = cli.worktrees(&repo).unwrap();
+        let entry = |path: &Path| listed.iter().find(|w| w.path == path).unwrap().clone();
+        assert_eq!(
+            entry(&keep).locked.as_deref(),
+            Some("parhel store: /parhel/alice")
+        );
+        assert_eq!(entry(&dropped).locked, None);
+
+        // The mount is down: both directories are gone, and the weekly `gc` runs.
+        let away = repo.parent().unwrap().join("away");
+        fs::create_dir(&away).unwrap();
+        fs::rename(&keep, away.join("keep")).unwrap();
+        fs::rename(&dropped, away.join("drop")).unwrap();
+        let prune = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "prune", "--expire", "now"])
+            .output()
+            .unwrap();
+        assert!(prune.status.success());
+        let after = cli.worktrees(&repo).unwrap();
+        assert!(
+            after.iter().any(|w| w.path == keep),
+            "the locked one was forgotten"
+        );
+        assert!(
+            !after.iter().any(|w| w.path == dropped),
+            "control: an unlocked one is pruned"
+        );
+
+        // Back again: it is a worktree, and parhel's removals take a locked one away.
+        fs::rename(away.join("keep"), &keep).unwrap();
+        cli.worktree_remove_force(&repo, &keep).unwrap();
+        assert!(!keep.exists());
+        assert!(!cli.worktrees(&repo).unwrap().iter().any(|w| w.path == keep));
+
+        let (_dir2, repo2, keep2, _) = two_worktrees();
+        cli.worktree_lock(&repo2, &keep2, "parhel store: /s")
+            .unwrap();
+        fs::remove_dir_all(&keep2).unwrap();
+        cli.unregister_worktree(&repo2, &keep2).unwrap();
+        assert!(
+            !cli.worktrees(&repo2)
+                .unwrap()
+                .iter()
+                .any(|w| w.path == keep2)
+        );
     }
 
     // U-GIT-03: a revision that looks like an option never reaches git (works on

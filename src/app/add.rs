@@ -549,6 +549,7 @@ fn store_transaction(
 
     let real = free_name(fs, &real_dir, name)?;
     let route = StoreRun {
+        root: store.root.clone(),
         baseline,
         worktrees_dir,
         real,
@@ -672,6 +673,8 @@ fn lock_baseline(env: &Env<'_>, path: &Path) -> Result<FileLock> {
 /// What a store run adds to the transaction: where the worktree is cloned from and where
 /// it ends up.
 struct StoreRun {
+    /// The store's root, named in the lock reason of the worktree.
+    root: PathBuf,
     /// `<store>/baselines/<id>/tree`: the clone source instead of the live source.
     baseline: PathBuf,
     /// `<store>/worktrees`: where the staging directory lives.
@@ -1120,6 +1123,25 @@ fn publish(
                 ),
             )
         })?;
+    // A worktree in the store has its registration in the repository's `.git` and its
+    // files on the store's image: with the mount down, `git worktree prune` (which `git
+    // gc` runs) sees a registration without a directory and drops it. A locked one is
+    // skipped. The worktree is valid either way, so a lock that fails is a warning.
+    if let Some(route) = route {
+        if let Err(e) = env.git.worktree_lock(
+            &plan.repo.toplevel,
+            at,
+            &format!("parhel store: {}", route.root.display()),
+        ) {
+            warnings.push(format!(
+                "could not lock `{}` against `git worktree prune`, which would forget it \
+                 while the store is not mounted: {}. Run `git worktree lock {}`",
+                at.display(),
+                e.message,
+                at.display()
+            ));
+        }
+    }
     // Last, because the root may be read-only: it could not be renamed (Linux wants
     // write access to a directory moved into another one) nor repaired before.
     if let Err(e) = env.fs.copy_mode(&plan.repo.toplevel, at) {
@@ -3856,6 +3878,57 @@ mod tests {
             |c| matches!(c, Call::Mirror { dst, .. } if *dst == baseline().join("src/main.rs")),
         );
         assert_eq!(after, first + 1, "the file was copied again");
+    }
+
+    // U-STO-91: a worktree published in the store is locked in git, with a reason that
+    // names the store: `git worktree prune` (and the `gc` that runs it) drops the
+    // registration of a worktree whose directory is not there, and while the store's
+    // mount is down none of them is. The lock follows the repair of the registration,
+    // at the real path. Nothing else is ever locked.
+    #[test]
+    fn a_published_store_worktree_is_locked_against_prune() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        let lock = Call::WorktreeLock {
+            path: real("feat"),
+            reason: "parhel store: /store".into(),
+        };
+        assert_eq!(w.count(|c| matches!(c, Call::WorktreeLock { .. })), 1);
+        let repair = w
+            .position(|c| *c == Call::Repair { path: real("feat") })
+            .unwrap();
+        let locked = w.position(|c| *c == lock).expect("locked at the real path");
+        let cleanup = w
+            .position(|c| *c == Call::RemoveDirAll(p(STORE_STAGING)))
+            .unwrap();
+        assert!(repair < locked && locked < cleanup, "{:#?}", w.calls());
+
+        let plain = World::default();
+        run(&plain, &new_branch()).unwrap();
+        assert_eq!(
+            plain.count(|c| matches!(c, Call::WorktreeLock { .. })),
+            0,
+            "only the store's worktrees"
+        );
+    }
+
+    // U-STO-92: the worktree is there and valid once published: a lock that could not be
+    // placed is a warning that says how to place it, never a rollback.
+    #[test]
+    fn a_lock_that_fails_is_a_warning_and_the_worktree_stays() {
+        let w = store_world().failing(Step::WorktreeLock, ErrorCode::GitFailed);
+        let out = run_store(&w, &new_branch()).unwrap();
+        assert!(
+            out.warnings.iter().any(|m| m.contains("git worktree lock")
+                && m.contains(&real("feat").display().to_string())),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(out.real_path, Some(real("feat")));
+        assert_eq!(
+            w.count(|c| matches!(c, Call::RemoveForce { .. } | Call::BranchDelete(_))),
+            0
+        );
     }
 
     // U-STO-22c: the message of a store that cannot be used names `git parhel doctor`
