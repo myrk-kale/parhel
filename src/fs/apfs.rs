@@ -119,7 +119,9 @@ impl CowFs for ApfsFs {
             )
         };
         if rc == 0 {
-            return Ok(());
+            // `clonefile` gives the clone the ACLs of the directory it lands in, and
+            // none of the entry's own: replace them.
+            return tree::copy_acls_at(parent.as_raw_fd(), &name, dst).map_err(|e| failed(&e, src));
         }
         let e = io::Error::last_os_error();
         let culprit = match e.raw_os_error() {
@@ -180,7 +182,7 @@ impl CowFs for ApfsFs {
     }
 
     fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
-        unix::copy_mode(from, to)
+        tree::copy_permissions(from, to)
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {

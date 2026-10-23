@@ -110,3 +110,31 @@ pub fn user_attrs(path: &Path) -> BTreeMap<String, Vec<u8>> {
 pub fn user_attrs(_: &Path) -> BTreeMap<String, Vec<u8>> {
     unimplemented!("only used by the Linux fidelity tests")
 }
+
+/// POSIX ACL entries as the kernel stores them in `system.posix_acl_*`.
+#[cfg(target_os = "linux")]
+pub mod acl {
+    pub const ACCESS: &str = "system.posix_acl_access";
+    pub const DEFAULT: &str = "system.posix_acl_default";
+
+    pub const USER_OBJ: u16 = 0x01;
+    pub const USER: u16 = 0x02;
+    pub const GROUP_OBJ: u16 = 0x04;
+    pub const GROUP: u16 = 0x08;
+    pub const MASK: u16 = 0x10;
+    pub const OTHER: u16 = 0x20;
+    /// `id` of the entries that name nobody.
+    pub const NOBODY: u32 = u32::MAX;
+
+    /// `(tag, permissions as rwx bits, id)` entries in the xattr's binary format
+    /// (version 2).
+    pub fn encode(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            bytes.extend(tag.to_le_bytes());
+            bytes.extend(perm.to_le_bytes());
+            bytes.extend(id.to_le_bytes());
+        }
+        bytes
+    }
+}

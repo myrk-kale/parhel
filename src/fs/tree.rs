@@ -505,7 +505,6 @@ fn copy_xattrs(shown: &Path, src: RawFd, dst: &Path, kind: Kind) -> Step {
         Err(e) => return at(shown, Err(e)),
     };
     let to = at(dst, cstr(dst))?;
-    let mut present = Vec::new();
     for name in names.split(|&b| b == 0).filter(|n| xattr::wanted(n)) {
         let name = CString::new(name).expect("split at NUL");
         let value = match xattr::get(src, &name) {
@@ -519,13 +518,38 @@ fn copy_xattrs(shown: &Path, src: RawFd, dst: &Path, kind: Kind) -> Step {
                 return at(dst, Err(e));
             }
         }
-        present.push(name);
     }
-    // What the source does not have, the copy must not either: an entry created in
-    // a directory with a default ACL inherited one, and with it access the source
-    // never gave.
-    xattr::drop_inherited(&to, &present, kind == Kind::Dir);
+    // Access control is not an attribute to be dropped quietly. What the source does
+    // not have, the copy must not either: an entry created in a directory with a
+    // default ACL inherited one, and with it access the source never gave.
+    if kind != Kind::Symlink {
+        at(shown, acl::copy(src, &to, kind == Kind::Dir))?;
+    }
     Ok(())
+}
+
+/// Give `to` the permission bits of the directory `from`, and its ACLs first (on
+/// Linux they rewrite the group bits). For the directories a clone does not make
+/// itself: the ones created for `.parhelignore`, and the worktree's root.
+pub(crate) fn copy_permissions(from: &Path, to: &Path) -> Result<()> {
+    let held = File::open(from).map_err(|e| unix::io_error(from, &e))?;
+    let target = unix::c_path(to)?;
+    acl::copy(held.as_raw_fd(), &target, true).map_err(|e| unix::io_error(to, &e))?;
+    unix::copy_mode(from, to)
+}
+
+/// Give `dst`, just cloned from the entry `name` of the open directory `parent`,
+/// that entry's ACLs and no others (`clonefile` hands out those of the directory it
+/// lands in instead).
+#[cfg(target_os = "macos")]
+pub(crate) fn copy_acls_at(parent: RawFd, name: &CStr, dst: &Path) -> io::Result<()> {
+    let st = anchor::stat_at(parent, name)?;
+    let kind = kind_of_mode(st.st_mode);
+    if kind == Kind::Symlink {
+        return Ok(());
+    }
+    let held = anchor::open_node_at(parent, name)?;
+    acl::copy(held.as_raw_fd(), &cstr(dst)?, kind == Kind::Dir)
 }
 
 /// Extended attributes of an entry itself (never of a symlink's target).
@@ -533,11 +557,6 @@ mod xattr {
     use std::ffi::CStr;
     use std::io;
     use std::os::fd::RawFd;
-
-    /// POSIX ACLs on Linux are the attributes `system.posix_acl_access` (and, on a
-    /// directory, `system.posix_acl_default`, which new entries inherit).
-    #[cfg(target_os = "linux")]
-    const ACL_NAMES: [&[u8]; 2] = [b"system.posix_acl_access", b"system.posix_acl_default"];
 
     /// Run `call(buffer, size)` (a `*xattr` syscall) with a buffer of the size it asks
     /// for, again if the value grew meanwhile.
@@ -618,51 +637,98 @@ mod xattr {
         }
     }
 
-    /// Remove the ACLs `path` has that the source did not (`present` are the
-    /// attributes copied from it); errors mean there was nothing to remove.
-    #[cfg(target_os = "linux")]
-    pub(super) fn drop_inherited(path: &CStr, present: &[std::ffi::CString], dir: bool) {
-        for name in ACL_NAMES {
-            let default = name.ends_with(b"default");
-            if (default && !dir) || present.iter().any(|p| p.as_bytes() == name) {
-                continue;
-            }
-            let name = std::ffi::CString::new(name).expect("no NUL");
-            // SAFETY: valid C strings.
-            unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[allow(clippy::missing_const_for_fn)]
-    pub(super) fn drop_inherited(_path: &CStr, _present: &[std::ffi::CString], _dir: bool) {}
-
     /// The filesystem has no extended attributes.
     pub(super) fn unsupported(e: &io::Error) -> bool {
         e.raw_os_error() == Some(libc::ENOTSUP)
     }
 
-    /// Linux: `user.*` belongs to the user and the POSIX ACLs are access control
-    /// (`security.*` and `trusted.*` are the kernel's and the administrator's).
-    /// macOS: everything.
+    /// Linux: only `user.*` belongs to the user (`security.*`, `system.*` and
+    /// `trusted.*` are the kernel's and the administrator's; the POSIX ACLs of
+    /// `system.*` are handled by [`super::acl`]). macOS: everything.
     pub(super) fn wanted(name: &[u8]) -> bool {
-        if name.is_empty() {
-            return false;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            name.starts_with(b"user.") || ACL_NAMES.contains(&name)
-        }
-        #[cfg(target_os = "macos")]
-        {
-            true
-        }
+        !name.is_empty() && (cfg!(target_os = "macos") || name.starts_with(b"user."))
     }
 
     /// Attributes the destination cannot hold are dropped (a filesystem without
     /// them; on macOS, system-protected ones such as `com.apple.provenance`).
     pub(super) fn tolerated(e: &io::Error) -> bool {
         cfg!(target_os = "macos") || unsupported(e)
+    }
+}
+
+/// Access control lists, apart from the other attributes: they decide who may read
+/// the file, so losing one, or keeping one the source does not have, changes who can.
+mod acl {
+    use std::ffi::CStr;
+    use std::io;
+    use std::os::fd::RawFd;
+
+    /// Linux: the POSIX ACLs are the attributes `system.posix_acl_access` and, on a
+    /// directory, `system.posix_acl_default` (which its new entries inherit). The
+    /// destination gets exactly the source's: set where it has one, removed where it
+    /// has none (the destination may have inherited one). Filesystems without ACLs
+    /// have nothing to copy.
+    #[cfg(target_os = "linux")]
+    pub(super) fn copy(src: RawFd, dst: &CStr, dir: bool) -> io::Result<()> {
+        for (name, default) in [
+            (c"system.posix_acl_access", false),
+            (c"system.posix_acl_default", true),
+        ] {
+            if default && !dir {
+                continue;
+            }
+            match super::xattr::get(src, name) {
+                Ok(value) => match super::xattr::set(dst, name, &value) {
+                    Err(e) if !super::xattr::unsupported(&e) => return Err(e),
+                    _ => {}
+                },
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENODATA) || super::xattr::unsupported(&e) =>
+                {
+                    // SAFETY: valid C strings. Nothing to remove is not an error.
+                    unsafe { libc::lremovexattr(dst.as_ptr(), name.as_ptr()) };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// macOS: the extended ACL (`chmod +a`), replaced by the source's, or removed.
+    #[cfg(target_os = "macos")]
+    pub(super) fn copy(src: RawFd, dst: &CStr, _dir: bool) -> io::Result<()> {
+        use std::ffi::{c_int, c_uint, c_void};
+
+        const ACL_TYPE_EXTENDED: c_uint = 0x100;
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: c_int, kind: c_uint) -> *mut c_void;
+            fn acl_set_link_np(path: *const libc::c_char, kind: c_uint, acl: *mut c_void) -> c_int;
+            fn acl_init(count: c_int) -> *mut c_void;
+            fn acl_free(object: *mut c_void) -> c_int;
+        }
+        // SAFETY: valid descriptor. NULL with ENOENT: the source has no ACL.
+        let mut acl = unsafe { acl_get_fd_np(src, ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                // An empty ACL removes the destination's (as `chmod -N`).
+                Some(libc::ENOENT | libc::ENOTSUP | libc::EINVAL) => {
+                    // SAFETY: plain allocation.
+                    acl = unsafe { acl_init(0) };
+                }
+                _ => return Err(e),
+            }
+        }
+        // SAFETY: valid C string and ACL, freed once.
+        let rc = unsafe { acl_set_link_np(dst.as_ptr(), ACL_TYPE_EXTENDED, acl) };
+        let result = if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+        // SAFETY: `acl` came from the allocator above.
+        unsafe { acl_free(acl) };
+        result
     }
 }
 
