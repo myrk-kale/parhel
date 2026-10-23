@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::app::rollback::{JOURNAL_FILE, Journal, StoreLink, rollback};
-use crate::app::store::{discover, first_sync_notice, first_sync_size, sync_baseline};
+use crate::app::store::{discover, ensure_room, first_sync_notice, first_sync_size, sync_baseline};
 use crate::domain::clone_plan::{self, CloneOp, DirLister};
 use crate::domain::exclusions::{ExclusionInput, Exclusions};
 use crate::domain::paths::{self, Placement};
@@ -478,6 +478,36 @@ fn store_transaction(
     }
     let baseline_lock = lock_baseline(env, &baseline_dir.join("lock"))?;
     let baseline = baseline_dir.join("tree");
+    refresh_baseline(env, plan, store, &baseline_dir, &exclusions)?;
+    crate::failpoint!("after_sync");
+    check_interrupt(env)?;
+
+    let names_dir = baseline_dir.join("names");
+    ensure_dir(fs, &names_dir)?;
+    let (real, reservation) = reserve_name(fs, &names_dir, &real_dir, name)?;
+    let route = StoreRun {
+        _reservation: reservation,
+        root: store.root.clone(),
+        baseline,
+        worktrees_dir,
+        real,
+        links: store.root.join(LINKS_FILE),
+        exclusions,
+    };
+    transaction(env, request, plan, Some((&route, baseline_lock)))
+}
+
+/// Bring the store's baseline in line with the source: judge whether the mirror fits,
+/// then sync it, and record in `meta` how it stands.
+fn refresh_baseline(
+    env: &Env<'_>,
+    plan: &Plan,
+    store: &Store,
+    baseline_dir: &Path,
+    exclusions: &Exclusions,
+) -> Result<()> {
+    let (fs, repo) = (env.fs, &plan.repo);
+    let baseline = baseline_dir.join("tree");
     let meta_path = baseline_dir.join("meta");
     // A sync that died without cleaning up (power loss, SIGKILL) may have left files
     // whose metadata is right and whose data never reached the disk, and the sync only
@@ -510,20 +540,32 @@ fn store_transaction(
             render_meta(&repo.toplevel, synced, state, last_sync).as_bytes(),
         )
     };
+    // Refused before the first write if the mirror will not fit: in the disk the store's
+    // sparse image grows into, or in the store. (Nothing is written yet, so there is
+    // nothing to undo, and the baseline is as the last run left it.)
+    let first_sync = first_sync_size(env.fs, &repo.toplevel, &baseline, exclusions)?;
+    ensure_room(
+        env.fs,
+        store,
+        first_sync,
+        &repo.toplevel,
+        &baseline,
+        exclusions,
+        last_sync,
+        env.interrupted,
+    )?;
     // Taken before the first entry is looked at: whatever is changed after this is
     // changed after the sync began.
     let started = unix_nanos();
     write_meta("syncing", None)?;
-    if let Some(bytes) = first_sync_size(env.fs, &repo.toplevel, &baseline, &exclusions)? {
-        if let Some(notice) = first_sync_notice(bytes) {
-            eprintln!("parhel: {notice}");
-        }
+    if let Some(notice) = first_sync.and_then(first_sync_notice) {
+        eprintln!("parhel: {notice}");
     }
     let synced = sync_baseline(
         env.fs,
         &repo.toplevel,
         &baseline,
-        &exclusions,
+        exclusions,
         env.interrupted,
         last_sync,
     );
@@ -531,7 +573,7 @@ fn store_transaction(
     // here) before the baseline is called finished. A stopped sync is finished too: it
     // leaves whole files only, and the next one completes it - against the sync before
     // it, because this one did not look at everything.
-    let flushed = fs.flush(&baseline_dir);
+    let flushed = fs.flush(baseline_dir);
     if flushed.is_ok() {
         write_meta(
             "synced",
@@ -544,22 +586,7 @@ fn store_transaction(
     }
     synced?;
     flushed?;
-    crate::failpoint!("after_sync");
-    check_interrupt(env)?;
-
-    let names_dir = baseline_dir.join("names");
-    ensure_dir(fs, &names_dir)?;
-    let (real, reservation) = reserve_name(fs, &names_dir, &real_dir, name)?;
-    let route = StoreRun {
-        _reservation: reservation,
-        root: store.root.clone(),
-        baseline,
-        worktrees_dir,
-        real,
-        links: store.root.join(LINKS_FILE),
-        exclusions,
-    };
-    transaction(env, request, plan, Some((&route, baseline_lock)))
+    Ok(())
 }
 
 /// Now, in nanoseconds since the epoch (the unit of a status-change time).
@@ -4096,6 +4123,54 @@ mod tests {
             0
         );
         assert_eq!(w.count(|c| *c == Call::RemoveDirAll(p(STORE_STAGING))), 1);
+    }
+
+    // U-STO-101: the check of the room comes before the first write of the run: a store
+    // that cannot take the mirror is refused with `store-no-space` and the run leaves
+    // nothing of its own - no baseline entry, no meta saying a sync began, no staging
+    // directory, no registration, no branch.
+    #[rstest]
+    #[case::disk_of_the_image("/var/lib/parhel", "alice.img")]
+    #[case::the_store("/store", "/store")]
+    fn a_store_without_room_is_refused_before_anything_is_written(
+        #[case] short: &str,
+        #[case] named: &str,
+    ) {
+        let w = store_world();
+        w.put_file(&p("/w/repo/src/main.rs"), 3 << 30, 20);
+        w.spaces.borrow_mut().push((
+            p(short),
+            crate::ports::Space {
+                total: 100 << 30,
+                free: 1 << 30,
+            },
+        ));
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreNoSpace, "{err}");
+        assert!(err.message.contains(named), "{}", err.message);
+        assert!(err.message.contains("--copy"), "{}", err.message);
+        assert_eq!(
+            w.count(|c| matches!(
+                c,
+                Call::Mirror { .. }
+                    | Call::MirrorDirMeta { .. }
+                    | Call::CreateStaging { .. }
+                    | Call::WorktreeAdd(_)
+                    | Call::Clone { .. }
+                    | Call::Symlink { .. }
+                    | Call::Append(_)
+            )),
+            0,
+            "{:#?}",
+            w.calls()
+        );
+        assert!(
+            !w.files
+                .borrow()
+                .contains_key(&p(&format!("{BASELINE_DIR}/meta"))),
+            "no meta: a sync never began"
+        );
+        assert!(w.branches.borrow().iter().all(|b| b == "main"));
     }
 
     // U-STO-22c: the message of a store that cannot be used names `git parhel doctor`

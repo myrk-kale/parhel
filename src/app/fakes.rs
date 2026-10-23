@@ -238,6 +238,8 @@ pub struct World {
     /// (`Some(target)`) at the moment `rename_exclusive` is called: (link, what becomes
     /// of it).
     pub link_tampered_at_rename: RefCell<Option<(PathBuf, Option<PathBuf>)>>,
+    /// `space` fails (a path that cannot be measured).
+    pub space_unavailable: Cell<bool>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -329,6 +331,7 @@ impl Default for World {
             fail_flush: Cell::new(false),
             rival_link: RefCell::default(),
             link_tampered_at_rename: RefCell::default(),
+            space_unavailable: Cell::new(false),
         }
     }
 }
@@ -1033,6 +1036,12 @@ impl CowFs for World {
     }
 
     fn space(&self, path: &Path) -> Result<Space> {
+        if self.space_unavailable.get() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: cannot measure", path.display()),
+            ));
+        }
         Ok(self
             .spaces
             .borrow()

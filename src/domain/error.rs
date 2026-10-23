@@ -72,6 +72,9 @@ pub enum ErrorCode {
     StoreUnavailable,
     /// `setup --remove` refused: worktrees still live in the store.
     StoreInUse,
+    /// `add` through the store refused before writing anything: the disk that holds the
+    /// store's image, or the store itself, has less room than mirroring the source needs.
+    StoreNoSpace,
     /// `setup` needs root and was not run as root.
     NotRoot,
     /// A program `setup` needs (`mkfs.btrfs`, `chattr`, ...) is not installed.
@@ -118,6 +121,7 @@ impl ErrorCode {
             Self::Interrupted => "interrupted",
             Self::StoreUnavailable => "store-unavailable",
             Self::StoreInUse => "store-in-use",
+            Self::StoreNoSpace => "store-no-space",
             Self::NotRoot => "not-root",
             Self::MissingTool => "missing-tool",
             Self::UnsupportedPlatform => "unsupported-platform",
