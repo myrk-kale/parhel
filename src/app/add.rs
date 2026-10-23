@@ -541,11 +541,12 @@ fn clone_tree(
 ) -> Result<()> {
     let fs = env.fs;
     let ops = clone_plan::plan(&Lister { fs, root: source }, exclusions)?;
+    let mut created = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         match op {
             CloneOp::CreateDir(rel) => {
                 fs.create_dir(&staged.join(rel))?;
-                fs.copy_mode(&source.join(rel), &staged.join(rel))?;
+                created.push(rel);
             }
             CloneOp::Clone(rel) if copy => fs.copy_entry(&source.join(rel), &staged.join(rel))?,
             CloneOp::Clone(rel) => fs.clone_entry(&source.join(rel), &staged.join(rel))?,
@@ -554,6 +555,11 @@ fn clone_tree(
             crate::failpoint!("mid_clone");
         }
         check_interrupt(env)?;
+    }
+    // The source's modes come last, deepest directory first: a read-only directory
+    // could not be filled, and the plan lists parents before children.
+    for rel in created.into_iter().rev() {
+        fs.copy_mode(&source.join(rel), &staged.join(rel))?;
     }
     // `git worktree add` created the root with default permissions.
     fs.copy_mode(source, staged)

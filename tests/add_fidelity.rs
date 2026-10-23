@@ -238,8 +238,10 @@ fn i23j_read_only_ancestors_of_exclusions_are_filled_then_locked(
     src.write(".parhelignore", "ro/inner/skip/\n");
     src.write("ro/kept.txt", "kept\n");
     src.write("ro/inner/kept.txt", "kept too\n");
-    src.write("ro/inner/skip/big.bin", "skipped\n");
     src.commit_all("read-only tree");
+    // Ignored by git (so untracked) and kept out of the copy by `.parhelignore`.
+    src.ignore(&["ro/inner/skip/"]);
+    src.write("ro/inner/skip/big.bin", "skipped\n");
     // Ignored files and a nested worktree below another read-only directory.
     src.write(".worktrees/notes.txt", "notes\n");
     let nested = src.path(".worktrees/other");
@@ -282,4 +284,37 @@ fn i23j_read_only_ancestors_of_exclusions_are_filled_then_locked(
         assert_eq!(mode(rel), 0o555, "{rel}");
     }
     assert_no_staging(&[&sb.root]);
+}
+
+// I-23k: a failure after the read-only ancestors were locked still removes the
+// staging directory (`remove_dir_all` makes directories writable) and leaves no trace.
+#[rstest]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn i23k_rollback_removes_locked_read_only_ancestors(#[values(false, true)] copy: bool) {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.write(".worktrees/notes.txt", "notes\n");
+    let nested = src.path(".worktrees/other");
+    src.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "other",
+        nested.to_str().unwrap(),
+    ]);
+    let _unlock = Unlock(vec![src.path(".worktrees")]);
+    src.chmod(".worktrees", 0o555);
+    let before = src.snapshot();
+
+    let mut args = add_args(&sb.path("dest"), &["--new-branch", "u"]);
+    if copy {
+        args.push("--copy".to_owned());
+    }
+    let out = parhel_with_failpoints(&sb.env, &src.root, &args, "after_clone=error");
+    assert_error(&out, "failpoint");
+    assert_eq!(src.branch_tip("u"), None);
+    before.assert_same(&src.snapshot());
+    assert_no_staging(&[&sb.root]);
+    assert!(!sb.path("dest").exists());
 }
