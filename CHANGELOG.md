@@ -15,6 +15,33 @@ All notable changes to this project are documented here. The format follows
   build provenance attestation, like the archives. CI installs them in Ubuntu,
   Debian and Fedora containers, runs the smoke test and lints the `.deb` with
   lintian. They are not GPG-signed, and there is no apt or dnf repository yet.
+- **The store: copy-on-write worktrees for sources without reflink (Linux).** When
+  `add` finds `not-cow` or `cross-volume` and the user has a store (a Btrfs
+  image mounted at `/parhel/<user>`, or the directory named by `PARHEL_STORE`),
+  it mirrors the source into a per-repository baseline inside the store (only what
+  changed, with modes, extended attributes, POSIX ACLs and nanosecond times),
+  clones the worktree from it with reflinks and leaves a symlink at the path you
+  asked for. git registers the worktree at its real path in the store, and so does
+  relocation. No flag: it is automatic; `--copy` and `--fallback` bypass it. A
+  configured store that cannot be used is the new error `store-unavailable`, never
+  a silent fallback; where there is no store, `not-cow` also suggests
+  `sudo git parhel setup`. Two runs on one repository take turns on the baseline,
+  a first sync over 1 GiB prints a notice, and a baseline whose sync died without
+  finishing is mirrored again instead of trusted. `git worktree remove <symlink>`
+  removes the real worktree and leaves the symlink dangling.
+- `doctor` checks the store: `store-unavailable`, `store-image-deleted`,
+  `store-low-space`, `store-orphan`, `store-dangling-link` and
+  `store-stale-baseline`; `--fix` removes dangling symlinks and stale baselines
+  and never a worktree. A source on ext4 is no longer reported as `not-cow` while
+  the store can serve it, and the journals of crashed store runs are repaired or
+  rolled back, trusting only paths inside the store.
+- New error code `store-unavailable`.
+
+### Changed
+
+- `remove_dir_all` (rollback, `doctor`) now also removes a tree inside a
+  read-only parent directory, which a mirror of a source with read-only
+  directories needs.
 
 ## [0.3.0] - 2026-10-23
 

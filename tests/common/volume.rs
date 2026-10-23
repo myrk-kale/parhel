@@ -3,7 +3,7 @@
 //! macOS: throwaway disk images (`hdiutil`, no root needed; serialize users with
 //! `#[serial(hdiutil)]`). Linux: filesystems mounted before the run
 //! (`scripts/linux-test.sh`, CI) and announced through `PARHEL_TEST_BTRFS`,
-//! `PARHEL_TEST_XFS` and `PARHEL_TEST_EXT4`: see [`test_mount`].
+//! `PARHEL_TEST_XFS`, `PARHEL_TEST_EXT4` and `PARHEL_TEST_BTRFS_SMALL`: see [`test_mount`].
 
 use std::ffi::OsString;
 use std::fs;
@@ -20,6 +20,8 @@ pub enum MountedFs {
     Btrfs,
     Xfs,
     Ext4,
+    /// A btrfs of a few hundred megabytes, to fill (the tests that need a full disk).
+    SmallBtrfs,
 }
 
 impl MountedFs {
@@ -29,13 +31,14 @@ impl MountedFs {
             Self::Btrfs => "PARHEL_TEST_BTRFS",
             Self::Xfs => "PARHEL_TEST_XFS",
             Self::Ext4 => "PARHEL_TEST_EXT4",
+            Self::SmallBtrfs => "PARHEL_TEST_BTRFS_SMALL",
         }
     }
 
     /// What `common::cow::fs_type` must answer for it.
     pub fn fs_type(self) -> &'static str {
         match self {
-            Self::Btrfs => "btrfs",
+            Self::Btrfs | Self::SmallBtrfs => "btrfs",
             Self::Xfs => "xfs",
             Self::Ext4 => "ext4",
         }

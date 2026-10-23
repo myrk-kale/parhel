@@ -58,6 +58,7 @@ something looks wrong, please
 - [Read this before you rely on it](#read-this-before-you-rely-on-it)
 - [Commands](#commands)
 - [Platform support](#platform-support)
+- [Filesystems without copy-on-write](#filesystems-without-copy-on-write)
 - [How it works](#how-it-works)
 - [What parhel writes, and where](#what-parhel-writes-and-where)
 - [What happens when things go wrong](#what-happens-when-things-go-wrong)
@@ -395,7 +396,11 @@ Only untracked paths are affected; tracked files always come from git.
 
 Reports problems in the repository and its environment:
 
-- the worktree is on a filesystem without copy-on-write (`not-cow`);
+- the worktree is on a filesystem without copy-on-write (`not-cow`), unless
+  the [store](#filesystems-without-copy-on-write) can serve it;
+- the findings about the store, when there is one (`store-unavailable`,
+  `store-image-deleted`, `store-low-space`, `store-orphan`, `store-dangling-link`,
+  `store-stale-baseline`);
 - an earlier run crashed and left a hidden `.parhel-staging-*` directory, or a
   worktree registration inside one;
 - a `.git` file inside your tree belongs to a different repository (`add`
@@ -404,7 +409,9 @@ Reports problems in the repository and its environment:
 `--fix` cleans up after crashed runs. It reads the journal the run left behind
 and removes only what that run created. If the crash happened after the new
 worktree was already in place, `--fix` repairs it and leaves it alone. Runs that
-are still going hold a lock on their journal, and `doctor` skips them.
+are still going hold a lock on their journal, and `doctor` skips them. For the
+store, `--fix` also removes dangling symlinks created by `add` and baselines whose
+source is gone; it never deletes a worktree.
 
 ### Help
 
@@ -419,7 +426,7 @@ script and the `.deb` and `.rpm` packages all install.
 | macOS, APFS | Supported | `clonefile(2)` |
 | Linux: Btrfs, XFS with reflink | Supported, tested | reflink copies (`ioctl(FICLONE)`) per file |
 | Linux: bcachefs, ZFS 2.2+ | Expected to work, not tested | the same reflinks; found by the same probe |
-| Linux: other filesystems (ext4, tmpfs, NFS...) | `--copy` or `--fallback` | full copies, or a regular worktree |
+| Linux: other filesystems (ext4, tmpfs, NFS...) | Through the [store](#filesystems-without-copy-on-write), or `--copy` or `--fallback` | a Btrfs image where the worktree lives (copy-on-write there), full copies, or a regular worktree |
 | Windows | Planned | |
 
 parhel does not go by the filesystem's name. On Linux it asks the directory
@@ -440,7 +447,9 @@ switches to a full copy by itself.
 
 When the source or the destination is on a filesystem without copy-on-write, or
 when they are on different volumes, `add` stops with `not-cow` or
-`cross-volume` before touching anything. You then have two ways out:
+`cross-volume` before touching anything, unless the Linux user has a
+[store](#filesystems-without-copy-on-write), which `add` then uses by itself. You
+have two more ways out:
 
 - `--copy` copies every file in full through the same steps as a clone: the
   staging directory, the exclusive rename, the rollback and the path rewriting.
@@ -467,6 +476,104 @@ those ACLs matter.
 The code keeps filesystem access behind one interface (`CowFs` in
 `src/ports.rs`), so adding a platform means writing a new implementation of it
 and running the same test suite against it.
+
+## Filesystems without copy-on-write
+
+On Linux, a source on ext4 (or any filesystem that cannot reflink) can still get
+copy-on-write worktrees through the **store**: a Btrfs image, one per user, that
+is mounted at `/parhel/<user>` and created once with `sudo git parhel setup`.
+The worktree is created inside the store, where files can share blocks, and the
+path you asked for becomes a symlink to it.
+
+`add` takes this route by itself, without a flag, when copy-on-write is not
+possible between the source and the destination (`not-cow`, or two filesystems,
+`cross-volume`), you have a store, and the store is on another filesystem than the
+source. `--copy` and `--fallback` keep their meaning and never look at the store.
+
+```
+$ git parhel add ../feature --new-branch feature
+Created copy-on-write (store) worktree at /home/you/work/feature
+The worktree lives in the store at /parhel/you/worktrees/<id>/feature; /home/you/work/feature is a symlink to it
+HEAD 4f3c1d2a9b8e
+```
+
+How it works:
+
+- **A baseline per repository.** The store keeps a mirror of the source worktree,
+  `baselines/<id>/tree`, where `<id>` is a hash of the source's path. Each `add`
+  first brings it up to date: it compares every file with the source (type, size,
+  modification time to the nanosecond, mode, symlink target) and copies only what
+  changed, deletes what the source deleted, and keeps modes, extended attributes,
+  POSIX ACLs and times. The first run copies everything (parhel prints a line with
+  the size before it starts when it is over 1 GiB); the next ones copy what you
+  changed since. The same exclusions apply as for any clone: the root `.git`,
+  nested worktrees, submodules with `--submodules=reinit`, `.parhelignore`.
+- **A clone of the baseline.** The worktree is a reflink clone of the baseline
+  inside the store, then the usual steps run against your repository: the
+  registration, the index, a checkout of a ref other than HEAD, submodules. Every
+  worktree shares its blocks with the baseline and with the others, so the second
+  one costs almost nothing. Rewriting the baseline never reaches a worktree that
+  already exists, because each one is an independent clone.
+- **The symlink.** git registers the worktree at its real path in the store,
+  `<store>/worktrees/<id>/<name>` (`<name>-2`, `<name>-3`... when the name is
+  taken), and so do the paths parhel rewrites inside it (virtual environments,
+  scripts, symlinks that pointed at the source): they stay valid however you
+  reach the worktree. The path you asked for is created last and never replaces
+  anything: if something appeared there meanwhile, the run stops with
+  `dest-exists` and removes what it made. The symlink is recorded in the run's
+  journal and in `<store>/links` before it is created.
+- **Two runs on one repository** take turns on the baseline: the second one waits
+  for the first to finish copying and cloning, then runs.
+- **`PARHEL_STORE`** names another store directory (tests and unusual setups). By
+  default it is `/parhel/<user>`, the user being the account that runs the command.
+
+If a store is configured and cannot be used (not mounted, no `.parhel-store`
+marker, not writable, not on a filesystem that can reflink), `add` stops with
+`store-unavailable`; it never falls back by itself to a regular worktree or a full
+copy. Run `git parhel doctor`, and check the mount with `systemctl status`. Where
+there is no store, `not-cow` also suggests `sudo git parhel setup`.
+
+### Removing a store worktree
+
+`git worktree remove <symlink>` works: git follows the symlink, removes the real
+worktree and its registration, and leaves the symlink behind, dangling. That
+path stays taken (`add` would answer `dest-exists`) until you delete the symlink
+yourself or run `git parhel doctor --fix`, which removes dangling symlinks that
+`add` created (it knows them from `<store>/links`, and removes a path only while it
+still is a symlink to exactly the worktree it was made for). Removing by the real
+path works the same way.
+
+### What `doctor` says about a store
+
+Only when a store is configured:
+
+| Finding | Meaning |
+|---|---|
+| `store-unavailable` | The store is configured and cannot be used; the reason follows. Nothing below is checked |
+| `store-image-deleted` | The store is mounted but the image file behind it was deleted. Copy your work out before unmounting: the data goes away with the last reference |
+| `store-low-space` | The filesystem holding the image has under 10% or 2 GiB free (the sparse image grows into it), or the store itself has under 10% free |
+| `store-orphan` | A directory under `worktrees/<id>/` that git does not know. Reported only: it may hold work, and `--fix` never deletes a worktree directory |
+| `store-dangling-link` | A symlink created by `add` whose worktree is gone. `--fix` removes the symlink |
+| `store-stale-baseline` | A baseline whose source is no longer a git worktree. `--fix` deletes that baseline, which is a cache |
+
+With a store that can serve it, a source on ext4 is no longer a `not-cow` finding.
+
+### Risks and limits
+
+- The store is **one image file** in the system's disk. Commits and branches live
+  in your repository's own `.git`, not in the store, so they are safe if the image
+  is lost. Uncommitted work in a store worktree is not: commit and push what you
+  cannot lose.
+- The baseline is a cache of the source. The sync trusts size, modification time
+  and mode: a change that leaves all three alone (`setfacl` or an extended
+  attribute on an otherwise untouched file) is not noticed until the file changes.
+  A sync that died without a word (power loss, `kill -9`) is not trusted at all:
+  the next run mirrors the source again.
+- A disk that fills up fails the run with the system's message, leaves no
+  worktree and no symlink, and the next run (with room, or with less in the source)
+  works from where the baseline stands.
+- The symlink path may not contain a tab or a newline (the registry has one line
+  per link).
 
 ## How it works
 
@@ -521,6 +628,7 @@ it touches. These are all the writes `add` makes:
 | New worktree registration and, if requested, a new branch | `.git/worktrees/<id>` and `refs/heads/<branch>`, through `git worktree add` |
 | Cloned files, rewritten paths, removed foreign `.git` files | Only inside the new worktree |
 | Pointing the registration at the final path | Only that registration's `gitdir` file |
+| With a store: the baseline, the worktree, the registry of links | `<store>/baselines/<id>`, `<store>/worktrees/<id>/<name>` and `<store>/links`, all inside the store; plus the symlink at the destination you asked for |
 
 It never writes to other worktrees, never changes `.git/config` (submodule
 settings are written only if they differ, and only for the new worktree's
@@ -620,7 +728,8 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 ## Limitations
 
 - Copy-on-write works on APFS (macOS) and on Linux filesystems that reflink.
-  Elsewhere, `--copy` copies every file and `--fallback` creates a regular
+  Elsewhere on Linux the [store](#filesystems-without-copy-on-write) provides it;
+  without one, `--copy` copies every file and `--fallback` creates a regular
   worktree. See [Platform support](#platform-support).
 - For a clone, source and destination must be on the same volume, because
   clones cannot cross volumes. `--copy` and `--fallback` cover this case too.
@@ -678,7 +787,8 @@ usage errors and `128 + signal` when a signal interrupted the run.
 | `dirty-source` | Commit or stash your changes, or pass `--allow-dirty` |
 | `dest-exists` | Choose another destination. parhel never overwrites |
 | `dest-parent-missing` | Create the parent directory first |
-| `not-cow` / `cross-volume` | Use a destination on the same volume, on a filesystem with copy-on-write, or pass `--copy` (full copy) or `--fallback` (regular worktree) |
+| `not-cow` / `cross-volume` | Use a destination on the same volume, on a filesystem with copy-on-write, set up the [store](#filesystems-without-copy-on-write) (`sudo git parhel setup`, Linux), or pass `--copy` (full copy) or `--fallback` (regular worktree) |
+| `store-unavailable` | The store exists but cannot be used (not mounted, marker missing, no copy-on-write, not writable). Run `git parhel doctor` and look at `systemctl status` of its mount; `--copy` and `--fallback` do not need it |
 | `submodules-present` | Pass `--submodules=reinit` |
 | `dirty-submodule` | Commit or stash the changes inside the submodule, or drop `--allow-dirty` |
 | `operation-in-progress` | Finish or abort the merge, rebase or cherry-pick first |
