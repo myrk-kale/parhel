@@ -1,4 +1,4 @@
-//! I-SET01..I-SET15: `git parhel setup`, the store at its real place.
+//! I-SET01..I-SET21: `git parhel setup`, the store at its real place.
 //!
 //! These tests change the machine: they create `/var/lib/parhel`, a loop-mounted btrfs
 //! image, a systemd unit and `/parhel/<user>`, and they need `sudo`, systemd and the
@@ -26,6 +26,9 @@ use std::process::{Command, Output};
 use common::*;
 use serial_test::serial;
 
+/// The look at the machine for a store that is not ours to remove happens once.
+static LOOKED: std::sync::Once = std::sync::Once::new();
+
 /// Whether the machine-changing tests are enabled. A skipped test says so.
 fn enabled() -> bool {
     let on = std::env::var_os("PARHEL_TEST_SETUP").is_some_and(|v| v == "1");
@@ -35,6 +38,14 @@ fn enabled() -> bool {
             unsafe { libc::geteuid() } != 0,
             "run these tests as an ordinary user: they call sudo for the few commands that need root"
         );
+        // Once, before the first test touches anything: these tests REMOVE the store of the
+        // user who runs them, so a machine that already has one is not for them.
+        LOOKED.call_once(|| {
+            let found = existing_store();
+            if let Some(why) = refusal(&found, &user(), std::env::var_os("CI").is_some()) {
+                panic!("{why}");
+            }
+        });
     } else {
         eprintln!(
             "SKIPPED: PARHEL_TEST_SETUP=1 is not set (this test creates a store with sudo, \
@@ -42,6 +53,44 @@ fn enabled() -> bool {
         );
     }
     on
+}
+
+/// What of the user's store is on this machine already: the image, the unit, the mount.
+fn existing_store() -> Vec<String> {
+    let mut found = Vec::new();
+    let root_has = |path: &Path| {
+        sudo("test", &["-e", path.to_str().unwrap()])
+            .status
+            .success()
+    };
+    if root_has(&image()) {
+        found.push(format!("the image {}", image().display()));
+    }
+    if root_has(&unit_file()) {
+        found.push(format!("the unit {}", unit_file().display()));
+    }
+    if sudo("mountpoint", &["-q", store_root().to_str().unwrap()])
+        .status
+        .success()
+    {
+        found.push(format!("a mount at {}", store_root().display()));
+    }
+    found
+}
+
+/// Why the tests must not run here: `found` is what of `user`'s store exists. Not on a CI
+/// machine (`ci`), which is built to be destroyed.
+fn refusal(found: &[String], user: &str, ci: bool) -> Option<String> {
+    if ci || found.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to run: PARHEL_TEST_SETUP=1 makes these tests REMOVE the store of `{user}`, \
+         and this machine already has one ({}). Whatever is in it - worktrees included - would \
+         be deleted. Run them on a machine you can lose (a VM, the CI job `setup (Linux)`), or \
+         set CI=1 if this one really is disposable",
+        found.join(", ")
+    ))
 }
 
 fn uid() -> u32 {
@@ -682,6 +731,219 @@ fn iset15_a_second_users_store_keeps_every_image_protected() {
         !rm.status.success(),
         "the remaining image lost its protection"
     );
+}
+
+/// The unit deleted by hand, the way someone cleaning up /etc/systemd/system would: the
+/// store is stopped, its image is still there, and nothing mounts it.
+fn delete_the_unit_by_hand() {
+    assert!(shell_ok(&format!(
+        "systemctl disable --now {u} && rm -f '{f}' && systemctl daemon-reload",
+        u = unit(),
+        f = unit_file().display()
+    )));
+    assert!(!unit_file().exists());
+    assert!(!is_mounted(&store_root()));
+}
+
+fn is_mounted(path: &Path) -> bool {
+    shell_ok(&format!("mountpoint -q '{}'", path.display()))
+}
+
+/// Nothing is left mounted on a private directory, and none is left behind.
+fn assert_no_probe_left() {
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    assert!(!mounts.contains("parhel-probe-"), "a probe mount is left");
+    let left: Vec<_> = fs::read_dir("/run")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("parhel-probe-"))
+        .collect();
+    assert!(left.is_empty(), "directories left in /run: {left:?}");
+}
+
+// I-SET17: the unit is gone and so is the store's mount, but the image is there and holds a
+// worktree: `--remove` used to delete it without looking. It now mounts the image read-only
+// to look, finds the worktree, refuses with `store-in-use` naming it where it will appear,
+// leaves the image untouched and nothing mounted; and the store comes back with the work.
+#[test]
+#[serial(setup)]
+fn iset17_remove_looks_inside_when_the_unit_is_gone_and_finds_the_worktree() {
+    if !enabled() {
+        return;
+    }
+    let Some((sb, src)) = ext4_source() else {
+        return;
+    };
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    let dest = sb.path("wt");
+    assert_success(&add_default(&sb, &src, &dest, "f1"));
+    let real = fs::read_link(&dest).unwrap();
+    fs::write(real.join("uncommitted.txt"), "do not lose me").unwrap();
+    let before = root_stat(image());
+    delete_the_unit_by_hand();
+
+    let out = setup(&["--remove"]);
+    assert_error(&out, "store-in-use");
+    assert!(
+        stderr(&out).contains(real.to_str().unwrap()),
+        "{}",
+        stderr(&out)
+    );
+    let after = root_stat(image());
+    assert_eq!((after.inode, after.mtime), (before.inode, before.mtime));
+    assert!(root_exists(image()));
+    assert!(!is_mounted(&store_root()));
+    assert_no_probe_left();
+
+    // The store comes back, with the work in it.
+    assert_success(&setup(&["--size", "512M"]));
+    assert_eq!(
+        fs::read_to_string(real.join("uncommitted.txt")).unwrap(),
+        "do not lose me"
+    );
+}
+
+// I-SET18: the unit is gone and the store holds nothing of value: `--remove` mounts it read-only,
+// looks, unmounts, and removes the image and the mount point.
+#[test]
+#[serial(setup)]
+fn iset18_remove_an_empty_store_whose_unit_is_gone() {
+    if !enabled() {
+        return;
+    }
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    delete_the_unit_by_hand();
+    let out = setup(&["--remove"]);
+    assert_success(&out);
+    assert!(!root_exists(image()), "image left");
+    assert!(!store_root().exists(), "mount point left");
+    assert_no_probe_left();
+}
+
+// I-SET19: ... and files that are not the store's, in the root of the store, are the user's:
+// refused, naming them, until `--discard-contents`.
+#[test]
+#[serial(setup)]
+fn iset19_remove_refuses_other_files_in_the_store_until_discard_contents() {
+    if !enabled() {
+        return;
+    }
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    fs::write(store_root().join("thesis.tex"), "years of work").unwrap();
+    delete_the_unit_by_hand();
+
+    let out = setup(&["--remove"]);
+    assert_error(&out, "store-in-use");
+    assert!(stderr(&out).contains("thesis.tex"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--discard-contents"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(root_exists(image()));
+    assert_no_probe_left();
+
+    let out = setup(&["--remove", "--discard-contents"]);
+    assert_success(&out);
+    assert!(!root_exists(image()));
+    assert_no_probe_left();
+}
+
+/// A tmpfs mounted over the store's place, unmounted on drop whatever happened.
+struct ForeignMount;
+
+impl ForeignMount {
+    fn at(path: &Path) -> Self {
+        assert!(
+            shell_ok(&format!("mount -t tmpfs tmpfs '{}'", path.display())),
+            "mount tmpfs"
+        );
+        Self
+    }
+}
+
+impl Drop for ForeignMount {
+    fn drop(&mut self) {
+        let _ = shell_ok(&format!("umount '{}'", store_root().display()));
+    }
+}
+
+// I-SET20: something else is mounted at /parhel/<user> (a tmpfs somebody put there): the
+// store is not it. `setup` does not lay it out, `--remove` does not unmount it, both say
+// store-unavailable and name what is there; when it is gone the store is set up as usual.
+#[test]
+#[serial(setup)]
+fn iset20_a_foreign_mount_at_the_stores_place_is_left_alone() {
+    if !enabled() {
+        return;
+    }
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    assert!(shell_ok(&format!("systemctl stop {}", unit())));
+    let foreign = ForeignMount::at(&store_root());
+    let before = fs::read_dir(store_root()).unwrap().count();
+
+    for args in [&["--size", "512M"][..], &["--remove"][..]] {
+        let mut all = vec![];
+        all.extend_from_slice(args);
+        let out = setup(&all);
+        assert_error(&out, "store-unavailable");
+        assert!(stderr(&out).contains("tmpfs"), "{}", stderr(&out));
+        assert!(is_mounted(&store_root()), "it was unmounted");
+        assert_eq!(fs::read_dir(store_root()).unwrap().count(), before);
+        assert!(root_exists(image()) && unit_file().exists());
+    }
+    drop(foreign);
+    assert_success(&setup(&["--size", "512M"]));
+    assert_eq!(common::cow::fs_type(&store_root()), "btrfs");
+}
+
+// I-SET21: user names that would become something else (`%` is expanded by systemd in a unit,
+// uppercase is not an account name) are refused before anything is created.
+#[test]
+#[serial(setup)]
+fn iset21_user_names_systemd_would_expand_are_refused() {
+    if !enabled() {
+        return;
+    }
+    let _machine = Machine::clean();
+    for name in ["a%b", "Alice", "a b"] {
+        let out = setup(&["--user", name, "--size", "512M"]);
+        assert_error(&out, "usage");
+        // Refused for what the name is, not because no such account exists.
+        assert!(
+            stderr(&out).contains("[a-z_][a-z0-9_.-]*"),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(!root_exists("/var/lib/parhel/a%b.img"));
+    assert!(!root_exists(image()) && !unit_file().exists());
+}
+
+// I-SET16: these tests remove the store of the user who runs them, and `PARHEL_TEST_SETUP=1`
+// on a developer's machine that has one would destroy it (the image is the user's
+// worktrees): `enabled()` refuses, with an explanation, unless the machine is CI's. Runs
+// everywhere: it looks at nothing.
+#[test]
+fn iset16_the_guard_refuses_a_machine_that_already_has_a_store() {
+    let found = vec![
+        "the image /var/lib/parhel/me.img".to_owned(),
+        "a mount at /parhel/me".to_owned(),
+    ];
+    let said = refusal(&found, "me", false).expect("a store is there and this is not CI");
+    for needle in ["/var/lib/parhel/me.img", "/parhel/me", "REMOVE", "CI"] {
+        assert!(said.contains(needle), "lacks `{needle}`: {said}");
+    }
+    assert_eq!(
+        refusal(&found, "me", true),
+        None,
+        "CI machines are disposable"
+    );
+    assert_eq!(refusal(&[], "me", false), None, "nothing to lose");
 }
 
 // I-SET14: off Linux `setup` is an `unsupported-platform` error and touches nothing.
