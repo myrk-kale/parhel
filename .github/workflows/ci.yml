@@ -108,12 +108,20 @@ jobs:
         run: |
           id
           echo "PID 1: $(ps -p 1 -o comm=)"
-          # sed, not head: with pipefail a reader that quits early fails the step.
-          systemctl --version | sed -n 1p
-          sudo -n true
-          sudo modprobe loop btrfs || true
-          grep -w btrfs /proc/filesystems
-          command -v mkfs.btrfs chattr systemd-escape
+          # Each prerequisite on its own line, so a missing one is named in the log.
+          missing=0
+          check() {
+            if out=$("$@" 2>&1); then echo "ok: $*"; else echo "MISSING: $* -> $out"; missing=1; fi
+          }
+          check sudo -n true
+          check systemctl --version
+          check sudo modprobe loop
+          check sudo modprobe btrfs
+          check grep -w btrfs /proc/filesystems
+          check command -v mkfs.btrfs
+          check command -v chattr
+          check command -v systemd-escape
+          exit "$missing"
       - name: Mount the ext4 filesystem for the sources (shared script)
         # The same script as the test job: also prints PARHEL_TEST_EXT4 and friends.
         shell: bash
