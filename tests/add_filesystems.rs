@@ -1,12 +1,16 @@
-//! I-50..I-53: real volume boundaries via throwaway disk images.
+//! I-50..I-53: real volume boundaries via throwaway disk images (macOS; the Linux
+//! counterparts are in `add_linux.rs`).
 
 mod common;
 
+#[cfg(target_os = "macos")]
 use common::volume::{DiskImage, ImageFs};
 use common::*;
+#[cfg(target_os = "macos")]
 use serial_test::serial;
 
 // I-50
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i50_destination_on_another_apfs_volume_is_refused() {
@@ -23,6 +27,7 @@ fn i50_destination_on_another_apfs_volume_is_refused() {
 }
 
 // I-51a
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i51a_source_on_hfs_is_refused() {
@@ -48,6 +53,7 @@ fn i51a_source_on_hfs_is_refused() {
 }
 
 // I-51b
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i51b_destination_on_hfs_is_refused_as_not_cow() {
@@ -63,6 +69,7 @@ fn i51b_destination_on_hfs_is_refused_as_not_cow() {
 }
 
 // I-52a: --fallback produces a regular worktree with a warning.
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i52a_fallback_creates_plain_worktree() {
@@ -85,7 +92,7 @@ fn i52a_fallback_creates_plain_worktree() {
     assert!(!wt.exists("node_modules"));
 }
 
-// I-52b: --fallback is inert when copy-on-write works.
+// I-52b: --fallback is inert when copy-on-write works (APFS, btrfs, XFS).
 #[test]
 fn i52b_fallback_flag_is_inert_on_apfs() {
     let sb = Sandbox::new();
@@ -105,6 +112,7 @@ fn i52b_fallback_flag_is_inert_on_apfs() {
 }
 
 // I-53: case-sensitive APFS.
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i53_case_sensitive_apfs_volume() {
@@ -124,4 +132,71 @@ fn i53_case_sensitive_apfs_volume() {
     wt.assert_clean();
     assert_eq!(wt.read("Readme.md"), "mixed\n");
     assert_eq!(wt.read("README.MD"), "upper\n");
+}
+
+// I-55a: `--copy` needs no copy-on-write: a source and destination on HFS+ work.
+#[cfg(target_os = "macos")]
+#[test]
+#[serial(hdiutil)]
+fn i55a_copy_works_on_a_volume_without_cow() {
+    let sb = Sandbox::new();
+    let hfs = DiskImage::new(ImageFs::Hfs, 128);
+    let src = TestRepo::init_at(&sb.env, &hfs.mount.join("src"));
+    src.ignore(&["target/"]);
+    src.write("target/debug/app", "binary");
+    let dest = hfs.mount.join("dest");
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--copy", "--new-branch", "c"]),
+    );
+    assert_success(&out);
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+    let wt = TestRepo::open(&sb.env, &dest);
+    wt.assert_clean();
+    assert_eq!(wt.read("target/debug/app"), "binary");
+    assert_no_staging(&[&hfs.mount]);
+}
+
+// I-55b: ... and `--copy` crosses volumes (refused as `cross-volume` without it, I-50).
+#[cfg(target_os = "macos")]
+#[test]
+#[serial(hdiutil)]
+fn i55b_copy_crosses_volumes() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let other = DiskImage::new(ImageFs::Apfs, 128);
+    let dest = other.mount.join("dest");
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--copy", "--new-branch", "x"]),
+    );
+    assert_success(&out);
+    let wt = TestRepo::open(&sb.env, &dest);
+    wt.assert_clean();
+    assert_eq!(wt.read("target/debug/app"), "binary");
+    assert_eq!(
+        wt.read("node_modules/pkg/index.js"),
+        "module.exports = 1;\n"
+    );
+    assert_no_staging(&[&sb.root, &other.mount]);
+}
+
+// I-55c: the refusal for a volume without copy-on-write offers both ways out.
+#[cfg(target_os = "macos")]
+#[test]
+#[serial(hdiutil)]
+fn i55c_refusal_offers_copy_and_fallback() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    let hfs = DiskImage::new(ImageFs::Hfs, 128);
+    let out = parhel(
+        &sb.env,
+        &src.root,
+        &add_args(&hfs.mount.join("dest"), &["--new-branch", "x"]),
+    );
+    assert_error(&out, "not-cow");
+    assert!(stderr(&out).contains("--copy"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--fallback"), "{}", stderr(&out));
 }

@@ -3,9 +3,12 @@
 
 pub mod cli;
 pub mod cow;
+#[cfg(target_os = "linux")]
+pub mod fiemap;
 pub mod fixtures;
 pub mod repo;
 pub mod volume;
+pub mod xattr;
 
 pub use cli::*;
 pub use fixtures::*;

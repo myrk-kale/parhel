@@ -4,9 +4,13 @@ mod common;
 
 use std::fs;
 
-use common::cow::{free_bytes, shares_storage, write_blob};
+#[cfg(target_os = "macos")]
+use common::cow::free_bytes;
+use common::cow::{shares_storage, write_blob};
+#[cfg(target_os = "macos")]
 use common::volume::{DiskImage, ImageFs};
 use common::*;
+#[cfg(target_os = "macos")]
 use serial_test::serial;
 
 const MIB: usize = 1 << 20;
@@ -54,6 +58,10 @@ fn i54b_writes_in_destination_do_not_reach_source() {
 }
 
 // I-54c: free space barely moves when cloning a large tree (isolated volume).
+// macOS only (hdiutil image). On Linux sharing is proven per file with FIEMAP
+// (I-L01, I-L02); free space on a mount shared
+// with parallel tests is too noisy to assert on.
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i54c_free_space_barely_changes() {

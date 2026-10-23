@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
+use common::xattr;
 use common::*;
 
 fn add_ok(sb: &Sandbox, src: &TestRepo, dest: &Path) -> TestRepo {
@@ -82,19 +83,12 @@ fn i23c_empty_directories_are_preserved() {
 fn i23d_extended_attributes_are_preserved() {
     let sb = Sandbox::new();
     let src = project(&sb);
-    let st = Command::new("xattr")
-        .args(["-w", "com.parhel.test", "hello"])
-        .arg(src.path("README.md"))
-        .status()
-        .unwrap();
-    assert!(st.success());
+    xattr::set(&src.path("README.md"), xattr::TEST_ATTR, b"hello").unwrap();
     let wt = add_ok(&sb, &src, &sb.path("xattr"));
-    let out = Command::new("xattr")
-        .args(["-p", "com.parhel.test"])
-        .arg(wt.path("README.md"))
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    assert_eq!(
+        xattr::get(&wt.path("README.md"), xattr::TEST_ATTR).unwrap(),
+        Some(b"hello".to_vec())
+    );
 }
 
 // I-23e: unicode (NFD) names, spaces in names and in the destination path.
