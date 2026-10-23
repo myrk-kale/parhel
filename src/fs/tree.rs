@@ -8,19 +8,27 @@
 //! directory changes its mtime, and a read-only one cannot be filled). Symlinks are
 //! recreated, never followed; FIFOs are recreated; sockets and device nodes are
 //! skipped, as git does. Hard links become independent files.
+//!
+//! The source is reached through directory descriptors (see [`super::anchor`]): the
+//! root is opened once and every directory below it with `O_NOFOLLOW`, so a
+//! component swapped for a symlink while the walk runs is an error and never a way
+//! to copy files from outside the source. A regular file that became a FIFO is
+//! refused without ever blocking on it. The walk looks at the process's interrupt
+//! flag before each entry and while it copies data, so Ctrl-C stops a long copy. The
+//! destination is a staging directory only we can reach, and stays path-based.
 
-use std::ffi::{CString, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Mutex, PoisonError};
 
-use super::unix;
+use super::{anchor, unix};
 use crate::domain::{Error, ErrorCode, Result};
 
 /// How the data of regular files reaches the destination.
@@ -43,12 +51,20 @@ impl std::fmt::Debug for Data {
     }
 }
 
-/// Clone (or copy) `src`, a file, symlink, FIFO or directory tree, to the new path
-/// `dst`. Fails, touching nothing, when `dst` exists. Errors: `cross-volume` when a
-/// reflink crosses filesystems, `clone-failed` otherwise, naming the entry that failed.
-/// Whatever was created before a failure is removed again.
+/// Clone (or copy) `root/rel`, a file, symlink, FIFO or directory tree, to the new
+/// path `dst`. Fails, touching nothing, when `dst` exists. Errors: `cross-volume`
+/// when a reflink crosses filesystems, `interrupted` on a signal, `clone-failed`
+/// otherwise, naming the entry that failed. Whatever was created before a failure is
+/// removed again.
 pub(crate) fn transfer(root: &Path, rel: &Path, dst: &Path, data: Data) -> Result<()> {
     run(root, rel, dst, data).map_err(|failure| {
+        if failure
+            .error
+            .get_ref()
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<Cancelled>)
+        {
+            return Error::new(ErrorCode::Interrupted, "interrupted; rolled back");
+        }
         let (verb, code) = match data {
             Data::Copy => ("copy", ErrorCode::CloneFailed),
             Data::Reflink(_) if failure.error.raw_os_error() == Some(libc::EXDEV) => {
@@ -82,6 +98,53 @@ fn at<T>(path: &Path, result: io::Result<T>) -> std::result::Result<T, Failure> 
     })
 }
 
+/// Like [`at`] for something done to the source: a component that is no longer what
+/// the listing said (`ELOOP`, `ENOTDIR`) reads as "changed", not as a bare errno.
+fn at_src<T>(path: &Path, result: io::Result<T>) -> std::result::Result<T, Failure> {
+    at(
+        path,
+        result.map_err(|e| {
+            if anchor::changed(&e) {
+                io::Error::other("changed while it was being copied")
+            } else {
+                e
+            }
+        }),
+    )
+}
+
+/// The walk was interrupted by a signal.
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+fn check_interrupt() -> io::Result<()> {
+    if crate::signals::raised() {
+        Err(io::Error::other(Cancelled))
+    } else {
+        Ok(())
+    }
+}
+
+/// Before the entry `rel` (relative to the source root) is opened: the failpoint of
+/// the walk, then the interrupt flag.
+fn enter(rel: &Path) -> Step {
+    let hit = || -> Result<()> {
+        crate::failpoint!("walk_entry", rel);
+        Ok(())
+    };
+    at(rel, hit().map_err(io::Error::other))?;
+    at(rel, check_interrupt())
+}
+
+/// What an entry is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Dir,
@@ -92,89 +155,177 @@ enum Kind {
     Other,
 }
 
-fn kind_of(ft: fs::FileType) -> Kind {
-    if ft.is_dir() {
-        Kind::Dir
-    } else if ft.is_file() {
-        Kind::File
-    } else if ft.is_symlink() {
-        Kind::Symlink
-    } else if ft.is_fifo() {
-        Kind::Fifo
-    } else {
-        Kind::Other
+fn kind_of_mode(mode: libc::mode_t) -> Kind {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => Kind::Dir,
+        libc::S_IFREG => Kind::File,
+        libc::S_IFLNK => Kind::Symlink,
+        libc::S_IFIFO => Kind::Fifo,
+        _ => Kind::Other,
     }
 }
 
-/// The failpoint of the walk, before the entry `rel` (relative to the source root) is
-/// opened.
-fn enter(rel: &Path) -> Step {
-    let hit = || -> Result<()> {
-        crate::failpoint!("walk_entry", rel);
-        Ok(())
-    };
-    at(rel, hit().map_err(io::Error::other))
+/// The kind a listing reports; `None` when the filesystem does not say.
+fn kind_of_dirent(d_type: u8) -> Option<Kind> {
+    match d_type {
+        libc::DT_DIR => Some(Kind::Dir),
+        libc::DT_REG => Some(Kind::File),
+        libc::DT_LNK => Some(Kind::Symlink),
+        libc::DT_FIFO => Some(Kind::Fifo),
+        libc::DT_UNKNOWN => None,
+        _ => Some(Kind::Other),
+    }
+}
+
+/// What `stat` says about an entry that matters here.
+#[derive(Clone, Copy)]
+struct Meta {
+    mode: libc::mode_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    atime: libc::timespec,
+    mtime: libc::timespec,
+    size: u64,
+    /// BSD file flags.
+    #[cfg(target_os = "macos")]
+    flags: u32,
+}
+
+impl Meta {
+    fn new(st: &libc::stat) -> Self {
+        Self {
+            mode: st.st_mode,
+            uid: st.st_uid,
+            gid: st.st_gid,
+            atime: libc::timespec {
+                tv_sec: st.st_atime,
+                tv_nsec: st.st_atime_nsec,
+            },
+            mtime: libc::timespec {
+                tv_sec: st.st_mtime,
+                tv_nsec: st.st_mtime_nsec,
+            },
+            size: u64::try_from(st.st_size).unwrap_or(0),
+            #[cfg(target_os = "macos")]
+            flags: st.st_flags,
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        kind_of_mode(self.mode)
+    }
+}
+
+/// The source side of a walk: the root, opened once, and its path for messages.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    root: &'a Path,
+    fd: RawFd,
+}
+
+impl Source<'_> {
+    /// The entry `rel` as a path, for messages only.
+    fn shown(&self, rel: &Path) -> PathBuf {
+        self.root.join(rel)
+    }
+
+    fn open_dir(&self, rel: &Path) -> std::result::Result<OwnedFd, Failure> {
+        at_src(&self.shown(rel), anchor::open_rel_dir(self.fd, rel))
+    }
 }
 
 fn run(root: &Path, rel: &Path, dst: &Path, data: Data) -> Step {
-    let src = root.join(rel);
+    let root_fd = at(root, anchor::open_root(root))?;
+    let source = Source {
+        root,
+        fd: root_fd.as_raw_fd(),
+    };
+    let shown = source.shown(rel);
     enter(rel)?;
-    let md = at(&src, fs::symlink_metadata(&src))?;
-    match kind_of(md.file_type()) {
-        Kind::Dir => copy_dir(root, rel, dst, md, data),
+    let (parent, name) = at_src(&shown, anchor::open_parent(source.fd, rel))?;
+    let st = at_src(&shown, anchor::stat_at(parent.as_raw_fd(), &name))?;
+    match kind_of_mode(st.st_mode) {
+        Kind::Dir => copy_dir(source, rel, dst, data),
         Kind::Other => Ok(()),
-        kind => copy_leaf(root, rel, dst, kind, data, &mut Vec::new()),
+        kind => copy_leaf(
+            parent.as_raw_fd(),
+            &name,
+            &shown,
+            dst,
+            kind,
+            data,
+            &mut Vec::new(),
+        ),
     }
 }
 
 // ------------------------------------------------------------------ leaves
 
+/// Copy the non-directory `name` of the open directory `parent` to `dst`; `shown`
+/// is its path for messages.
 fn copy_leaf(
-    root: &Path,
-    rel: &Path,
+    parent: RawFd,
+    name: &CStr,
+    shown: &Path,
     dst: &Path,
     kind: Kind,
     data: Data,
     buf: &mut Vec<u8>,
 ) -> Step {
-    let src = &root.join(rel);
     match kind {
-        Kind::File => copy_file(src, dst, data, buf),
+        Kind::File => copy_file(parent, name, shown, dst, data, buf),
         Kind::Symlink => {
-            let md = at(src, fs::symlink_metadata(src))?;
-            let target = at(src, fs::read_link(src))?;
+            let md = Meta::new(&at_src(shown, anchor::stat_at(parent, name))?);
+            let target = at_src(shown, anchor::read_link_at(parent, name))?;
             at(dst, std::os::unix::fs::symlink(target, dst))?;
-            undo_on_error(dst, restore(src, dst, &md, kind))
+            // Only macOS symlinks carry attributes (and can be opened for them).
+            #[cfg(target_os = "macos")]
+            let held = Some(at_src(shown, anchor::open_symlink_at(parent, name))?);
+            #[cfg(not(target_os = "macos"))]
+            let held: Option<OwnedFd> = None;
+            let done = restore(shown, held.as_ref().map(AsRawFd::as_raw_fd), dst, &md, kind);
+            undo_on_error(dst, done)
         }
         Kind::Fifo => {
-            let md = at(src, fs::symlink_metadata(src))?;
+            let held = at_src(shown, anchor::open_node_at(parent, name))?;
+            let md = Meta::new(&at(shown, anchor::fstat(held.as_raw_fd()))?);
+            if md.kind() != Kind::Fifo {
+                return at(
+                    shown,
+                    Err(io::Error::other("changed while it was being copied")),
+                );
+            }
             let c = at(dst, cstr(dst))?;
             // SAFETY: valid C string.
             if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
                 return at(dst, Err(io::Error::last_os_error()));
             }
-            undo_on_error(dst, restore(src, dst, &md, kind))
+            let done = restore(shown, Some(held.as_raw_fd()), dst, &md, kind);
+            undo_on_error(dst, done)
         }
         Kind::Dir | Kind::Other => Ok(()),
     }
 }
 
-fn copy_file(src: &Path, dst: &Path, data: Data, buf: &mut Vec<u8>) -> Step {
-    let input = at(
-        src,
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(src),
-    )?;
-    // The listing may be stale: only a regular file is copied.
-    let md = at(src, input.metadata())?;
-    if !md.is_file() {
+fn copy_file(
+    parent: RawFd,
+    name: &CStr,
+    shown: &Path,
+    dst: &Path,
+    data: Data,
+    buf: &mut Vec<u8>,
+) -> Step {
+    // Opened without blocking: the listing may be stale and a FIFO in its place
+    // would hold `open` forever. Only a regular file is copied.
+    let input = File::from(at_src(shown, anchor::open_node_at(parent, name))?);
+    let md = Meta::new(&at(shown, anchor::fstat(input.as_raw_fd()))?);
+    if md.kind() != Kind::File {
         return at(
-            src,
+            shown,
             Err(io::Error::other("changed while it was being copied")),
         );
     }
+    at(shown, anchor::make_blocking(input.as_raw_fd()))?;
     // Owner-writable until the end: attributes are set before the final mode.
     let output = at(
         dst,
@@ -186,13 +337,13 @@ fn copy_file(src: &Path, dst: &Path, data: Data, buf: &mut Vec<u8>) -> Step {
             .open(dst),
     )?;
     let filled = match data {
-        Data::Reflink(clone) => at(src, clone(&input, &output)),
-        Data::Copy => at(src, copy_data(&input, &output, md.len(), buf)),
+        Data::Reflink(clone) => at(shown, clone(&input, &output)),
+        Data::Copy => at(shown, copy_data(&input, &output, md.size, buf)),
     };
     drop(output);
     undo_on_error(
         dst,
-        filled.and_then(|()| restore(src, dst, &md, Kind::File)),
+        filled.and_then(|()| restore(shown, Some(input.as_raw_fd()), dst, &md, Kind::File)),
     )
 }
 
@@ -221,6 +372,7 @@ fn copy_data(input: &File, output: &File, len: u64, buf: &mut Vec<u8>) -> io::Re
     }
     let (mut reader, mut writer) = (input, output);
     loop {
+        check_interrupt()?;
         let n = match reader.read(buf) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -263,6 +415,7 @@ fn copy_extents(input: &File, output: &File, len: u64, buf: &mut [u8]) -> io::Re
         let hole = seek(input, data, libc::SEEK_HOLE)?.unwrap_or(len);
         let mut offset = data;
         while offset < hole {
+            check_interrupt()?;
             let want = usize::try_from(hole - offset).map_or(buf.len(), |n| n.min(buf.len()));
             let n = input.read_at(&mut buf[..want], offset)?;
             if n == 0 {
@@ -287,35 +440,29 @@ fn cstr(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
-/// Give `dst` everything about `src` that is not its data: extended attributes,
-/// owner (when permitted), mode and times (nanoseconds). Last step of every entry:
-/// nothing may touch `dst` afterwards.
-fn restore(src: &Path, dst: &Path, md: &fs::Metadata, kind: Kind) -> Step {
-    copy_xattrs(src, dst)?;
+/// Give `dst` everything about the source entry that is not its data: extended
+/// attributes (read through `src`, the entry opened by the walk), owner (when
+/// permitted), mode and times (nanoseconds). Last step of every entry: nothing may
+/// touch `dst` afterwards.
+fn restore(shown: &Path, src: Option<RawFd>, dst: &Path, md: &Meta, kind: Kind) -> Step {
+    if let Some(src) = src {
+        copy_xattrs(shown, src, dst, kind)?;
+    }
     let c = at(dst, cstr(dst))?;
     if owner_differs(md) {
         // SAFETY: valid C string; lchown never follows symlinks. Not permitted for
         // other owners unless root: the copy then belongs to whoever made it.
-        unsafe { libc::lchown(c.as_ptr(), md.uid(), md.gid()) };
+        unsafe { libc::lchown(c.as_ptr(), md.uid, md.gid) };
     }
     if kind != Kind::Symlink {
-        // After the owner: changing it clears setuid and setgid.
+        // After the owner: changing it clears setuid and setgid. After the access
+        // ACL, which rewrites the group bits: the source's mode is the final word.
         // SAFETY: valid C string.
-        let mode = libc::mode_t::try_from(md.mode() & 0o7777).unwrap_or(0o600);
-        if unsafe { libc::chmod(c.as_ptr(), mode) } != 0 {
+        if unsafe { libc::chmod(c.as_ptr(), md.mode & 0o7777) } != 0 {
             return at(dst, Err(io::Error::last_os_error()));
         }
     }
-    let times = [
-        libc::timespec {
-            tv_sec: md.atime(),
-            tv_nsec: md.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: md.mtime(),
-            tv_nsec: md.mtime_nsec(),
-        },
-    ];
+    let times = [md.atime, md.mtime];
     // SAFETY: valid C string and two timespecs.
     let set = unsafe {
         libc::utimensat(
@@ -333,47 +480,51 @@ fn restore(src: &Path, dst: &Path, md: &fs::Metadata, kind: Kind) -> Step {
     Ok(())
 }
 
-fn owner_differs(md: &fs::Metadata) -> bool {
+fn owner_differs(md: &Meta) -> bool {
     // SAFETY: no arguments, cannot fail.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    md.uid() != uid || md.gid() != gid
+    md.uid != uid || md.gid != gid
 }
 
 /// BSD file flags a user may set: `nodump`, `uchg`, `uappnd`, `opaque`, `hidden`.
 /// (Not `compressed` and the like, which the filesystem decides.)
 #[cfg(target_os = "macos")]
-fn restore_flags(c: &CString, md: &fs::Metadata) {
-    use std::os::macos::fs::MetadataExt as _;
+fn restore_flags(c: &CString, md: &Meta) {
     const SETTABLE: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x8000;
-    let flags = md.st_flags() & SETTABLE;
+    let flags = md.flags & SETTABLE;
     if flags != 0 {
         // SAFETY: valid C string; lchflags never follows symlinks.
         unsafe { libc::lchflags(c.as_ptr(), flags) };
     }
 }
 
-fn copy_xattrs(src: &Path, dst: &Path) -> Step {
-    let from = at(src, cstr(src))?;
-    let names = match xattr::list(&from) {
+fn copy_xattrs(shown: &Path, src: RawFd, dst: &Path, kind: Kind) -> Step {
+    let names = match xattr::list(src) {
         Ok(names) => names,
-        Err(e) if xattr::unsupported(&e) => return Ok(()),
-        Err(e) => return at(src, Err(e)),
+        Err(e) if xattr::unsupported(&e) => Vec::new(),
+        Err(e) => return at(shown, Err(e)),
     };
     let to = at(dst, cstr(dst))?;
+    let mut present = Vec::new();
     for name in names.split(|&b| b == 0).filter(|n| xattr::wanted(n)) {
         let name = CString::new(name).expect("split at NUL");
-        let value = match xattr::get(&from, &name) {
+        let value = match xattr::get(src, &name) {
             Ok(value) => value,
             // Removed meanwhile.
             Err(e) if e.raw_os_error() == Some(libc::ENODATA) => continue,
-            Err(e) => return at(src, Err(e)),
+            Err(e) => return at(shown, Err(e)),
         };
         if let Err(e) = xattr::set(&to, &name, &value) {
             if !xattr::tolerated(&e) {
                 return at(dst, Err(e));
             }
         }
+        present.push(name);
     }
+    // What the source does not have, the copy must not either: an entry created in
+    // a directory with a default ACL inherited one, and with it access the source
+    // never gave.
+    xattr::drop_inherited(&to, &present, kind == Kind::Dir);
     Ok(())
 }
 
@@ -381,6 +532,12 @@ fn copy_xattrs(src: &Path, dst: &Path) -> Step {
 mod xattr {
     use std::ffi::CStr;
     use std::io;
+    use std::os::fd::RawFd;
+
+    /// POSIX ACLs on Linux are the attributes `system.posix_acl_access` (and, on a
+    /// directory, `system.posix_acl_default`, which new entries inherit).
+    #[cfg(target_os = "linux")]
+    const ACL_NAMES: [&[u8]; 2] = [b"system.posix_acl_access", b"system.posix_acl_default"];
 
     /// Run `call(buffer, size)` (a `*xattr` syscall) with a buffer of the size it asks
     /// for, again if the value grew meanwhile.
@@ -404,37 +561,28 @@ mod xattr {
         }
     }
 
-    /// Names of the attributes, each followed by a NUL.
-    pub(super) fn list(path: &CStr) -> io::Result<Vec<u8>> {
+    /// Names of the attributes of the open entry `fd`, each followed by a NUL.
+    pub(super) fn list(fd: RawFd) -> io::Result<Vec<u8>> {
         read_sized(|buf, size| {
-            // SAFETY: valid C string; `buf` is null or writable for `size` bytes.
+            // SAFETY: valid descriptor; `buf` is null or writable for `size` bytes.
             #[cfg(target_os = "linux")]
-            let got = unsafe { libc::llistxattr(path.as_ptr(), buf.cast(), size) };
+            let got = unsafe { libc::flistxattr(fd, buf.cast(), size) };
             // SAFETY: as above.
             #[cfg(target_os = "macos")]
-            let got =
-                unsafe { libc::listxattr(path.as_ptr(), buf.cast(), size, libc::XATTR_NOFOLLOW) };
+            let got = unsafe { libc::flistxattr(fd, buf.cast(), size, 0) };
             got
         })
     }
 
-    pub(super) fn get(path: &CStr, name: &CStr) -> io::Result<Vec<u8>> {
+    pub(super) fn get(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
         read_sized(|buf, size| {
-            // SAFETY: valid C strings; `buf` is null or writable for `size` bytes.
+            // SAFETY: valid descriptor and C string; `buf` is null or writable for
+            // `size` bytes.
             #[cfg(target_os = "linux")]
-            let got = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf, size) };
+            let got = unsafe { libc::fgetxattr(fd, name.as_ptr(), buf, size) };
             // SAFETY: as above.
             #[cfg(target_os = "macos")]
-            let got = unsafe {
-                libc::getxattr(
-                    path.as_ptr(),
-                    name.as_ptr(),
-                    buf,
-                    size,
-                    0,
-                    libc::XATTR_NOFOLLOW,
-                )
-            };
+            let got = unsafe { libc::fgetxattr(fd, name.as_ptr(), buf, size, 0, 0) };
             got
         })
     }
@@ -470,15 +618,45 @@ mod xattr {
         }
     }
 
+    /// Remove the ACLs `path` has that the source did not (`present` are the
+    /// attributes copied from it); errors mean there was nothing to remove.
+    #[cfg(target_os = "linux")]
+    pub(super) fn drop_inherited(path: &CStr, present: &[std::ffi::CString], dir: bool) {
+        for name in ACL_NAMES {
+            let default = name.ends_with(b"default");
+            if (default && !dir) || present.iter().any(|p| p.as_bytes() == name) {
+                continue;
+            }
+            let name = std::ffi::CString::new(name).expect("no NUL");
+            // SAFETY: valid C strings.
+            unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::missing_const_for_fn)]
+    pub(super) fn drop_inherited(_path: &CStr, _present: &[std::ffi::CString], _dir: bool) {}
+
     /// The filesystem has no extended attributes.
     pub(super) fn unsupported(e: &io::Error) -> bool {
         e.raw_os_error() == Some(libc::ENOTSUP)
     }
 
-    /// Linux: only `user.*` belongs to the user (`security.*`, `system.*` and
-    /// `trusted.*` are the kernel's and the administrator's). macOS: everything.
+    /// Linux: `user.*` belongs to the user and the POSIX ACLs are access control
+    /// (`security.*` and `trusted.*` are the kernel's and the administrator's).
+    /// macOS: everything.
     pub(super) fn wanted(name: &[u8]) -> bool {
-        !name.is_empty() && (cfg!(target_os = "macos") || name.starts_with(b"user."))
+        if name.is_empty() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            name.starts_with(b"user.") || ACL_NAMES.contains(&name)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
     }
 
     /// Attributes the destination cannot hold are dropped (a filesystem without
@@ -492,9 +670,11 @@ mod xattr {
 
 /// A directory created in the destination, to be finished once it is full.
 struct Dir {
+    /// Relative to the source root.
     rel: PathBuf,
     dst: PathBuf,
-    md: fs::Metadata,
+    /// Of the source directory as opened by the walk.
+    md: Option<Meta>,
 }
 
 /// Entries of one directory (a slice of it) to copy by one worker.
@@ -511,24 +691,29 @@ fn mkdir(dst: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(dst)
 }
 
-fn copy_dir(root: &Path, rel: &Path, dst: &Path, md: fs::Metadata, data: Data) -> Step {
+/// Remove a partial result, immutable leftovers included.
+fn discard(dst: &Path) {
+    let _ = unix::remove_dir_all(dst, unix::make_removable);
+}
+
+fn copy_dir(source: Source<'_>, rel: &Path, dst: &Path, data: Data) -> Step {
     // Fails when `dst` exists: nothing has been created yet, nothing to undo.
     at(dst, mkdir(dst))?;
     let mut dirs = vec![Dir {
         rel: rel.to_path_buf(),
         dst: dst.to_path_buf(),
-        md,
+        md: None,
     }];
-    let done = fill(root, &mut dirs, data).and_then(|()| finish(root, &dirs));
+    let done = fill(source, &mut dirs, data).and_then(|()| finish(source, &dirs));
     if done.is_err() {
-        let _ = unix::remove_dir_all(dst, |path| unix::make_dirs_writable(path, &|_| {}));
+        discard(dst);
     }
     done
 }
 
 /// Create every directory below the first of `dirs` (appended to it, parents before
 /// children) and copy the other entries, in parallel.
-fn fill(root: &Path, dirs: &mut Vec<Dir>, data: Data) -> Step {
+fn fill(source: Source<'_>, dirs: &mut Vec<Dir>, data: Data) -> Step {
     let failed = AtomicBool::new(false);
     let first = Mutex::new(None);
     let record = |failure: Failure| {
@@ -551,13 +736,13 @@ fn fill(root: &Path, dirs: &mut Vec<Dir>, data: Data) -> Step {
                     if failed.load(Ordering::SeqCst) {
                         continue;
                     }
-                    if let Err(failure) = run_job(root, &job, data, &mut buf) {
+                    if let Err(failure) = run_job(source, &job, data, &mut buf) {
                         record(failure);
                     }
                 }
             });
         }
-        if let Err(failure) = list_and_make_dirs(root, dirs, &tx, &failed) {
+        if let Err(failure) = list_and_make_dirs(source, dirs, &tx, &failed) {
             record(failure);
         }
         drop(tx);
@@ -568,11 +753,22 @@ fn fill(root: &Path, dirs: &mut Vec<Dir>, data: Data) -> Step {
         .map_or(Ok(()), Err)
 }
 
-fn run_job(root: &Path, job: &Job, data: Data, buf: &mut Vec<u8>) -> Step {
+fn run_job(source: Source<'_>, job: &Job, data: Data, buf: &mut Vec<u8>) -> Step {
+    let dir = source.open_dir(&job.rel)?;
     for (name, kind) in &job.entries {
         let rel = job.rel.join(name);
         enter(&rel)?;
-        copy_leaf(root, &rel, &job.dst.join(name), *kind, data, buf)?;
+        let shown = source.shown(&rel);
+        let c = at(&shown, anchor::cstring(name))?;
+        copy_leaf(
+            dir.as_raw_fd(),
+            &c,
+            &shown,
+            &job.dst.join(name),
+            *kind,
+            data,
+            buf,
+        )?;
     }
     Ok(())
 }
@@ -580,7 +776,7 @@ fn run_job(root: &Path, job: &Job, data: Data, buf: &mut Vec<u8>) -> Step {
 /// Breadth-first over the directories (`dirs` doubles as the queue): create each
 /// subdirectory in the destination and hand the other entries to the workers.
 fn list_and_make_dirs(
-    root: &Path,
+    source: Source<'_>,
     dirs: &mut Vec<Dir>,
     tx: &std::sync::mpsc::SyncSender<Job>,
     failed: &AtomicBool,
@@ -588,8 +784,11 @@ fn list_and_make_dirs(
     let mut next = 0;
     while next < dirs.len() && !failed.load(Ordering::SeqCst) {
         let (rel, dst) = (dirs[next].rel.clone(), dirs[next].dst.clone());
-        let src = root.join(&rel);
+        let index = next;
         next += 1;
+        let shown = source.shown(&rel);
+        let dir = source.open_dir(&rel)?;
+        dirs[index].md = Some(Meta::new(&at(&shown, anchor::fstat(dir.as_raw_fd()))?));
         let mut entries = Vec::new();
         let send = |entries: &mut Vec<(OsString, Kind)>| {
             let job = Job {
@@ -600,26 +799,29 @@ fn list_and_make_dirs(
             // Only fails when every worker is gone, which only a failure causes.
             let _ = tx.send(job);
         };
-        for entry in at(&src, fs::read_dir(&src))? {
-            let entry = at(&src, entry)?;
-            let name = entry.file_name();
-            let kind = kind_of(at(&entry.path(), entry.file_type())?);
+        for entry in at_src(&shown, anchor::list(dir.as_raw_fd()))? {
+            let child_rel = rel.join(&entry.name);
+            let kind = if let Some(kind) = kind_of_dirent(entry.d_type) {
+                kind
+            } else {
+                let c = at(&shown, anchor::cstring(&entry.name))?;
+                let st = at_src(&child_rel, anchor::stat_at(dir.as_raw_fd(), &c))?;
+                kind_of_mode(st.st_mode)
+            };
             match kind {
                 Kind::Dir => {
-                    let (child_rel, child_dst) = (rel.join(&name), dst.join(&name));
                     enter(&child_rel)?;
-                    let child_src = root.join(&child_rel);
-                    let md = at(&child_src, fs::symlink_metadata(&child_src))?;
+                    let child_dst = dst.join(&entry.name);
                     at(&child_dst, mkdir(&child_dst))?;
                     dirs.push(Dir {
                         rel: child_rel,
                         dst: child_dst,
-                        md,
+                        md: None,
                     });
                 }
                 Kind::Other => {}
                 _ => {
-                    entries.push((name, kind));
+                    entries.push((entry.name, kind));
                     if entries.len() >= JOB_ENTRIES {
                         send(&mut entries);
                     }
@@ -634,9 +836,50 @@ fn list_and_make_dirs(
 }
 
 /// Attributes, owner, mode and times of every directory, deepest first.
-fn finish(root: &Path, dirs: &[Dir]) -> Step {
+fn finish(source: Source<'_>, dirs: &[Dir]) -> Step {
     for dir in dirs.iter().rev() {
-        restore(&root.join(&dir.rel), &dir.dst, &dir.md, Kind::Dir)?;
+        let Some(md) = dir.md else { continue };
+        let held = source.open_dir(&dir.rel)?;
+        restore(
+            &source.shown(&dir.rel),
+            Some(held.as_raw_fd()),
+            &dir.dst,
+            &md,
+            Kind::Dir,
+        )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // U-FS-23: a partial copy is removed even when it holds read-only directories
+    // and (macOS) immutable files.
+    #[test]
+    fn discard_removes_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let partial = d.path().join("partial");
+        fs::create_dir_all(partial.join("sub/deeper")).unwrap();
+        fs::write(partial.join("sub/deeper/f"), b"x").unwrap();
+        fs::set_permissions(
+            partial.join("sub/deeper"),
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        fs::set_permissions(partial.join("sub"), fs::Permissions::from_mode(0o500)).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let st = std::process::Command::new("chflags")
+                .arg("uchg")
+                .arg(partial.join("sub/deeper/f"))
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        discard(&partial);
+        assert!(!partial.exists());
+    }
 }

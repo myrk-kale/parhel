@@ -197,7 +197,7 @@ impl CowFs for LinuxFs {
     }
 
     fn remove_dir_all(&self, path: &Path) -> Result<()> {
-        unix::remove_dir_all(path, |path| unix::make_dirs_writable(path, &|_| {}))
+        unix::remove_dir_all(path, unix::make_removable)
     }
 
     /// Durable write: the journal must reach the disk before the step it

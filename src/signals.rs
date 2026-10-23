@@ -35,3 +35,9 @@ pub fn received() -> Option<i32> {
         s => Some(s),
     }
 }
+
+/// Whether a signal arrived since [`install`]: what long operations poll.
+#[must_use]
+pub fn raised() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
