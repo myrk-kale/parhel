@@ -234,6 +234,10 @@ pub struct World {
     /// A symlink another run creates at the moment `symlink_exclusive` is called
     /// (link, target): the race that `symlink_exclusive` exists to lose cleanly.
     pub rival_link: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// A symlink another process (a `doctor --fix`) removes (`None`) or points elsewhere
+    /// (`Some(target)`) at the moment `rename_exclusive` is called: (link, what becomes
+    /// of it).
+    pub link_tampered_at_rename: RefCell<Option<(PathBuf, Option<PathBuf>)>>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -324,6 +328,7 @@ impl Default for World {
             flushes: Cell::new(0),
             fail_flush: Cell::new(false),
             rival_link: RefCell::default(),
+            link_tampered_at_rename: RefCell::default(),
         }
     }
 }
@@ -823,6 +828,12 @@ impl CowFs for World {
                 ErrorCode::DestExists,
                 "fake: destination exists",
             ));
+        }
+        if let Some((link, now)) = self.link_tampered_at_rename.borrow_mut().take() {
+            match now {
+                Some(target) => self.links.borrow_mut().insert(link, target),
+                None => self.links.borrow_mut().remove(&link),
+            };
         }
         Ok(())
     }
