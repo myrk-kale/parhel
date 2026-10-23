@@ -308,13 +308,34 @@ pub(crate) fn copy_mode(from: &Path, to: &Path) -> Result<()> {
     fs::set_permissions(to, perms).map_err(|e| io_error(to, &e))
 }
 
+/// Run `change`, which adds or removes the entry `path`, with its directory writable
+/// by the owner even when the copy made it read-only; the directory gets its mode
+/// back afterwards, whatever came out.
+fn in_writable_dir(path: &Path, change: impl FnOnce() -> io::Result<()>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let locked = dir.and_then(|dir| {
+        let perms = fs::metadata(dir).ok()?.permissions();
+        let unlock = fs::Permissions::from_mode(perms.mode() | 0o700);
+        (perms.mode() & 0o200 == 0 && fs::set_permissions(dir, unlock).is_ok())
+            .then_some((dir, perms))
+    });
+    let done = change();
+    if let Some((dir, perms)) = locked {
+        let _ = fs::set_permissions(dir, perms);
+    }
+    done.map_err(|e| io_error(path, &e))
+}
+
 pub(crate) fn remove_file(path: &Path) -> Result<()> {
-    fs::remove_file(path).map_err(|e| io_error(path, &e))
+    in_writable_dir(path, || fs::remove_file(path))
 }
 
 pub(crate) fn replace_symlink(path: &Path, target: &Path) -> Result<()> {
-    fs::remove_file(path).map_err(|e| io_error(path, &e))?;
-    std::os::unix::fs::symlink(target, path).map_err(|e| io_error(path, &e))
+    in_writable_dir(path, || {
+        fs::remove_file(path)?;
+        std::os::unix::fs::symlink(target, path)
+    })
 }
 
 pub(crate) fn lock_exclusive(path: &Path) -> Result<FileLock> {
