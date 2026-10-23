@@ -1208,6 +1208,24 @@ fn publish(
             e.message
         ));
     }
+    // The symlink is the user's way in. It was created before the rename and has been
+    // exposed to anything that runs meanwhile (a `doctor --fix` that took it for a
+    // dangling link): do not report a worktree nobody can reach by the path they asked for.
+    if let Some(route) = route {
+        if !matches!(env.fs.read_link(&plan.destination), Ok(Some(t)) if t == route.real) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!(
+                    "the worktree was created at `{real}`, but the symlink `{dest}` that should \
+                     lead to it is gone or points elsewhere (something removed it while the \
+                     worktree was being published). The worktree is intact: link it again with \
+                     `ln -s {real} {dest}`",
+                    real = route.real.display(),
+                    dest = plan.destination.display()
+                ),
+            ));
+        }
+    }
     if !report.binaries.is_empty() {
         let shown: Vec<String> = report
             .binaries
@@ -4037,6 +4055,40 @@ mod tests {
             w.count(|c| matches!(c, Call::RemoveForce { .. } | Call::BranchDelete(_))),
             0
         );
+    }
+
+    // U-STO-98: the symlink is the user's way in. If it is gone or points elsewhere once the
+    // worktree is published (a `doctor --fix` that ran at the same moment took it for
+    // a dangling link), `add` does not report success: it says where the worktree is and
+    // how to link it. The worktree is valid and is not rolled back.
+    #[rstest]
+    #[case::removed(None)]
+    #[case::retargeted(Some(p("/store/worktrees/elsewhere/x")))]
+    fn a_symlink_lost_at_publication_is_a_loud_failure(#[case] now: Option<PathBuf>) {
+        let w = store_world();
+        *w.link_tampered_at_rename.borrow_mut() = Some((p(DEST), now));
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
+        let real = real("feat");
+        assert!(err.message.contains(DEST), "{}", err.message);
+        assert!(
+            err.message.contains(&real.display().to_string()),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains(&format!("ln -s {} {DEST}", real.display())),
+            "{}",
+            err.message
+        );
+        // Published, repaired, locked, cleaned up: nothing is undone.
+        assert_eq!(w.count(|c| *c == Call::Repair { path: real.clone() }), 1);
+        assert_eq!(
+            w.count(|c| matches!(c, Call::RemoveForce { .. } | Call::BranchDelete(_))),
+            0
+        );
+        assert_eq!(w.count(|c| *c == Call::RemoveDirAll(p(STORE_STAGING))), 1);
     }
 
     // U-STO-22c: the message of a store that cannot be used names `git parhel doctor`

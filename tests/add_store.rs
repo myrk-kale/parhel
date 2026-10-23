@@ -1608,3 +1608,45 @@ fn is40_two_runs_with_one_name_get_distinct_places_in_the_store() {
     w.open(&b_dest).assert_clean();
     w.store.assert_no_staging();
 }
+
+// I-S41: `doctor --fix` runs while an `add` is between creating its symlink and renaming the
+// worktree into place (frozen at `after_link`). The symlink dangles for that moment, and
+// doctor must not take it for a leftover: the run is alive (its journal is locked), the
+// link is its own. The run then publishes and the path the user asked for works.
+#[test]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn is41_doctor_fix_leaves_the_symlink_of_a_run_in_progress() {
+    let Some(w) = world() else { return };
+    let dest = w.sb.path("wt");
+    let barrier = Barrier::new(&w.sb.root, "link");
+    let mut a = spawn_parhel_store(
+        &w.sb.env,
+        &w.src.root,
+        &add_args(&dest, &["--new-branch", "fa"]),
+        &w.store,
+        Some(&barrier.spec("after_link")),
+    );
+    barrier.wait_reached(&mut a);
+    assert!(is_symlink(&dest), "the run has claimed its path");
+    assert!(!dest.exists(), "and its worktree is not in place yet");
+
+    let out = parhel_store(&w.sb.env, &w.src.root, &["doctor", "--fix"], &w.store);
+    assert_success(&out);
+    let said = stdout(&out);
+    assert!(said.contains("in-progress"), "{said}");
+    assert!(!said.contains("store-dangling-link"), "{said}");
+    assert!(
+        is_symlink(&dest),
+        "doctor --fix removed the symlink of a live run"
+    );
+
+    barrier.release();
+    let out = finish(a);
+    assert_success(&out);
+    assert!(is_symlink(&dest));
+    let wt = w.open(&dest);
+    wt.assert_clean();
+    assert_eq!(fs::read_link(&dest).unwrap(), w.store.only_worktree());
+    let out = parhel_store(&w.sb.env, &w.src.root, &["doctor"], &w.store);
+    assert_success(&out);
+}

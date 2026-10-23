@@ -671,7 +671,19 @@ fn dangling_links(env: &Env<'_>, store: &Store, fix: bool, report: &mut DoctorRe
                 .all(|c| matches!(c, std::path::Component::Normal(_)))
         });
         let still_ours = matches!(fs.read_link(&link), Ok(Some(t)) if t == target);
-        if !inside || !still_ours || fs.exists_no_follow(&target).unwrap_or(true) {
+        if !inside || !still_ours {
+            continue;
+        }
+        // A run of `add` that is still going creates its symlink before it renames the
+        // worktree into place, and until then the symlink dangles like any other. The run
+        // owns it. This is asked after the symlink was seen and before the worktree is
+        // looked for: the run holds its journal from before the symlink exists until after
+        // the rename, so one that is not found here has finished (the worktree is there)
+        // or died (its leftovers are `--fix`'s to undo).
+        if claimed_by_a_live_run(fs, store, &target) {
+            continue;
+        }
+        if fs.exists_no_follow(&target).unwrap_or(true) {
             continue;
         }
         let finding = Finding::StoreDanglingLink {
@@ -683,6 +695,30 @@ fn dangling_links(env: &Env<'_>, store: &Store, fix: bool, report: &mut DoctorRe
             report.fixed.push(finding);
         }
     }
+}
+
+/// Whether a run of `add` that holds its journal's lock is about to publish a worktree at
+/// `target`.
+fn claimed_by_a_live_run(fs: &dyn CowFs, store: &Store, target: &Path) -> bool {
+    let dir = store.root.join(WORKTREES_DIR);
+    fs.list_dir(&dir).unwrap_or_default().iter().any(|name| {
+        if !is_staging_name(name) {
+            return false;
+        }
+        let journal = dir.join(name).join(JOURNAL_FILE);
+        // A staging dir that cannot be asked is not known to be dead: leave its link.
+        if fs.is_locked(&journal).unwrap_or(true) {
+            return fs
+                .read_file(&journal)
+                .ok()
+                .and_then(|bytes| Journal::decode(&bytes).ok())
+                .is_none_or(|journal| {
+                    journal.publish_to.as_deref() == Some(target)
+                        || journal.store_link.is_some_and(|l| l.target == target)
+                });
+        }
+        false
+    })
 }
 
 /// Baselines whose source is no longer a git worktree. A baseline is a cache: `--fix`
@@ -1992,6 +2028,81 @@ mod tests {
                 worktrees: vec![real()],
                 unlocked: vec![real()],
             }]
+        );
+    }
+
+    /// `store_world` plus a run of `add` that is going on right now: it has claimed
+    /// `/w/new` (the symlink exists, the registry knows it) for a worktree it has not
+    /// published yet, and holds the lock on its journal.
+    fn run_between_link_and_rename(alive: bool) -> World {
+        let w = store_world();
+        let target = p(&format!("/store/worktrees/{ID}/new"));
+        let staging = p("/store/worktrees/.parhel-staging-live");
+        w.put_dir(&staging);
+        w.put_dir(&staging.join("new"));
+        let journal = Journal {
+            repo: p("/w/repo"),
+            worktree: Some(staging.join("new")),
+            publish_to: Some(target.clone()),
+            store_link: Some(crate::app::rollback::StoreLink {
+                path: p("/w/new"),
+                target: target.clone(),
+            }),
+            ..Journal::default()
+        };
+        w.files
+            .borrow_mut()
+            .insert(staging.join(JOURNAL_FILE), journal.encode());
+        w.put_link(Path::new("/w/new"), &target);
+        let registry = format!(
+            "/w/feat\t{}\n/w/new\t{}\n",
+            real().display(),
+            target.display()
+        );
+        w.files
+            .borrow_mut()
+            .insert(p("/store/links"), registry.into_bytes());
+        if alive {
+            w.locked.borrow_mut().insert(staging.join(JOURNAL_FILE));
+        }
+        w
+    }
+
+    // U-STO-97: between the moment `add` creates its symlink and the moment it renames the
+    // worktree into place the target does not exist, and the symlink looks exactly like
+    // a dangling one. A run that is still going (its journal is locked) owns it:
+    // `doctor --fix` leaves the symlink alone, and says the run is in progress.
+    #[test]
+    fn a_link_claimed_by_a_live_run_is_not_dangling() {
+        let w = run_between_link_and_rename(true);
+        let report = run_store(&w, true);
+        assert_eq!(
+            store_findings(&report),
+            Vec::<&Finding>::new(),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f, Finding::InProgress { .. })),
+            "{report:#?}"
+        );
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(w.calls(), vec![], "nothing touched");
+    }
+
+    // U-STO-97b: ... and the same state with nobody holding the journal is a crashed run:
+    // its symlink goes with the rest (U-STO-81), as before.
+    #[test]
+    fn the_same_link_of_a_dead_run_is_cleaned_up() {
+        let w = run_between_link_and_rename(false);
+        run_store(&w, true);
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p("/w/new"))),
+            1,
+            "{:#?}",
+            w.calls()
         );
     }
 
