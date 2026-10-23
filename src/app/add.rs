@@ -1226,6 +1226,24 @@ fn publish(
             ));
         }
     }
+    warnings.extend(report_warnings(report));
+    Ok(AddOutcome {
+        destination: plan.destination.clone(),
+        head: env.git.head(at)?,
+        strategy: match (route, request.copy) {
+            (Some(_), _) => Strategy::Store,
+            (None, true) => Strategy::Copy,
+            (None, false) => Strategy::CopyOnWrite,
+        },
+        warnings,
+        relocated: report.rewritten + report.relinked,
+        real_path: route.map(|r| r.real.clone()),
+    })
+}
+
+/// What a published worktree's relocation report says to the user.
+fn report_warnings(report: &RelocationReport) -> Vec<String> {
+    let mut warnings = Vec::new();
     if !report.binaries.is_empty() {
         let shown: Vec<String> = report
             .binaries
@@ -1267,18 +1285,7 @@ fn publish(
             report.unexamined
         ));
     }
-    Ok(AddOutcome {
-        destination: plan.destination.clone(),
-        head: env.git.head(at)?,
-        strategy: match (route, request.copy) {
-            (Some(_), _) => Strategy::Store,
-            (None, true) => Strategy::Copy,
-            (None, false) => Strategy::CopyOnWrite,
-        },
-        warnings,
-        relocated: report.rewritten + report.relinked,
-        real_path: route.map(|r| r.real.clone()),
-    })
+    warnings
 }
 
 /// [`DirLister`] over the real source tree through the [`CowFs`] port.
