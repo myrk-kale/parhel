@@ -1,14 +1,19 @@
 //! `git parhel doctor`: diagnose the environment and repair leftovers of crashed runs.
 
 use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::app::add::Env;
 use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
+use crate::app::store::discover;
 use crate::domain::paths::{self, is_staging_name};
-use crate::domain::{DoctorRequest, Result};
+use crate::domain::store::{
+    BASELINES_DIR, LINKS_FILE, Store, StoreState, WORKTREES_DIR, is_repo_id, repo_id,
+};
+use crate::domain::{DoctorRequest, ErrorCode, Result};
 use crate::git::parse::WorktreeEntry;
-use crate::ports::RepoInfo;
+use crate::ports::{CowFs, RepoInfo};
 
 /// Something worth reporting. `code()` is printed and is a stable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,23 +111,19 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         .git
         .discover(&paths::resolve_destination(env.cwd, &request.from))?;
     let mut report = DoctorReport::default();
+    // Looking at the store is reading only; a store that is not there is not a finding.
+    let mut store_state = match env.store {
+        Some(path) => discover(env.fs, path)?,
+        None => StoreState::NotConfigured,
+    };
+    if let StoreState::Available(store) = &mut store_state {
+        // Registrations name canonical paths; compare like with like.
+        store.root = env.fs.canonicalize(&store.root)?;
+    }
 
-    let mut volume = env.fs.volume(&repo.toplevel)?;
-    if !volume.cow {
-        // A read-only top directory cannot be probed for reflink support; the git
-        // directory on the same filesystem can.
-        if let Ok(git) = env.fs.volume(&repo.git_dir) {
-            if git.cow && git.filesystem == volume.filesystem {
-                volume = git;
-            }
-        }
-    }
-    if !volume.cow {
-        report.findings.push(Finding::NotCow {
-            path: repo.toplevel.clone(),
-            fs_type: volume.fs_type,
-        });
-    }
+    report
+        .findings
+        .extend(not_cow_finding(env, &repo, &store_state)?);
 
     let worktrees = env.git.worktrees(&repo.toplevel)?;
     let mut scan_dirs: BTreeSet<PathBuf> = worktrees
@@ -130,6 +131,13 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         .filter_map(|w| w.path.parent().map(Path::to_path_buf))
         .collect();
     scan_dirs.extend(repo.toplevel.parent().map(Path::to_path_buf));
+    // The staging dirs of store runs sit in the store, with no registration to lead here
+    // when the run died before registering anything.
+    let store = match &store_state {
+        StoreState::Available(store) => Some(store),
+        _ => None,
+    };
+    scan_dirs.extend(store.map(|s| s.root.join(WORKTREES_DIR)));
     // A crashed run's registration points inside its staging dir, which sits next
     // to the destination, possibly far from the source: look there too.
     scan_dirs.extend(
@@ -175,6 +183,8 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
     );
     find_foreign_gitfiles(env, &repo, &repo.toplevel, &mut report);
 
+    // Where crashed store runs were going (before the fix removes their staging dirs).
+    let claimed = store.map_or_else(Vec::new, |s| claimed_destinations(env.fs, s));
     if request.fix {
         fix(
             env,
@@ -182,10 +192,63 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
             &worktrees,
             &orphans,
             &registrations,
+            store.map(|s| s.root.as_path()),
             &mut report,
         );
     }
+    // After the fix: a crashed run's symlink is gone by now and is not reported twice.
+    match &store_state {
+        StoreState::Unavailable { root, reason } => {
+            report.findings.push(Finding::StoreUnavailable {
+                path: root.clone(),
+                reason: reason.clone(),
+            });
+        }
+        StoreState::Available(store) => {
+            check_store(
+                env,
+                &repo,
+                store,
+                &worktrees,
+                &claimed,
+                request.fix,
+                &mut report,
+            );
+        }
+        StoreState::NotConfigured => {}
+    }
     Ok(report)
+}
+
+/// `not-cow` for the source's volume, unless the store can serve it.
+fn not_cow_finding(
+    env: &Env<'_>,
+    repo: &RepoInfo,
+    store_state: &StoreState,
+) -> Result<Option<Finding>> {
+    let mut volume = env.fs.volume(&repo.toplevel)?;
+    if !volume.cow {
+        // A read-only top directory cannot be probed for reflink support; the git
+        // directory on the same filesystem can.
+        if let Ok(git) = env.fs.volume(&repo.git_dir) {
+            if git.cow && git.filesystem == volume.filesystem {
+                volume = git;
+            }
+        }
+    }
+    // `add` serves a source without copy-on-write through the store, so while the store
+    // can do that the source's filesystem is no problem.
+    let served = match store_state {
+        StoreState::Available(store) => env
+            .fs
+            .volume(&store.root)
+            .is_ok_and(|held| held.filesystem != volume.filesystem),
+        _ => false,
+    };
+    Ok((!volume.cow && !served).then(|| Finding::NotCow {
+        path: repo.toplevel.clone(),
+        fs_type: volume.fs_type,
+    }))
 }
 
 /// Undo crashed runs: with a journal, exactly what the run created; without one,
@@ -197,6 +260,7 @@ fn fix(
     worktrees: &[WorktreeEntry],
     orphans: &[PathBuf],
     registrations: &[PathBuf],
+    store: Option<&Path>,
     report: &mut DoctorReport,
 ) {
     let mut handled: Vec<PathBuf> = Vec::new();
@@ -206,7 +270,7 @@ fn fix(
             .read_file(&staging.join(JOURNAL_FILE))
             .ok()
             .and_then(|bytes| Journal::decode(&bytes).ok())
-            .and_then(|journal| trusted(journal, repo, worktrees, staging));
+            .and_then(|journal| trusted(journal, repo, worktrees, staging, store));
         let ok = if let Some(journal) = journal {
             handled.extend(journal.worktree.clone());
             let published = journal.worktree.as_deref().and_then(|staged| {
@@ -267,12 +331,18 @@ fn fix(
 /// this staging dir; the repository is always the one doctor runs in; the
 /// destination is the staging dir's sibling, never read from the journal; and the
 /// branch counts only if the staged registration really has it checked out.
+///
+/// In a store (the staging dir is directly under `<store>/worktrees`) the destination
+/// is not a sibling: it is the journaled one, accepted only when it is exactly
+/// `<store>/worktrees/<id>/<name>`, and the journaled symlink only when it points at that
+/// destination (it is removed only while it still does).
 /// Returns `None` when the journal points anywhere else.
 fn trusted(
     journal: Journal,
     repo: &RepoInfo,
     worktrees: &[WorktreeEntry],
     staging: &Path,
+    store: Option<&Path>,
 ) -> Option<Journal> {
     let staged = match journal.worktree {
         Some(staged) if staged.parent() == Some(staging) && staged.file_name().is_some() => {
@@ -289,18 +359,309 @@ fn trusted(
                 .any(|w| &w.path == staged && w.branch.as_deref() == Some(checked_out.as_str()))
         })
     });
-    let publish_to = staged
-        .as_ref()
-        .and_then(|s| Some(staging.parent()?.join(s.file_name()?)));
+    let worktrees_dir = store
+        .filter(|root| staging.parent() == Some(root.join(WORKTREES_DIR).as_path()))
+        .map(|root| root.join(WORKTREES_DIR));
+    let (publish_to, store_link) = match &worktrees_dir {
+        Some(dir) => {
+            let publish_to = journal
+                .publish_to
+                .filter(|dest| is_store_destination(dest, dir));
+            let link = journal
+                .store_link
+                .filter(|link| publish_to.as_ref() == Some(&link.target));
+            (publish_to, link)
+        }
+        None => (
+            staged
+                .as_ref()
+                .and_then(|s| Some(staging.parent()?.join(s.file_name()?))),
+            None,
+        ),
+    };
     Some(Journal {
         repo: repo.toplevel.clone(),
         worktree: staged,
         created_branch,
         publish_to,
         branch_start: journal.branch_start,
-        // TDD: a crashed store run's link is trusted (and undone) in the store work.
-        store_link: None,
+        store_link,
     })
+}
+
+/// `dest` is `<worktrees>/<id>/<name>` with nothing else in it (no `..`, no extra
+/// levels) and `<id>` shaped like a repository id.
+fn is_store_destination(dest: &Path, worktrees: &Path) -> bool {
+    use std::path::Component;
+    let Ok(rest) = dest.strip_prefix(worktrees) else {
+        return false;
+    };
+    let parts: Vec<Component<'_>> = rest.components().collect();
+    matches!(parts.as_slice(), [Component::Normal(id), Component::Normal(_)] if is_repo_id(id))
+}
+
+// ------------------------------------------------------------------ the store
+
+/// A host filesystem or a store is low on space below this many free bytes (the host)
+/// or this share of its size (both).
+const LOW_FREE_BYTES: u64 = 2 << 30;
+
+/// Everything about a store that can be checked while it is available. Reports only,
+/// except for what `fix` can repair without deleting anybody's work: a symlink the
+/// registry knows that dangles, and a baseline (a cache) whose source is gone. A
+/// worktree directory is never deleted.
+fn check_store(
+    env: &Env<'_>,
+    repo: &RepoInfo,
+    store: &Store,
+    worktrees: &[WorktreeEntry],
+    claimed: &[PathBuf],
+    fix: bool,
+    report: &mut DoctorReport,
+) {
+    if let Some(image) = deleted_image(env.fs, &store.root) {
+        report.findings.push(Finding::StoreImageDeleted {
+            path: store.root.clone(),
+            image,
+        });
+    }
+    check_space(env.fs, store, report);
+    store_orphans(env, repo, store, worktrees, claimed, report);
+    dangling_links(env, store, fix, report);
+    stale_baselines(env, store, worktrees, fix, report);
+}
+
+/// The image file backing the loop device the store is mounted from, when that file was
+/// deleted: the data lives on only until the store is unmounted.
+fn deleted_image(fs: &dyn CowFs, root: &Path) -> Option<String> {
+    let info = fs.read_file(Path::new("/proc/self/mountinfo")).ok()?;
+    let info = String::from_utf8_lossy(&info);
+    // The deepest mount point that holds the store: the store itself in production.
+    let mut best: Option<(usize, &str)> = None;
+    for line in info.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let (Some(mount), Some(source)) = (before.split(' ').nth(4), after.split(' ').nth(1))
+        else {
+            continue;
+        };
+        let mount = unescape_mount(mount);
+        if root.starts_with(&mount) && best.is_none_or(|(len, _)| mount.as_os_str().len() >= len) {
+            best = Some((mount.as_os_str().len(), source));
+        }
+    }
+    let device = Path::new(best?.1).file_name()?.to_str()?;
+    if !device.starts_with("loop") {
+        return None;
+    }
+    let backing = fs
+        .read_file(Path::new(&format!("/sys/block/{device}/loop/backing_file")))
+        .ok()?;
+    let backing = String::from_utf8_lossy(&backing);
+    let image = backing.trim_end().strip_suffix(" (deleted)")?;
+    Some(image.to_owned())
+}
+
+/// `/proc/self/mountinfo` writes a space, tab, newline or backslash in a path as `\040`
+/// (octal).
+fn unescape_mount(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = (bytes[i] == b'\\' && i + 3 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 4]).ok())
+            .flatten()
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(byte) = octal {
+            out.push(byte);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// The filesystem holding the image grows with the store (under 10% free or under 2 GiB
+/// is low), and the store itself should keep a tenth free.
+fn check_space(fs: &dyn CowFs, store: &Store, report: &mut DoctorReport) {
+    let host = store
+        .marker
+        .image
+        .parent()
+        .map(Path::to_path_buf)
+        .and_then(|dir| fs.space(&dir).ok().map(|space| (dir, space)));
+    let mut low = Vec::new();
+    if let Some((dir, space)) = host {
+        if space.free < LOW_FREE_BYTES || space.free.saturating_mul(10) < space.total {
+            low.push((dir, space));
+        }
+    }
+    if let Ok(space) = fs.space(&store.root) {
+        if space.free.saturating_mul(10) < space.total {
+            low.push((store.root.clone(), space));
+        }
+    }
+    for (path, space) in low {
+        report.findings.push(Finding::StoreLowSpace {
+            path,
+            free: space.free,
+            total: space.total,
+        });
+    }
+}
+
+/// Where the store's runs in flight or crashed (a `.parhel-staging-*` dir with a
+/// journal) were going to publish their worktree: a directory there is theirs to
+/// repair, not an orphan.
+fn claimed_destinations(fs: &dyn CowFs, store: &Store) -> Vec<PathBuf> {
+    let dir = store.root.join(WORKTREES_DIR);
+    fs.list_dir(&dir)
+        .unwrap_or_default()
+        .iter()
+        .filter(|name| is_staging_name(name))
+        .filter_map(|name| fs.read_file(&dir.join(name).join(JOURNAL_FILE)).ok())
+        .filter_map(|bytes| Journal::decode(&bytes).ok())
+        .filter_map(|journal| journal.publish_to)
+        .filter(|dest| is_store_destination(dest, &dir))
+        .collect()
+}
+
+/// The directories this repository has under `worktrees/<id>/` that git does not know.
+/// Reported only: they may hold work, and the user decides.
+fn store_orphans(
+    env: &Env<'_>,
+    repo: &RepoInfo,
+    store: &Store,
+    worktrees: &[WorktreeEntry],
+    claimed: &[PathBuf],
+    report: &mut DoctorReport,
+) {
+    let fs = env.fs;
+    let dir = store.root.join(WORKTREES_DIR);
+    let Ok(mut ids) = fs.list_dir(&dir) else {
+        return;
+    };
+    ids.sort();
+    let own_id = repo_id(&repo.toplevel);
+    for id in ids.iter().filter(|id| is_repo_id(id)) {
+        // Another repository's id (its baseline names a source this repository does not
+        // have) is none of this run's business.
+        let ours = *id == *own_id
+            || baseline_source(fs, store, id)
+                .is_some_and(|source| worktrees.iter().any(|w| w.path == source));
+        if !ours {
+            continue;
+        }
+        let id_dir = dir.join(id);
+        let Ok(mut names) = fs.list_dir(&id_dir) else {
+            continue;
+        };
+        names.sort();
+        for name in names {
+            let path = id_dir.join(name);
+            let known = worktrees.iter().any(|w| w.path == path) || claimed.contains(&path);
+            if !known && fs.is_dir_no_follow(&path).unwrap_or(false) {
+                report.findings.push(Finding::StoreOrphan { path });
+            }
+        }
+    }
+}
+
+/// The `source=` line of a baseline's `meta`.
+fn baseline_source(fs: &dyn CowFs, store: &Store, id: &std::ffi::OsStr) -> Option<PathBuf> {
+    let meta = fs
+        .read_file(&store.root.join(BASELINES_DIR).join(id).join("meta"))
+        .ok()?;
+    meta.split(|&b| b == b'\n').find_map(|line| {
+        let value = line.strip_prefix(b"source=")?;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)))
+    })
+}
+
+/// Symlinks the registry says we created, that still point at their worktree's real
+/// path inside the store, and the worktree is gone (`git worktree remove` given the
+/// symlink removes the real worktree and leaves the link). The registry is a record,
+/// not a license: a path that is no longer a symlink to exactly that target is none of
+/// our business.
+fn dangling_links(env: &Env<'_>, store: &Store, fix: bool, report: &mut DoctorReport) {
+    let fs = env.fs;
+    let Ok(registry) = fs.read_file(&store.root.join(LINKS_FILE)) else {
+        return;
+    };
+    let worktrees = store.root.join(WORKTREES_DIR);
+    let mut seen = BTreeSet::new();
+    for line in registry.split(|&b| b == b'\n') {
+        let Some(tab) = line.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let link = PathBuf::from(std::ffi::OsStr::from_bytes(&line[..tab]));
+        let target = PathBuf::from(std::ffi::OsStr::from_bytes(&line[tab + 1..]));
+        if !seen.insert((link.clone(), target.clone())) {
+            continue;
+        }
+        let inside = target.strip_prefix(&worktrees).is_ok_and(|rest| {
+            rest.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        });
+        let still_ours = matches!(fs.read_link(&link), Ok(Some(t)) if t == target);
+        if !inside || !still_ours || fs.exists_no_follow(&target).unwrap_or(true) {
+            continue;
+        }
+        let finding = Finding::StoreDanglingLink {
+            link: link.clone(),
+            target,
+        };
+        report.findings.push(finding.clone());
+        if fix && fs.remove_file(&link).is_ok() {
+            report.fixed.push(finding);
+        }
+    }
+}
+
+/// Baselines whose source is no longer a git worktree. A baseline is a cache: `--fix`
+/// deletes it (the next `add` mirrors the source again) unless a run holds its lock.
+fn stale_baselines(
+    env: &Env<'_>,
+    store: &Store,
+    worktrees: &[WorktreeEntry],
+    fix: bool,
+    report: &mut DoctorReport,
+) {
+    let fs = env.fs;
+    let dir = store.root.join(BASELINES_DIR);
+    let Ok(mut ids) = fs.list_dir(&dir) else {
+        return;
+    };
+    ids.sort();
+    for id in ids {
+        let Some(source) = baseline_source(fs, store, &id) else {
+            continue;
+        };
+        let registered = worktrees.iter().any(|w| w.path == source);
+        let alive = registered
+            || (fs.exists_no_follow(&source).unwrap_or(true)
+                && env.git.discover(&source).map_or_else(
+                    |e| e.code != ErrorCode::NotARepo,
+                    |info| info.toplevel == source,
+                ));
+        if alive {
+            continue;
+        }
+        let path = dir.join(&id);
+        let finding = Finding::StoreStaleBaseline { path: path.clone() };
+        report.findings.push(finding.clone());
+        if fix
+            && !fs.is_locked(&path.join("lock")).unwrap_or(true)
+            && fs.remove_dir_all(&path).is_ok()
+        {
+            report.fixed.push(finding);
+        }
+    }
 }
 
 /// The `.parhel-staging-*` directory `path` lies in, if any.
