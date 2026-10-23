@@ -160,11 +160,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install the musl toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Clippy (musl)
+        # The libc types differ from glibc's (`ioctl` takes an int, `f_type` an unsigned
+        # long), so lints that are silent on the gnu targets can fire here.
+        run: cargo clippy --all-targets --all-features --target "${{ matrix.target }}" -- -D warnings
       - name: Build the release binary (as the release workflow does)
         run: |
           cargo build --release --locked --target "${{ matrix.target }}" --bin git-parhel

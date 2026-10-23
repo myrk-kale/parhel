@@ -93,7 +93,13 @@ fn reflink_probe(dir: &Path) -> Option<bool> {
 
 /// `BTRFS_IOC_FS_INFO`: `_IOR(0x94, 31, struct btrfs_ioctl_fs_info_args)`, a
 /// 1024-byte structure whose `fsid` (the filesystem's UUID) starts at byte 16.
-const BTRFS_IOC_FS_INFO: u64 = 0x8400_941f;
+///
+/// `ioctl` takes an unsigned long on glibc and an int on musl (`libc::Ioctl`): the
+/// request is written once as the 32-bit number the kernel defines and converted to
+/// the type of the target. On musl the top bit makes it negative as an `int`, which
+/// is what the C headers do too.
+#[allow(clippy::cast_possible_wrap)]
+const BTRFS_IOC_FS_INFO: libc::Ioctl = 0x8400_941f_u32 as libc::Ioctl;
 
 /// The UUID of the btrfs filesystem holding `path`, folded to 64 bits. Subvolumes
 /// of one filesystem have it in common (and a `st_dev` and an `f_fsid` each).
@@ -101,7 +107,7 @@ fn btrfs_uuid(path: &Path) -> Option<u64> {
     let dir = File::open(path).ok()?;
     let mut info = [0u8; 1024];
     // SAFETY: valid open fd; the request fills a buffer of the size it encodes.
-    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_FS_INFO as _, info.as_mut_ptr()) };
+    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_FS_INFO, info.as_mut_ptr()) };
     let uuid: [u8; 16] = info[16..32].try_into().ok()?;
     (rc == 0 && uuid != [0; 16]).then(|| {
         let (a, b) = uuid.split_at(8);
@@ -411,6 +417,8 @@ mod tests {
     const ALL: [Kind; 3] = [Kind::Btrfs, Kind::Xfs, Kind::Ext4];
     const REFLINKING: [Kind; 2] = [Kind::Btrfs, Kind::Xfs];
 
+    // `f_type` is a `c_ulong` on musl and a signed word on glibc.
+    #[allow(clippy::useless_conversion)]
     fn magic_of(path: &Path) -> u64 {
         let c = c_path(path).unwrap();
         let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();

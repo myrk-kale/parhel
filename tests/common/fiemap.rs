@@ -16,8 +16,11 @@ use std::path::Path;
 const FIEMAP_FLAG_SYNC: u32 = 1;
 /// The extent is referenced by more than one file (reflink / snapshot).
 pub const FIEMAP_EXTENT_SHARED: u32 = 0x0000_2000;
-/// `_IOWR('f', 11, struct fiemap)`.
-const FS_IOC_FIEMAP: u64 = 0xC020_660B;
+/// `_IOWR('f', 11, struct fiemap)`. `ioctl` takes an unsigned long on glibc and an int
+/// on musl (`libc::Ioctl`); the top bit makes the 32-bit request negative as an `int`,
+/// as in the C headers.
+#[allow(clippy::cast_possible_wrap)]
+const FS_IOC_FIEMAP: libc::Ioctl = 0xC020_660B_u32 as libc::Ioctl;
 const MAX_EXTENTS: usize = 256;
 
 /// `struct fiemap_extent`.
@@ -57,7 +60,7 @@ pub fn extents(path: &Path) -> io::Result<Vec<Extent>> {
         extents: [Extent::default(); MAX_EXTENTS],
     });
     // SAFETY: valid fd and a `fiemap` request with room for `extent_count` extents.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP as _, &mut *request) };
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP, &mut *request) };
     if rc == -1 {
         return Err(io::Error::last_os_error());
     }
