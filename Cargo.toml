@@ -57,3 +57,47 @@ missing_panics_doc = "allow"
 lto = true
 codegen-units = 1
 strip = true
+
+# Linux packages, built from the already-compiled static musl binary by
+# scripts/build-packages.sh (used by the release and CI workflows). The tools'
+# versions are pinned there.
+[package.metadata.deb]
+maintainer = "Kale <parhel-release@users.noreply.github.com>"
+section = "vcs"
+priority = "optional"
+depends = "git (>= 1:2.29)"
+# Used by a future `setup` command to prepare a Btrfs volume.
+recommends = "btrfs-progs"
+license-file = ["packaging/debian/copyright", "0"]
+extended-description = """\
+Creates Git worktrees with filesystem copy-on-write cloning, so ignored build \
+output such as node_modules/ and target/ is in place immediately and takes no \
+extra disk space until a file changes. Runs on Btrfs and XFS (reflink); \
+--copy and --fallback cover other filesystems."""
+assets = [
+    ["target/release/git-parhel", "usr/bin/git-parhel", "755"],
+    ["man/*.1", "usr/share/man/man1/", "644"],
+    ["README.md", "usr/share/doc/parhel/README.md", "644"],
+    # The file name has no Debian revision, so Debian tools take the package for a
+    # native one and expect its changelog here (see packaging/debian/lintian-overrides).
+    ["CHANGELOG.md", "usr/share/doc/parhel/changelog", "644"],
+    ["packaging/debian/lintian-overrides", "usr/share/lintian/overrides/parhel", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Git worktrees with copy-on-write cloning, ignored build output included"
+license = "MIT"
+url = "https://github.com/myrk-kale/parhel"
+assets = [
+    { source = "target/release/git-parhel", dest = "/usr/bin/git-parhel", mode = "755" },
+    { source = "man/*.1", dest = "/usr/share/man/man1/", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/parhel/README.md", mode = "644", doc = true },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/parhel/CHANGELOG.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/parhel/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+git = ">= 2.29"
+
+[package.metadata.generate-rpm.recommends]
+btrfs-progs = "*"

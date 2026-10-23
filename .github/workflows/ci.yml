@@ -117,6 +117,24 @@ jobs:
           if grep -q INTERP program-headers.txt; then echo "git-parhel is dynamically linked"; exit 1; fi
       - name: Smoke test
         run: scripts/smoke-test.sh ./git-parhel
+      - name: Build the .deb and .rpm (as the release workflow does)
+        run: |
+          scripts/build-packages.sh "${{ matrix.target }}" dist
+          ls -l dist
+          (cd dist && sha256sum -c ./*.sha256)
+      - name: Lint the .deb
+        # Errors fail the job. The two tags the package overrides, and why, are in
+        # packaging/debian/lintian-overrides; everything else is printed.
+        run: |
+          sudo apt-get install -y --no-install-recommends lintian
+          lintian --version
+          lintian --fail-on error --tag-display-limit 0 dist/*.deb
+      - name: Install the .deb in Ubuntu 24.04
+        run: scripts/test-package.sh ubuntu:24.04 dist/*.deb
+      - name: Install the .deb in Debian stable
+        run: scripts/test-package.sh debian:stable dist/*.deb
+      - name: Install the .rpm in Fedora
+        run: scripts/test-package.sh fedora:latest dist/*.rpm
 
   msrv:
     name: MSRV (shipped binary)

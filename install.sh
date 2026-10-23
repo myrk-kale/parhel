@@ -74,5 +74,6 @@ case ":${MANPATH:-}:" in
 esac
 if [ "$(uname -s)" = "Linux" ]; then
   say "copy-on-write needs Btrfs, XFS (reflink), bcachefs or ZFS 2.2+; elsewhere use --copy or --fallback"
+  say ".deb and .rpm packages are on the releases page too: https://github.com/${repo}/releases"
 fi
 say "try: git parhel add ../my-feature --new-branch my-feature"
