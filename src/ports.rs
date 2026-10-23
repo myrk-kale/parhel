@@ -257,6 +257,12 @@ pub trait Host {
     /// Names in a directory; empty when it does not exist.
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>>;
     fn is_mount_point(&self, path: &Path) -> bool;
+    /// Whether the immutable attribute (`chattr +i`) is set on `path`. A filesystem
+    /// that cannot say answers `false`.
+    fn is_immutable(&self, path: &Path) -> bool;
+    /// What `blkid -p` finds on the image: the filesystem type, or `None` when it has
+    /// no signature at all (blank, or an earlier setup that stopped before `mkfs`).
+    fn filesystem_of(&self, image: &Path) -> Result<Option<String>>;
     /// Run a program to completion, returning its stdout. Errors carry its stderr.
     fn run(&self, program: &str, args: &[&str]) -> Result<String>;
     /// Create the directory when missing; either way set its mode and owner.
@@ -267,8 +273,9 @@ pub trait Host {
     /// the whole size with `preallocate`.
     fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()>;
     fn image_usage(&self, path: &Path) -> Result<ImageUsage>;
-    /// After `chattr +i` on `dir`: `unlink` and `rename` of `image` fail with `EPERM`
-    /// while writing to it still works.
+    /// After `chattr +i` on `dir`: removing and renaming `image` fail with `EPERM`
+    /// while opening it for writing still works. The probes never change the image,
+    /// so a directory that turns out not to be protected loses nothing.
     fn verify_immutable(&self, dir: &Path, image: &Path) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
     /// Remove an empty directory.
