@@ -309,6 +309,17 @@ pub trait Host {
     fn remove_file(&self, path: &Path) -> Result<()>;
     /// Remove an empty directory.
     fn remove_dir(&self, path: &Path) -> Result<()>;
+    /// Mount the btrfs `image` read-only on a new private directory (root's, mode 0700) to
+    /// look inside it, and return that directory. Mounted with `-t btrfs -o
+    /// loop,ro,nodev,nosuid,noexec` plus `rescue=nologreplay` where the kernel has it, so
+    /// that looking changes nothing in the image. Errors carry the reason (a damaged
+    /// image does not mount).
+    fn mount_readonly(&self, image: &Path) -> Result<PathBuf>;
+    /// Unmount `mount_point`; a directory made by [`mount_readonly`](Self::mount_readonly)
+    /// is removed with it.
+    fn umount(&self, mount_point: &Path) -> Result<()>;
+    /// Tell the person running the command something now (stderr), ahead of the result.
+    fn notice(&self, message: &str);
 }
 
 /// Guard of [`CowFs::lock_exclusive`].

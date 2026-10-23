@@ -1142,6 +1142,11 @@ pub enum HostCall {
     },
     RemoveFile(PathBuf),
     RemoveDir(PathBuf),
+    /// An image mounted read-only on a private directory.
+    MountReadonly(PathBuf),
+    Umount(PathBuf),
+    /// Something said to the person ahead of the result.
+    Notice(String),
 }
 
 impl HostCall {
@@ -1169,6 +1174,9 @@ impl HostCall {
             }
             Self::RemoveFile(path) => format!("rm {}", path.display()),
             Self::RemoveDir(path) => format!("rmdir {}", path.display()),
+            Self::MountReadonly(image) => format!("mount-ro {}", image.display()),
+            Self::Umount(path) => format!("umount {}", path.display()),
+            Self::Notice(text) => format!("notice {text}"),
         }
     }
 }
@@ -1209,6 +1217,13 @@ pub struct FakeHost {
     pub fail_run: RefCell<HashMap<String, ErrorCode>>,
     /// A `chattr` that succeeds without setting anything (a filesystem that ignores it).
     pub chattr_does_nothing: bool,
+    /// Where the contents of an image appear once it is mounted somewhere (image -> the
+    /// directory of the fake tree that holds them).
+    pub image_roots: RefCell<HashMap<PathBuf, PathBuf>>,
+    /// Private directories an image is mounted on right now (directory -> contents).
+    pub probes: RefCell<HashMap<PathBuf, PathBuf>>,
+    /// Directories that cannot be listed.
+    pub unreadable: RefCell<HashSet<PathBuf>>,
     /// Creating an image fails (after the directory was checked).
     pub fail_create_image: Cell<bool>,
     /// Sizing an image fails.
@@ -1259,6 +1274,9 @@ impl Default for FakeHost {
             attrs: RefCell::default(),
             fail_run: RefCell::default(),
             chattr_does_nothing: false,
+            image_roots: RefCell::default(),
+            probes: RefCell::default(),
+            unreadable: RefCell::default(),
             fail_create_image: Cell::new(false),
             fail_size_image: Cell::new(false),
         }
@@ -1330,14 +1348,25 @@ impl FakeHost {
     /// counts the root's own entries (its listing), which the image holds too.
     fn out_of_reach(&self, path: &Path, include_root: bool) -> bool {
         let mounted = self.mounted.borrow();
-        self.files
-            .borrow()
+        let image_roots = self.image_roots.borrow();
+        let files = self.files.borrow();
+        let marker_roots = files
             .keys()
             .filter(|f| f.file_name().is_some_and(|n| n == ".parhel-store"))
-            .filter_map(|f| f.parent())
+            .filter_map(|f| f.parent());
+        marker_roots
+            .chain(image_roots.values().map(PathBuf::as_path))
             .any(|root| {
                 !mounted.contains(root) && path.starts_with(root) && (include_root || path != root)
             })
+    }
+
+    /// `path` seen through a read-only probe mount: where its contents are in the fake tree.
+    fn through_probe(&self, path: &Path) -> Option<PathBuf> {
+        self.probes
+            .borrow()
+            .iter()
+            .find_map(|(probe, root)| path.strip_prefix(probe).ok().map(|rest| root.join(rest)))
     }
 
     fn remember(&self, path: &Path, mode: u32, owner: Owner) {
@@ -1380,6 +1409,9 @@ impl Host for FakeHost {
     }
 
     fn read_text(&self, path: &Path) -> Result<Option<String>> {
+        if let Some(real) = self.through_probe(path) {
+            return Ok(self.files.borrow().get(&real).cloned());
+        }
         if self.out_of_reach(path, false) {
             return Ok(None);
         }
@@ -1387,6 +1419,9 @@ impl Host for FakeHost {
     }
 
     fn exists(&self, path: &Path) -> bool {
+        if let Some(real) = self.through_probe(path) {
+            return self.files.borrow().contains_key(&real) || self.dirs.borrow().contains(&real);
+        }
         !self.out_of_reach(path, false)
             && (self.files.borrow().contains_key(path)
                 || self.dirs.borrow().contains(path)
@@ -1394,7 +1429,17 @@ impl Host for FakeHost {
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>> {
-        if self.out_of_reach(path, true) {
+        let (listed, in_reach) = match self.through_probe(path) {
+            Some(real) => (real, true),
+            None => (path.to_path_buf(), !self.out_of_reach(path, true)),
+        };
+        if self.unreadable.borrow().contains(&listed) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: Input/output error", path.display()),
+            ));
+        }
+        if !in_reach {
             return Ok(Vec::new());
         }
         let files = self.files.borrow();
@@ -1404,7 +1449,7 @@ impl Host for FakeHost {
             .keys()
             .chain(dirs.iter())
             .chain(images.keys())
-            .filter(|c| c.parent() == Some(path))
+            .filter(|c| c.parent() == Some(listed.as_path()))
             .filter_map(|c| c.file_name().map(OsString::from))
             .collect();
         names.sort();
@@ -1413,7 +1458,7 @@ impl Host for FakeHost {
     }
 
     fn is_mount_point(&self, path: &Path) -> bool {
-        self.mounted.borrow().contains(path)
+        self.mounted.borrow().contains(path) || self.probes.borrow().contains_key(path)
     }
 
     fn mount_backing(&self, mount_point: &Path, _image: &Path) -> Result<MountBacking> {
@@ -1647,5 +1692,41 @@ impl Host for FakeHost {
             .borrow_mut()
             .retain(|d| d != path && !d.starts_with(path));
         Ok(())
+    }
+
+    fn mount_readonly(&self, image: &Path) -> Result<PathBuf> {
+        self.log(HostCall::MountReadonly(image.into()));
+        if let Some(code) = self.fail_run.borrow().get("mount") {
+            return Err(Error::new(*code, "fake: mount failed"));
+        }
+        let Some(root) = self.image_roots.borrow().get(image).cloned() else {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!(
+                    "{}: wrong fs type, bad option, bad superblock",
+                    image.display()
+                ),
+            ));
+        };
+        let dir = p(&format!(
+            "/run/parhel-probe-{}",
+            self.probes.borrow().len() + 1
+        ));
+        self.probes.borrow_mut().insert(dir.clone(), root);
+        Ok(dir)
+    }
+
+    fn umount(&self, mount_point: &Path) -> Result<()> {
+        self.log(HostCall::Umount(mount_point.into()));
+        if let Some(code) = self.fail_run.borrow().get("umount") {
+            return Err(Error::new(*code, "fake: umount failed"));
+        }
+        self.probes.borrow_mut().remove(mount_point);
+        self.mounted.borrow_mut().remove(mount_point);
+        Ok(())
+    }
+
+    fn notice(&self, message: &str) {
+        self.log(HostCall::Notice(message.to_owned()));
     }
 }

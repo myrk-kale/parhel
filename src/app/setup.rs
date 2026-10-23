@@ -5,11 +5,12 @@
 //! recording fake. The steps are idempotent: each one looks at what exists and does
 //! only what is missing, so a run that stopped half way is finished by running it again.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::domain::request::DEFAULT_STORE_SIZE;
-use crate::domain::store::{BASELINES_DIR, MARKER_FILE, Marker, WORKTREES_DIR};
+use crate::domain::store::{BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, WORKTREES_DIR};
 use crate::domain::{Error, ErrorCode, Result, SetupRequest};
 use crate::ports::{Host, MountBacking, Owner, UserInfo};
 
@@ -184,7 +185,7 @@ pub fn setup(host: &dyn Host, request: &SetupRequest) -> Result<SetupOutcome> {
     }
     let places = Places::new(host, account(host, request)?)?;
     if request.remove {
-        remove(host, &places)
+        remove(host, &places, request.discard_contents)
     } else {
         create(host, &places, request)
     }
@@ -195,6 +196,9 @@ fn sudo_command(request: &SetupRequest) -> String {
     let mut words = vec!["sudo git parhel setup".to_owned()];
     if request.remove {
         words.push("--remove".to_owned());
+        if request.discard_contents {
+            words.push("--discard-contents".to_owned());
+        }
     } else {
         if request.size != DEFAULT_STORE_SIZE {
             words.push(format!("--size {}", request.size));
@@ -320,6 +324,7 @@ fn create(host: &dyn Host, places: &Places, request: &SetupRequest) -> Result<Se
                     size: DEFAULT_STORE_SIZE,
                     preallocate: false,
                     user: Some(places.user.name.clone()),
+                    discard_contents: false,
                 }),
             ),
         ));
@@ -586,6 +591,7 @@ fn rerun_command(places: &Places) -> String {
         preallocate: false,
         user: Some(places.user.name.clone()),
         remove: false,
+        discard_contents: false,
     })
 }
 
@@ -625,10 +631,50 @@ fn protect(host: &dyn Host, places: &Places) -> Result<()> {
 
 // ------------------------------------------------------------------------ removal
 
-fn remove(host: &dyn Host, places: &Places) -> Result<SetupOutcome> {
+/// How the contents of the store were reached, and what to undo about it.
+enum Way {
+    /// Mounted already: nothing to undo.
+    Mounted,
+    /// Its unit was started to look: stop it again unless the store is going away.
+    Started,
+    /// The image is mounted read-only on this private directory: unmount it.
+    Probe(PathBuf),
+}
+
+/// The marker of a store being looked at.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkerState {
+    Ours,
+    /// There is none.
+    Missing,
+    /// There is one that is not this user's (or not a marker at all).
+    Foreign(String),
+}
+
+/// What is in a store being removed.
+struct Contents {
+    marker: MarkerState,
+    /// Names in the store root that are not parhel's.
+    extras: Vec<OsString>,
+    /// Whether the store root holds anything at all.
+    empty: bool,
+    /// Worktrees, as paths under the store's mount point.
+    worktrees: Vec<PathBuf>,
+    /// Symlinks the registry says were made for the store's worktrees, once each.
+    links: Vec<PathBuf>,
+}
+
+/// What looking at the store came to.
+struct Looked {
+    way: Option<Way>,
+    /// `Err(why)` when the contents could not be reached: nothing to judge.
+    contents: std::result::Result<Option<Contents>, String>,
+}
+
+fn remove(host: &dyn Host, places: &Places, discard: bool) -> Result<SetupOutcome> {
     let unit_text = host.read_text(&places.unit_file)?;
     let image_present = host.exists(&places.image);
-    let mut mounted = host.is_mount_point(&places.root);
+    let mounted = host.is_mount_point(&places.root);
     let root_present = host.exists(&places.root);
     if !image_present && unit_text.is_none() && !mounted && !root_present {
         return Ok(SetupOutcome::NothingToRemove {
@@ -642,46 +688,27 @@ fn remove(host: &dyn Host, places: &Places) -> Result<SetupOutcome> {
         verify_mount(host, places)?;
     }
 
-    // The worktrees are the user's work. They can only be seen with the store mounted:
-    // a stopped one is mounted to look, and put back if it is not to be removed.
-    let mut started_to_look = false;
-    if !mounted && unit_text.is_some() && image_present {
-        host.run("systemctl", &["start", &places.unit])
-            .map_err(|e| {
-                Error::new(
-                    ErrorCode::StoreUnavailable,
-                    format!(
-                        "cannot look for worktrees in the store because it does not mount: {}",
-                        e.message
-                    ),
-                )
-            })?;
-        mounted = host.is_mount_point(&places.root);
-        started_to_look = true;
-    }
-    let worktrees = if mounted {
-        worktrees_in(host, &places.root)?
-    } else {
-        Vec::new()
-    };
-    if !worktrees.is_empty() {
-        if started_to_look {
+    // The worktrees are the user's work, and so is whatever else is in there. Looked at
+    // before anything is deleted: through the mount if it is up, by starting the unit if
+    // there is one, or by mounting the image read-only on a private directory when the
+    // unit is gone.
+    let looked = look(host, places, unit_text.is_some(), image_present, mounted)?;
+    let verdict = judge(places, &looked, discard);
+    match (&looked.way, &verdict) {
+        (Some(Way::Probe(dir)), _) => {
+            let unmounted = host.umount(dir);
+            if verdict.is_ok() {
+                unmounted?;
+            }
+        }
+        (Some(Way::Started), Err(_)) => {
             let _ = host.run("systemctl", &["stop", &places.unit]);
         }
-        let list = worktrees.iter().fold(String::new(), |mut list, w| {
-            let _ = write!(list, "\n  {}", w.display());
-            list
-        });
-        return Err(Error::new(
-            ErrorCode::StoreInUse,
-            format!(
-                "the store for {} still holds {} worktree(s):{list}\nremove each one with \
-                 `git worktree remove <path>` from its repository (then `git parhel doctor \
-                 --fix` clears the symlinks left behind) and run this again",
-                places.user.name,
-                worktrees.len()
-            ),
-        ));
+        _ => {}
+    }
+    verdict?;
+    if let Ok(Some(contents)) = &looked.contents {
+        announce_links(host, &contents.links);
     }
 
     let usage = if image_present {
@@ -696,7 +723,7 @@ fn remove(host: &dyn Host, places: &Places) -> Result<SetupOutcome> {
         host.remove_file(&places.unit_file)?;
         host.run("systemctl", &["daemon-reload"])?;
     } else if mounted {
-        host.run("umount", &[&places.root.to_string_lossy()])?;
+        host.umount(&places.root)?;
     }
 
     // The directory is immutable: lift it to delete, and put it back for the others.
@@ -727,6 +754,242 @@ fn remove(host: &dyn Host, places: &Places) -> Result<SetupOutcome> {
         allocated: usage.map_or(0, |u| u.allocated),
         unit: places.unit.clone(),
     }))
+}
+
+/// Reach the contents of the store, whichever way works, and read them.
+///
+/// `Err` is for what is wrong with the machine (an unreadable directory); a store that
+/// cannot be reached is reported in the result, for the caller to refuse or, with
+/// `--discard-contents`, to go on.
+fn look(
+    host: &dyn Host,
+    places: &Places,
+    has_unit: bool,
+    image_present: bool,
+    mounted: bool,
+) -> Result<Looked> {
+    let unreachable = |why: String| {
+        Ok(Looked {
+            way: None,
+            contents: Err(why),
+        })
+    };
+    let (way, at) = if mounted {
+        (Way::Mounted, places.root.clone())
+    } else if !image_present {
+        // A unit or a mount point and no image: there is nothing to look at.
+        return Ok(Looked {
+            way: None,
+            contents: Ok(None),
+        });
+    } else if has_unit {
+        if let Err(e) = host.run("systemctl", &["start", &places.unit]) {
+            return unreachable(format!("its unit does not start: {}", e.message));
+        }
+        if !host.is_mount_point(&places.root) {
+            return unreachable("its unit started but it is not mounted".to_owned());
+        }
+        (Way::Started, places.root.clone())
+    } else {
+        // The unit is gone (deleted by hand): the image is mounted read-only on a private
+        // directory - unless it holds nothing to look at, or something that is not ours.
+        require_tool(host, "mount", "util-linux")?;
+        require_tool(host, "umount", "util-linux")?;
+        require_tool(host, "blkid", "util-linux")?;
+        match host.filesystem_of(&places.image)? {
+            None => {
+                return Ok(Looked {
+                    way: None,
+                    contents: Ok(None),
+                });
+            }
+            Some(kind) if kind == "btrfs" => {}
+            Some(kind) => {
+                return unreachable(format!("it holds {kind}, not btrfs"));
+            }
+        }
+        match host.mount_readonly(&places.image) {
+            Ok(dir) => (Way::Probe(dir.clone()), dir),
+            Err(e) => return unreachable(format!("it does not mount: {}", e.message)),
+        }
+    };
+    match inspect(host, places, &at) {
+        Ok(contents) => Ok(Looked {
+            way: Some(way),
+            contents: Ok(Some(contents)),
+        }),
+        Err(e) => {
+            // As found: not left mounted because looking failed.
+            match &way {
+                Way::Probe(dir) => {
+                    let _ = host.umount(dir);
+                }
+                Way::Started => {
+                    let _ = host.run("systemctl", &["stop", &places.unit]);
+                }
+                Way::Mounted => {}
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Read the store whose root is `at` (its mount point, or a private mount of its image).
+fn inspect(host: &dyn Host, places: &Places, at: &Path) -> Result<Contents> {
+    let names = host.list_dir(at)?;
+    let marker = match host.read_text(&at.join(MARKER_FILE))? {
+        None => MarkerState::Missing,
+        Some(text) => match Marker::parse(&text) {
+            Ok(found) if found == places.marker() => MarkerState::Ours,
+            Ok(found) => MarkerState::Foreign(format!(
+                "it says the store is for `{}` (image {}, unit {})",
+                found.user,
+                found.image.display(),
+                found.unit
+            )),
+            Err(e) => MarkerState::Foreign(e.message),
+        },
+    };
+    let own = [MARKER_FILE, BASELINES_DIR, WORKTREES_DIR, LINKS_FILE];
+    let extras = names
+        .iter()
+        .filter(|name| !own.iter().any(|o| name.as_encoded_bytes() == o.as_bytes()))
+        .cloned()
+        .collect();
+    // The paths are shown where they will be once the store is mounted.
+    let worktrees = worktrees_in(host, at)?
+        .into_iter()
+        .map(|w| places.root.join(w.strip_prefix(at).unwrap_or(&w)))
+        .collect();
+    Ok(Contents {
+        marker,
+        extras,
+        empty: names.is_empty(),
+        worktrees,
+        links: registered_links(host, &at.join(LINKS_FILE)),
+    })
+}
+
+/// The symlinks named in the registry (`link TAB target` lines), once each. Best effort:
+/// the registry is the user's file, and a store is being removed anyway.
+fn registered_links(host: &dyn Host, registry: &Path) -> Vec<PathBuf> {
+    let Ok(Some(text)) = host.read_text(registry) else {
+        return Vec::new();
+    };
+    let mut links: Vec<PathBuf> = Vec::new();
+    for line in text.lines() {
+        if let Some((link, _)) = line.split_once('\t') {
+            let link = PathBuf::from(link);
+            if !link.as_os_str().is_empty() && !links.contains(&link) {
+                links.push(link);
+            }
+        }
+    }
+    links
+}
+
+/// What to do about what was found: `Ok` to go on, or the refusal.
+fn judge(places: &Places, looked: &Looked, discard: bool) -> Result<()> {
+    let user = &places.user.name;
+    let by_hand = format!(
+        "to look yourself: `sudo mount -t btrfs -o loop,ro,nodev,nosuid,noexec {} /mnt`, \
+         `ls -la /mnt`, `sudo umount /mnt`; to delete it anyway: `sudo git parhel setup \
+         --remove --user {user} --discard-contents`",
+        places.image.display()
+    );
+    let contents = match &looked.contents {
+        Ok(None) => return Ok(()),
+        Ok(Some(contents)) => contents,
+        Err(_) if discard => return Ok(()),
+        Err(why) => {
+            return Err(Error::new(
+                ErrorCode::StoreUnavailable,
+                format!(
+                    "cannot look inside {}: {why}, so it cannot be known whether it holds \
+                     worktrees or anything else of value. For now nothing was deleted; {by_hand}",
+                    places.image.display()
+                ),
+            ));
+        }
+    };
+    // Work in progress: never discarded by the flag.
+    if !contents.worktrees.is_empty() {
+        let list = contents
+            .worktrees
+            .iter()
+            .fold(String::new(), |mut list, w| {
+                let _ = write!(list, "\n  {}", w.display());
+                list
+            });
+        return Err(Error::new(
+            ErrorCode::StoreInUse,
+            format!(
+                "the store for {user} still holds {} worktree(s):{list}\nremove each one with \
+                 `git worktree unlock <path>` and `git worktree remove <path>` from its \
+                 repository (then `git parhel doctor --fix` clears the symlinks left behind) \
+                 and run this again. For now nothing was deleted",
+                contents.worktrees.len()
+            ),
+        ));
+    }
+    if discard {
+        return Ok(());
+    }
+    let marker_trouble = match &contents.marker {
+        MarkerState::Ours => None,
+        MarkerState::Missing if contents.empty => None,
+        MarkerState::Missing => Some("it has no store marker but is not empty".to_owned()),
+        MarkerState::Foreign(why) => Some(format!("its marker is not this store's: {why}")),
+    };
+    if let Some(why) = marker_trouble {
+        return Err(Error::new(
+            ErrorCode::StoreUnavailable,
+            format!(
+                "{} does not look like the store for {user}: {why}. For now nothing was \
+                 deleted; {by_hand}",
+                places.image.display()
+            ),
+        ));
+    }
+    if !contents.extras.is_empty() {
+        let list = contents
+            .extras
+            .iter()
+            .fold(String::new(), |mut list, name| {
+                let _ = write!(list, "\n  {}", places.root.join(name).display());
+                list
+            });
+        return Err(Error::new(
+            ErrorCode::StoreInUse,
+            format!(
+                "the store for {user} holds files that are not the store's own:{list}\nmove \
+                 them out and run this again, or delete them with the store: `sudo git parhel \
+                 setup --remove --user {user} --discard-contents`. For now nothing was deleted"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Print the symlinks that will be left pointing nowhere, before the registry that names
+/// them is deleted with the store.
+fn announce_links(host: &dyn Host, links: &[PathBuf]) {
+    const SHOWN: usize = 50;
+    if links.is_empty() {
+        return;
+    }
+    let mut text = String::from(
+        "these symlinks were made for the store's worktrees and will dangle once the store is \
+         gone (the registry that names them is deleted with it); remove them yourself \
+         afterwards:",
+    );
+    for link in links.iter().take(SHOWN) {
+        let _ = write!(text, "\n  {}", link.display().to_string().escape_debug());
+    }
+    if links.len() > SHOWN {
+        let _ = write!(text, "\n  ... and {} more", links.len() - SHOWN);
+    }
+    host.notice(&text);
 }
 
 /// Whether any image is left in the directory that protects them.
@@ -780,6 +1043,7 @@ mod tests {
             preallocate: false,
             user: None,
             remove: false,
+            discard_contents: false,
         }
     }
 
@@ -818,6 +1082,7 @@ mod tests {
             },
         );
         h.formatted.borrow_mut().insert(p(IMG));
+        h.image_roots.borrow_mut().insert(p(IMG), p(ROOT));
         h.files.borrow_mut().insert(
             p(UNIT_FILE),
             "[Unit]\nDescription=parhel store for alice\n\n[Mount]\nWhat=/var/lib/parhel/alice.img\n\
@@ -1313,6 +1578,7 @@ mod tests {
             preallocate: true,
             user: Some("bob".into()),
             remove: false,
+            discard_contents: false,
         };
         let err = setup(&h, &req).unwrap_err();
         assert!(
@@ -1332,6 +1598,27 @@ mod tests {
             ..request()
         };
         (h, req)
+    }
+
+    // U-SET-02c: ... and the removal that was asked to discard names the flag too.
+    #[test]
+    fn the_sudo_command_of_a_removal_carries_discard_contents() {
+        let h = FakeHost {
+            root: false,
+            ..FakeHost::default()
+        };
+        let req = SetupRequest {
+            discard_contents: true,
+            user: Some("bob".into()),
+            ..removal()
+        };
+        let err = setup(&h, &req).unwrap_err();
+        assert!(
+            err.message
+                .contains("sudo git parhel setup --remove --discard-contents --user bob"),
+            "{}",
+            err.message
+        );
     }
 
     // U-SET-22: a second user's image goes into the directory that protects the first
@@ -1808,21 +2095,335 @@ mod tests {
         assert_no_mutation(&h);
     }
 
-    // U-SET-36: a mount unit that is gone but a mounted image is not "nothing": the
-    // pieces that exist are cleaned up, one by one.
-    #[test]
-    fn remove_cleans_up_a_partial_store() {
-        let h = FakeHost::default();
-        installed(&h);
+    /// The unit was deleted by hand and the store is stopped: an image nobody mounts.
+    fn image_without_unit(h: &FakeHost) {
+        installed(h);
         h.files.borrow_mut().remove(&p(UNIT_FILE));
         h.mounted.borrow_mut().clear();
-        setup(&h, &removal()).unwrap();
-        assert!(!h.exists(Path::new(IMG)));
+    }
+
+    const PROBE: &str = "/run/parhel-probe-1";
+
+    fn worktree_inside(h: &FakeHost) {
+        for dir in [
+            "/parhel/alice/worktrees/abc",
+            "/parhel/alice/worktrees/abc/feat",
+        ] {
+            h.dirs.borrow_mut().insert(p(dir));
+        }
+    }
+
+    // U-SET-36: a mount unit that is gone does not make an image that is there "nothing":
+    // the image is mounted read-only on a private directory, looked into (the marker, the
+    // worktrees, what else is there), unmounted, and only then deleted.
+    #[test]
+    fn remove_looks_inside_an_image_whose_unit_is_gone() {
+        let h = FakeHost::default();
+        image_without_unit(&h);
+        assert!(matches!(
+            setup(&h, &removal()).unwrap(),
+            SetupOutcome::Removed(_)
+        ));
+        assert_eq!(
+            h.lines(),
+            vec![
+                format!("mount-ro {IMG}"),
+                format!("umount {PROBE}"),
+                "run chattr -i /var/lib/parhel".to_owned(),
+                format!("rm {IMG}"),
+                format!("rmdir {ROOT}"),
+            ]
+        );
+        assert!(!h.exists(Path::new(IMG)) && !h.exists(Path::new(ROOT)));
+    }
+
+    // U-SET-36b: ... and a worktree in it is the user's work: `store-in-use`, naming the
+    // worktree where it will appear once the store is mounted (not the private directory),
+    // the image intact and nothing left mounted.
+    #[test]
+    fn remove_refuses_worktrees_found_in_an_image_whose_unit_is_gone() {
+        let h = FakeHost::default();
+        image_without_unit(&h);
+        worktree_inside(&h);
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreInUse, "{err}");
         assert!(
-            !h.lines().iter().any(|l| l.contains("disable")),
+            err.message.contains("/parhel/alice/worktrees/abc/feat"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("parhel-probe"), "{}", err.message);
+        assert_eq!(
+            h.lines(),
+            vec![format!("mount-ro {IMG}"), format!("umount {PROBE}")]
+        );
+        assert!(h.exists(Path::new(IMG)));
+        assert!(h.probes.borrow().is_empty(), "nothing left mounted");
+    }
+
+    // U-SET-36c: an image with no filesystem at all (what an interrupted setup leaves)
+    // has nothing inside: it is deleted without mounting anything.
+    #[test]
+    fn remove_deletes_a_blank_image_without_mounting_it() {
+        let h = FakeHost::default();
+        image_without_unit(&h);
+        h.formatted.borrow_mut().clear();
+        setup(&h, &removal()).unwrap();
+        assert_eq!(
+            h.lines(),
+            vec![
+                "run chattr -i /var/lib/parhel".to_owned(),
+                format!("rm {IMG}"),
+                format!("rmdir {ROOT}"),
+            ]
+        );
+    }
+
+    /// What a refusal says: nothing was deleted, how to look yourself, how to insist.
+    fn assert_refusal_explains(err: &Error) {
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        for needle in [
+            "nothing was deleted",
+            "mount -t btrfs -o loop,ro,nodev,nosuid,noexec",
+            IMG,
+            "--discard-contents",
+            "--user alice",
+        ] {
+            assert!(
+                err.message.contains(needle),
+                "lacks `{needle}`: {}",
+                err.message
+            );
+        }
+    }
+
+    // U-SET-36d: an image that cannot be looked into is not deleted on a guess: it does not
+    // mount (damaged), holds another filesystem (somebody else's data), or its marker is
+    // missing next to other files or says it is not this user's. The refusal says that
+    // nothing was deleted and gives the commands to look and to insist; with
+    // `--discard-contents` the removal goes on.
+    #[rstest]
+    #[case::does_not_mount(
+        FakeHost::default().failing("mount", ErrorCode::Io),
+        |_: &FakeHost| {}
+    )]
+    #[case::another_filesystem(
+        FakeHost::default(),
+        |h: &FakeHost| { h.foreign.borrow_mut().insert(p(IMG), "ext4".into()); }
+    )]
+    #[case::marker_of_another_user(
+        FakeHost::default(),
+        |h: &FakeHost| {
+            h.files.borrow_mut().insert(
+                p("/parhel/alice/.parhel-store"),
+                "format=1\nuser=bob\nimage=/var/lib/parhel/bob.img\nunit=parhel-bob.mount\n".into(),
+            );
+        }
+    )]
+    #[case::marker_missing_next_to_other_files(
+        FakeHost::default(),
+        |h: &FakeHost| { h.files.borrow_mut().remove(&p("/parhel/alice/.parhel-store")); }
+    )]
+    #[case::marker_not_ours(
+        FakeHost::default(),
+        |h: &FakeHost| { h.files.borrow_mut().insert(p("/parhel/alice/.parhel-store"), "garbage".into()); }
+    )]
+    fn remove_refuses_an_image_it_cannot_vouch_for(
+        #[case] h: FakeHost,
+        #[case] spoil: fn(&FakeHost),
+    ) {
+        image_without_unit(&h);
+        spoil(&h);
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_refusal_explains(&err);
+        assert!(h.exists(Path::new(IMG)), "the image is intact");
+        assert!(h.probes.borrow().is_empty(), "nothing left mounted");
+        assert!(
+            !h.lines()
+                .iter()
+                .any(|l| l.starts_with("rm") || l.contains("chattr")),
             "{:?}",
             h.lines()
         );
+
+        // Insisting.
+        let insist = SetupRequest {
+            discard_contents: true,
+            ..removal()
+        };
+        assert!(matches!(
+            setup(&h, &insist).unwrap(),
+            SetupOutcome::Removed(_)
+        ));
+        assert!(!h.exists(Path::new(IMG)));
+    }
+
+    // U-SET-36e: no marker and nothing else in the filesystem is an interrupted setup, not
+    // somebody's data: removed without a flag.
+    #[test]
+    fn remove_deletes_a_formatted_image_that_holds_nothing() {
+        let h = FakeHost::default();
+        image_without_unit(&h);
+        for gone in ["/parhel/alice/baselines", "/parhel/alice/worktrees"] {
+            h.dirs.borrow_mut().remove(&p(gone));
+        }
+        h.files
+            .borrow_mut()
+            .remove(&p("/parhel/alice/.parhel-store"));
+        assert!(matches!(
+            setup(&h, &removal()).unwrap(),
+            SetupOutcome::Removed(_)
+        ));
+        assert!(!h.exists(Path::new(IMG)));
+    }
+
+    // U-SET-36f: what is in the store root that is not the store's - a file the user kept
+    // there, a directory - is theirs: refused, listing it, wherever the store is looked at
+    // (mounted, started to look, mounted read-only), until `--discard-contents`.
+    #[rstest]
+    #[case::mounted(|_: &FakeHost| {})]
+    #[case::stopped_with_its_unit(|h: &FakeHost| { h.mounted.borrow_mut().clear(); })]
+    #[case::unit_gone(|h: &FakeHost| {
+        h.files.borrow_mut().remove(&p(UNIT_FILE));
+        h.mounted.borrow_mut().clear();
+    })]
+    fn remove_refuses_files_that_are_not_the_stores(#[case] arrange: fn(&FakeHost)) {
+        let h = FakeHost::default();
+        installed(&h);
+        arrange(&h);
+        h.files
+            .borrow_mut()
+            .insert(p("/parhel/alice/thesis.tex"), "years of work".into());
+        h.dirs.borrow_mut().insert(p("/parhel/alice/photos"));
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreInUse, "{err}");
+        assert!(err.message.contains("thesis.tex"), "{}", err.message);
+        assert!(err.message.contains("photos"), "{}", err.message);
+        assert!(
+            err.message.contains("--discard-contents"),
+            "{}",
+            err.message
+        );
+        assert!(h.exists(Path::new(IMG)));
+        assert!(
+            !h.lines()
+                .iter()
+                .any(|l| l.starts_with("rm") || l.contains("chattr")),
+            "{:?}",
+            h.lines()
+        );
+        assert!(h.probes.borrow().is_empty());
+
+        let insist = SetupRequest {
+            discard_contents: true,
+            ..removal()
+        };
+        setup(&h, &insist).unwrap();
+        assert!(!h.exists(Path::new(IMG)));
+    }
+
+    // U-SET-36g: worktrees are never discarded by the flag: it covers what could not be
+    // checked or is not the store's, not work in progress.
+    #[test]
+    fn discard_contents_does_not_discard_worktrees() {
+        let h = FakeHost::default();
+        image_without_unit(&h);
+        worktree_inside(&h);
+        let insist = SetupRequest {
+            discard_contents: true,
+            ..removal()
+        };
+        let err = setup(&h, &insist).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreInUse, "{err}");
+        assert!(h.exists(Path::new(IMG)));
+    }
+
+    // U-SET-36h: the registry of symlinks goes with the store and cannot be rebuilt: the
+    // links it names are printed before anything is deleted, so they can be removed (or
+    // kept in mind) afterwards.
+    #[rstest]
+    #[case::mounted(|_: &FakeHost| {})]
+    #[case::unit_gone(|h: &FakeHost| {
+        h.files.borrow_mut().remove(&p(UNIT_FILE));
+        h.mounted.borrow_mut().clear();
+    })]
+    fn remove_lists_the_symlinks_it_is_about_to_lose(#[case] arrange: fn(&FakeHost)) {
+        let h = FakeHost::default();
+        installed(&h);
+        arrange(&h);
+        h.files.borrow_mut().insert(
+            p("/parhel/alice/links"),
+            "/home/alice/wt-one\t/parhel/alice/worktrees/abc/one\n\
+             /home/alice/wt-two\t/parhel/alice/worktrees/abc/two\n\
+             /home/alice/wt-one\t/parhel/alice/worktrees/abc/one\n"
+                .into(),
+        );
+        setup(&h, &removal()).unwrap();
+        let lines = h.lines();
+        let notice = lines
+            .iter()
+            .position(|l| l.starts_with("notice "))
+            .expect("the links are listed");
+        let first_deletion = lines
+            .iter()
+            .position(|l| l.starts_with("rm ") || l.contains("disable") || l.contains("chattr"))
+            .unwrap();
+        assert!(notice < first_deletion, "{lines:#?}");
+        let said = &lines[notice];
+        assert!(said.contains("/home/alice/wt-one"), "{said}");
+        assert!(said.contains("/home/alice/wt-two"), "{said}");
+        assert_eq!(
+            said.matches("/home/alice/wt-one").count(),
+            1,
+            "once: {said}"
+        );
+        assert!(said.contains("dangl"), "{said}");
+    }
+
+    // U-SET-36i: a store with no registered links says nothing of the kind.
+    #[test]
+    fn remove_without_links_prints_nothing() {
+        let h = FakeHost::default();
+        installed(&h);
+        setup(&h, &removal()).unwrap();
+        assert!(!h.lines().iter().any(|l| l.starts_with("notice ")));
+    }
+
+    // U-SET-36j: the unit is there and the image is not mounted, but it does not start: the
+    // worktrees cannot be looked for. That is a refusal with the way to look yourself and the
+    // way to insist - not a guess.
+    #[test]
+    fn remove_refuses_a_unit_that_does_not_start() {
+        let h = FakeHost::default().failing("systemctl", ErrorCode::Io);
+        installed(&h);
+        h.mounted.borrow_mut().clear();
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_refusal_explains(&err);
+        assert!(h.exists(Path::new(IMG)));
+        assert!(h.exists(Path::new(UNIT_FILE)));
+    }
+
+    // U-SET-38b: the store was started to look inside and looking failed (a directory that
+    // cannot be read): the unit is stopped again, as it was found, and the error is shown.
+    #[test]
+    fn remove_stops_a_unit_it_started_when_looking_fails() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.mounted.borrow_mut().clear();
+        h.unreadable
+            .borrow_mut()
+            .insert(p("/parhel/alice/worktrees"));
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
+        assert_eq!(
+            h.lines(),
+            vec![
+                "run systemctl start parhel-alice.mount".to_owned(),
+                "run systemctl stop parhel-alice.mount".to_owned()
+            ]
+        );
+        assert!(h.exists(Path::new(IMG)));
+        assert!(!h.is_mount_point(Path::new(ROOT)), "left as it was found");
     }
 
     // U-SET-37: the removal deletes parhel's unit, image and mount point and nothing else
@@ -1886,7 +2487,7 @@ mod tests {
         setup(&h, &removal()).unwrap();
         assert_eq!(
             h.lines().first().map(String::as_str),
-            Some("run umount /parhel/alice")
+            Some("umount /parhel/alice")
         );
         assert!(!h.exists(Path::new(IMG)) && !h.exists(Path::new(ROOT)));
     }

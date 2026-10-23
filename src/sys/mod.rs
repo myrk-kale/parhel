@@ -582,6 +582,69 @@ impl Host for SystemHost {
     fn remove_dir(&self, path: &Path) -> Result<()> {
         fs::remove_dir(path).map_err(|e| io_error(path, &e))
     }
+
+    fn mount_readonly(&self, image: &Path) -> Result<PathBuf> {
+        let dir = private_dir()?;
+        let image_text = image.to_string_lossy();
+        let dir_text = dir.to_string_lossy();
+        // `nologreplay` keeps the kernel from replaying the filesystem's log: looking must
+        // not change the image. Older kernels do not know the option and refuse it, so the
+        // second attempt is without it.
+        let options = "loop,ro,nodev,nosuid,noexec";
+        let with = format!("{options},rescue=nologreplay");
+        let mount = |opts: &str| {
+            self.run(
+                "mount",
+                &["-t", "btrfs", "-o", opts, &image_text, &dir_text],
+            )
+        };
+        let mounted = mount(&with).or_else(|_| mount(options));
+        match mounted {
+            Ok(_) => Ok(dir),
+            Err(e) => {
+                let _ = fs::remove_dir(&dir);
+                Err(e)
+            }
+        }
+    }
+
+    fn umount(&self, mount_point: &Path) -> Result<()> {
+        self.run("umount", &[&mount_point.to_string_lossy()])?;
+        if mount_point.starts_with(PROBE_PARENT)
+            && mount_point
+                .file_name()
+                .is_some_and(|n| n.as_encoded_bytes().starts_with(PROBE_PREFIX.as_bytes()))
+        {
+            fs::remove_dir(mount_point).map_err(|e| io_error(mount_point, &e))?;
+        }
+        Ok(())
+    }
+
+    fn notice(&self, message: &str) {
+        eprintln!("{message}");
+    }
+}
+
+/// Where the directories to look inside an image on are made: root's, in memory.
+const PROBE_PARENT: &str = "/run";
+const PROBE_PREFIX: &str = "parhel-probe-";
+
+/// A new directory for `mount_readonly`, owned by root, mode 0700, that nobody else can
+/// have planted: made exclusively under `/run`.
+fn private_dir() -> Result<PathBuf> {
+    let base = Path::new(PROBE_PARENT);
+    for attempt in 0..100u32 {
+        let dir = base.join(format!("{PROBE_PREFIX}{}-{attempt}", std::process::id()));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_error(&dir, &e)),
+        }
+    }
+    Err(Error::new(
+        ErrorCode::Io,
+        format!("cannot make a private directory under {PROBE_PARENT}"),
+    ))
 }
 
 /// Whether the kernel refuses (EPERM) to create an entry in `dir`: the probe is a
