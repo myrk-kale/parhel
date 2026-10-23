@@ -745,4 +745,16 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Io);
         assert!(err.message.contains("absent"), "{err}");
     }
+
+    // U-FS-33: the account of the process comes from the user database, not from the
+    // environment (which `sudo` and `su` leave behind).
+    #[test]
+    fn current_user_name_is_the_account_not_the_environment() {
+        let id = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        let want = String::from_utf8(id.stdout).unwrap().trim().to_owned();
+        assert_eq!(current_user_name().as_deref(), Some(want.as_str()));
+    }
 }

@@ -473,9 +473,7 @@ fn store_transaction(
         &baseline_dir,
         &worktrees_dir,
     ] {
-        if !fs.is_dir(dir)? {
-            fs.create_dir(dir)?;
-        }
+        ensure_dir(fs, dir)?;
     }
     let baseline_lock = lock_baseline(env, &baseline_dir.join("lock"))?;
     let baseline = baseline_dir.join("tree");
@@ -590,6 +588,16 @@ fn links_inside(env: &Env<'_>, store: &Store, source: &Path) -> Vec<PathBuf> {
         }
     }
     inside
+}
+
+/// The directory `dir`, created if missing. Another run creating it at the same moment
+/// (two first runs for one repository) is not a failure.
+fn ensure_dir(fs: &dyn CowFs, dir: &Path) -> Result<()> {
+    if fs.is_dir(dir)? {
+        return Ok(());
+    }
+    fs.create_dir(dir)
+        .or_else(|e| if fs.is_dir(dir)? { Ok(()) } else { Err(e) })
 }
 
 /// `dir/name`, or the first of `dir/name-2`, `dir/name-3`... that is free.
@@ -828,9 +836,7 @@ fn claim_link(
 ) -> Result<()> {
     let fs = env.fs;
     if let Some(dir) = route.real.parent() {
-        if !fs.is_dir(dir)? {
-            fs.create_dir(dir)?;
-        }
+        ensure_dir(fs, dir)?;
     }
     journal.store_link = Some(StoreLink {
         path: plan.destination.clone(),
