@@ -9,6 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// Device offset of the first byte of `path` (`fcntl(F_LOG2PHYS_EXT)`).
+#[cfg(target_os = "macos")]
 pub fn physical_offset(path: &Path) -> io::Result<i64> {
     let file = File::open(path)?;
     let mut l2p = libc::log2phys {
@@ -22,6 +23,12 @@ pub fn physical_offset(path: &Path) -> io::Result<i64> {
         return Err(io::Error::last_os_error());
     }
     Ok(l2p.l2p_devoffset)
+}
+
+/// Linux: no proof of sharing yet (a `FIEMAP` implementation will replace this).
+#[cfg(not(target_os = "macos"))]
+pub fn physical_offset(_: &Path) -> io::Result<i64> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Whether both files start at the same physical block (i.e. they are clones).
@@ -46,6 +53,7 @@ fn statfs(path: &Path) -> libc::statfs {
 }
 
 /// `f_fstypename` of the volume holding `path` (`"apfs"`, `"hfs"`, ...).
+#[cfg(target_os = "macos")]
 pub fn fs_type(path: &Path) -> String {
     let st = statfs(path);
     let bytes: Vec<u8> = st
@@ -57,9 +65,23 @@ pub fn fs_type(path: &Path) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+/// `f_type` magic of the volume holding `path`, in hex (Linux).
+#[cfg(not(target_os = "macos"))]
+pub fn fs_type(path: &Path) -> String {
+    format!("{:#x}", statfs(path).f_type)
+}
+
+#[cfg(target_os = "macos")]
 pub fn free_bytes(path: &Path) -> u64 {
     let st = statfs(path);
     st.f_bavail * u64::from(st.f_bsize)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::cast_sign_loss)]
+pub fn free_bytes(path: &Path) -> u64 {
+    let st = statfs(path);
+    st.f_bavail * st.f_bsize as u64
 }
 
 /// Write `size` bytes of incompressible pseudo-random data and fsync (forces

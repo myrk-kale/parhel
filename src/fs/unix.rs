@@ -4,6 +4,9 @@
 //! Only the copy-on-write primitives (clone, exclusive rename, filesystem
 //! identity, durable sync, unlocking immutable files) live in the adapters.
 
+// Until the Linux adapter exists, nothing uses these on Linux.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
