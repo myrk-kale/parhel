@@ -201,6 +201,10 @@ pub trait CowFs {
     fn read_link(&self, path: &Path) -> Result<Option<PathBuf>>;
     /// Append `bytes` to `path` (created if missing) and sync it.
     fn append_file(&self, path: &Path, bytes: &[u8]) -> Result<()>;
+    /// Make everything written to the filesystem holding `path` durable, and report a
+    /// write that failed after it was accepted (`syncfs`: `ENOSPC` and `EIO` of delayed
+    /// allocation surface here and nowhere else).
+    fn flush(&self, path: &Path) -> Result<()>;
     /// Whether the current user can create entries in the directory `path`.
     fn is_writable(&self, path: &Path) -> Result<bool>;
     /// Free and total space of the filesystem holding `path` (`statvfs`).

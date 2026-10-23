@@ -294,6 +294,7 @@ mod tests {
     use crate::domain::ErrorCode;
     use crate::domain::exclusions::ExclusionInput;
     use crate::domain::store::{Marker, Store};
+    use rstest::rstest;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
@@ -807,5 +808,46 @@ mod tests {
                 .any(|c| matches!(c, Call::Mirror { dst, .. } if *dst == at("src/main.rs"))),
             "{calls:#?}"
         );
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    // U-STO-90: a first sync of more than a GiB announces itself, with the size; a
+    // smaller one, or any later one, says nothing. The size comes from `stat`s alone and
+    // counts what would be copied (not the exclusions).
+    #[test]
+    fn a_big_first_sync_is_announced_with_its_size() {
+        let w = world();
+        w.put_file(&src("big/disk.img"), 3 * GIB, 5);
+        w.put_file(&src("node_modules/huge"), 40 * GIB, 6);
+        let ex = Exclusions::compute(&ExclusionInput {
+            source_root: p("/w/repo"),
+            user_excluded: vec![PathBuf::from("node_modules")],
+            ..ExclusionInput::default()
+        });
+        let size = first_sync_size(&w, Path::new("/w/repo"), &base(), &ex).unwrap();
+        assert_eq!(size, Some(3 * GIB + 20), "disk.img and src/main.rs");
+        let notice = first_sync_notice(size.unwrap()).expect("over a GiB");
+        assert!(notice.contains("3.0 GiB"), "{notice}");
+        assert_no_mutation(&w);
+
+        // Later syncs copy a difference, whatever the tree weighs.
+        let w = synced();
+        w.put_file(&src("big/disk.img"), 3 * GIB, 5);
+        assert_eq!(
+            first_sync_size(&w, Path::new("/w/repo"), &base(), &exclusions()).unwrap(),
+            None
+        );
+    }
+
+    // U-STO-90b: the threshold is a GiB, exclusive.
+    #[rstest]
+    #[case(0, false)]
+    #[case(GIB - 1, false)]
+    #[case(GIB, false)]
+    #[case(GIB + 1, true)]
+    #[case(500 * GIB, true)]
+    fn the_notice_starts_above_a_gibibyte(#[case] bytes: u64, #[case] announced: bool) {
+        assert_eq!(first_sync_notice(bytes).is_some(), announced);
     }
 }

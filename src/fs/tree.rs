@@ -1007,6 +1007,8 @@ fn stat_entry_io(root: &Path, rel: &Path) -> io::Result<Option<EntryMeta>> {
     Ok(entry_meta(&st, target))
 }
 
+// `mode_t` is 16 bits wide on macOS and 32 on Linux.
+#[allow(clippy::useless_conversion)]
 fn entry_meta(st: &libc::stat, link_target: Option<PathBuf>) -> Option<EntryMeta> {
     let kind = match kind_of_mode(st.st_mode) {
         Kind::Dir => EntryKind::Dir,
@@ -1060,6 +1062,10 @@ fn mirror_io(root: &Path, rel: &Path, dst: &Path) -> std::result::Result<u64, Fa
         Kind::Other => return Ok(0),
         _ => {}
     }
+    // The mirror keeps the source's modes, read-only directories included: one that
+    // has to take an entry is opened for the owner (its mode comes back with the
+    // metadata the sync gives every directory it touched).
+    at(dst, make_parent_writable(dst))?;
     let temporary = temporary_name(dst);
     let copied = copy_leaf(
         parent.as_raw_fd(),
@@ -1080,6 +1086,19 @@ fn mirror_io(root: &Path, rel: &Path, dst: &Path) -> std::result::Result<u64, Fa
     } else {
         0
     })
+}
+
+/// Let the owner create entries in the directory that holds `dst`.
+fn make_parent_writable(dst: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let mode = fs::metadata(parent)?.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(parent, fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    Ok(())
 }
 
 /// The directory `dst`, created owner-only unless it is one already (never a symlink to
@@ -1138,5 +1157,262 @@ mod tests {
         }
         discard(&partial);
         assert!(!partial.exists());
+    }
+
+    // ---------------------------------------------------------- the store's mirror
+
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// An attribute every filesystem under test accepts for regular users.
+    #[cfg(target_os = "macos")]
+    const ATTR: &str = "com.parhel.test";
+    #[cfg(target_os = "linux")]
+    const ATTR: &str = "user.parhel.test";
+
+    const NANOS: u32 = 123_456_789;
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn canon(dir: &tempfile::TempDir) -> PathBuf {
+        fs::canonicalize(dir.path()).unwrap()
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::new(secs, NANOS)))
+            .unwrap();
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mkfifo(path: &Path, mode: libc::mode_t) {
+        let c = cstr(path).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), mode) }, 0);
+    }
+
+    fn user_attr(path: &Path) -> Option<Vec<u8>> {
+        let file = File::open(path).unwrap();
+        xattr::get(file.as_raw_fd(), &CString::new(ATTR).unwrap()).ok()
+    }
+
+    fn set_user_attr(path: &Path, value: &[u8]) {
+        let c = cstr(path).unwrap();
+        xattr::set(&c, &CString::new(ATTR).unwrap(), value).unwrap();
+    }
+
+    // U-FS-24: `stat_entry` says what lstat says, as the sync compares it: kind, size,
+    // mtime to the nanosecond, permission bits, the target of a symlink.
+    #[test]
+    fn stat_entry_describes_what_lstat_says() {
+        let d = tmp();
+        let root = canon(&d);
+        fs::write(root.join("file"), b"12345").unwrap();
+        set_mode(&root.join("file"), 0o640);
+        set_mtime(&root.join("file"), 1_600_000_000);
+        fs::create_dir(root.join("dir")).unwrap();
+        set_mode(&root.join("dir"), 0o750);
+        symlink("nowhere", root.join("dangling")).unwrap();
+        mkfifo(&root.join("fifo"), 0o600);
+
+        let file = stat_entry(&root, Path::new("file")).unwrap().unwrap();
+        assert_eq!(
+            file,
+            EntryMeta {
+                kind: EntryKind::File,
+                size: 5,
+                mtime_ns: 1_600_000_000 * 1_000_000_000 + i128::from(NANOS),
+                mode: 0o640,
+                link_target: None,
+            }
+        );
+        let dir = stat_entry(&root, Path::new("dir")).unwrap().unwrap();
+        assert_eq!((dir.kind, dir.mode, dir.size), (EntryKind::Dir, 0o750, 0));
+        let link = stat_entry(&root, Path::new("dangling")).unwrap().unwrap();
+        assert_eq!(link.kind, EntryKind::Symlink);
+        assert_eq!(link.link_target, Some(PathBuf::from("nowhere")));
+        let fifo = stat_entry(&root, Path::new("fifo")).unwrap().unwrap();
+        assert_eq!(fifo.kind, EntryKind::Fifo);
+        // The root itself.
+        let top = stat_entry(&root, Path::new("")).unwrap().unwrap();
+        assert_eq!(top.kind, EntryKind::Dir);
+    }
+
+    // U-FS-24b: what is not there, or not part of a worktree, is `None`; a directory
+    // that was swapped for a symlink is an error, never a way out of the root.
+    #[test]
+    fn stat_entry_of_the_absent_and_the_swapped() {
+        let d = tmp();
+        let root = canon(&d);
+        fs::write(root.join("file"), b"x").unwrap();
+        let outside = tmp();
+        fs::write(outside.path().join("secret"), b"x").unwrap();
+        symlink(outside.path(), root.join("swapped")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+
+        assert_eq!(stat_entry(&root, Path::new("absent")).unwrap(), None);
+        assert_eq!(stat_entry(&root, Path::new("absent/deeper")).unwrap(), None);
+        assert_eq!(stat_entry(&root, Path::new("file/deeper")).unwrap(), None);
+        assert_eq!(
+            stat_entry(&root.join("nowhere"), Path::new("")).unwrap(),
+            None
+        );
+        assert_eq!(stat_entry(&root, Path::new("sock")).unwrap(), None);
+        // Linux refuses the component (an error), macOS calls it not a directory
+        // (absent): never the file behind the link.
+        assert!(
+            !matches!(stat_entry(&root, Path::new("swapped/secret")), Ok(Some(_))),
+            "followed a symlink out of the root"
+        );
+    }
+
+    // U-FS-25: a mirrored file is a full copy of the source's with its metadata: data,
+    // mode (read-only too), mtime to the nanosecond, user attributes. It arrives under
+    // a temporary name and replaces what was there in one rename: nothing else is left.
+    #[test]
+    fn mirror_copies_a_file_with_its_metadata_and_replaces_in_one_step() {
+        let d = tmp();
+        let (src, dst) = (canon(&d).join("src"), canon(&d).join("dst"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("f"), b"first version").unwrap();
+        set_user_attr(&src.join("f"), b"tagged");
+        set_mode(&src.join("f"), 0o444);
+        set_mtime(&src.join("f"), 1_600_000_000);
+
+        assert_eq!(mirror(&src, Path::new("f"), &dst.join("f")).unwrap(), 13);
+        let (s, t) = (
+            fs::metadata(src.join("f")).unwrap(),
+            fs::metadata(dst.join("f")).unwrap(),
+        );
+        assert_eq!(fs::read(dst.join("f")).unwrap(), b"first version");
+        assert_eq!(t.mode() & 0o7777, 0o444);
+        assert_eq!((t.mtime(), t.mtime_nsec()), (s.mtime(), s.mtime_nsec()));
+        assert_eq!(user_attr(&dst.join("f")), Some(b"tagged".to_vec()));
+        assert_ne!(
+            (s.dev(), s.ino()),
+            (t.dev(), t.ino()),
+            "a copy, not the same file"
+        );
+
+        // A new version replaces the read-only copy.
+        set_mode(&src.join("f"), 0o644);
+        fs::write(src.join("f"), b"second").unwrap();
+        set_mtime(&src.join("f"), 1_700_000_000);
+        assert_eq!(mirror(&src, Path::new("f"), &dst.join("f")).unwrap(), 6);
+        assert_eq!(fs::read(dst.join("f")).unwrap(), b"second");
+        assert_eq!(fs::metadata(dst.join("f")).unwrap().mode() & 0o7777, 0o644);
+        let names: Vec<_> = fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("f")],
+            "no temporary left"
+        );
+    }
+
+    // U-FS-26: symlinks (dangling, absolute) are recreated and never followed, FIFOs are
+    // made again, a directory is made owner-only so it can be filled, and its own mode
+    // and times come last with `mirror_dir_meta`.
+    #[test]
+    fn mirror_recreates_links_and_fifos_and_finishes_directories_last() {
+        let d = tmp();
+        let (src, dst) = (canon(&d).join("src"), canon(&d).join("dst"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        symlink("/etc/hostname", src.join("abs")).unwrap();
+        symlink("nowhere", src.join("dangling")).unwrap();
+        mkfifo(&src.join("fifo"), 0o640);
+        fs::create_dir(src.join("sub")).unwrap();
+        set_user_attr(&src.join("sub"), b"dir");
+        set_mode(&src.join("sub"), 0o555);
+        set_mtime(&src.join("sub"), 1_500_000_000);
+
+        for name in ["abs", "dangling", "fifo", "sub"] {
+            assert_eq!(mirror(&src, Path::new(name), &dst.join(name)).unwrap(), 0);
+        }
+        assert_eq!(
+            fs::read_link(dst.join("abs")).unwrap(),
+            Path::new("/etc/hostname")
+        );
+        assert_eq!(
+            fs::read_link(dst.join("dangling")).unwrap(),
+            Path::new("nowhere")
+        );
+        let fifo = fs::symlink_metadata(dst.join("fifo")).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&fifo.file_type()));
+        assert_eq!(fifo.mode() & 0o7777, 0o640);
+        // Owner-only until finished: it can still take entries.
+        assert_eq!(
+            fs::metadata(dst.join("sub")).unwrap().mode() & 0o7777,
+            0o700
+        );
+        // An existing directory is left alone; a symlink in its place is not followed.
+        mirror(&src, Path::new("sub"), &dst.join("sub")).unwrap();
+        let bad = mirror(&src, Path::new("sub"), &dst.join("abs")).unwrap_err();
+        assert_eq!(bad.code, ErrorCode::CloneFailed, "{bad}");
+
+        fs::write(dst.join("sub/child"), b"x").unwrap();
+        mirror_dir_meta(&src, Path::new("sub"), &dst.join("sub")).unwrap();
+        let sub = fs::metadata(dst.join("sub")).unwrap();
+        assert_eq!(sub.mode() & 0o7777, 0o555);
+        assert_eq!(
+            (sub.mtime(), sub.mtime_nsec()),
+            (1_500_000_000, i64::from(NANOS))
+        );
+        assert_eq!(user_attr(&dst.join("sub")), Some(b"dir".to_vec()));
+
+        // A directory that is now read-only still takes the next change.
+        fs::write(src.join("sub2"), b"y").unwrap();
+        mirror(&src, Path::new("sub2"), &dst.join("sub/new")).unwrap();
+        assert_eq!(fs::read(dst.join("sub/new")).unwrap(), b"y");
+        set_mode(&dst.join("sub"), 0o755);
+    }
+
+    // U-FS-27: a mirror that cannot be made says which entry and leaves nothing: no
+    // temporary file, nothing replaced.
+    #[test]
+    fn mirror_failures_name_the_entry_and_leave_nothing() {
+        let d = tmp();
+        let (src, dst) = (canon(&d).join("src"), canon(&d).join("dst"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("f"), b"x").unwrap();
+
+        let gone = mirror(&src, Path::new("absent"), &dst.join("absent")).unwrap_err();
+        assert_eq!(gone.code, ErrorCode::CloneFailed);
+        assert!(gone.message.contains("absent"), "{gone}");
+
+        // A directory where a file belongs: the caller removes it first, we refuse.
+        fs::create_dir(dst.join("f")).unwrap();
+        let clash = mirror(&src, Path::new("f"), &dst.join("f")).unwrap_err();
+        assert_eq!(clash.code, ErrorCode::CloneFailed, "{clash}");
+        assert!(dst.join("f").is_dir());
+
+        let nowhere = mirror(&src, Path::new("f"), &dst.join("missing/f")).unwrap_err();
+        assert_eq!(nowhere.code, ErrorCode::CloneFailed, "{nowhere}");
+
+        // A directory of the path swapped for a symlink out of the source.
+        let outside = tmp();
+        fs::write(outside.path().join("f"), b"secret").unwrap();
+        symlink(outside.path(), src.join("swapped")).unwrap();
+        let swapped = mirror(&src, Path::new("swapped/f"), &dst.join("copy")).unwrap_err();
+        assert!(swapped.message.contains("changed"), "{swapped}");
+        assert!(!dst.join("copy").exists());
+
+        let mut left: Vec<_> = fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("f")]);
     }
 }

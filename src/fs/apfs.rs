@@ -229,6 +229,10 @@ impl CowFs for ApfsFs {
         unix::append_file(path, bytes, full_sync)
     }
 
+    fn flush(&self, path: &Path) -> Result<()> {
+        unix::flush(path)
+    }
+
     fn is_writable(&self, path: &Path) -> Result<bool> {
         unix::is_writable(path)
     }

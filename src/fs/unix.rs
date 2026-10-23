@@ -401,6 +401,26 @@ pub(crate) fn append_file(
     sync(&file).map_err(|e| io_error(path, &e))
 }
 
+/// Flush the filesystem holding `path`: `syncfs` where it exists, else `sync`. A write
+/// error the kernel kept for later (full disk, I/O error) is returned here.
+pub(crate) fn flush(path: &Path) -> Result<()> {
+    let dir = File::open(path).map_err(|e| io_error(path, &e))?;
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: valid open descriptor.
+        if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+            return Err(io_error(path, &io::Error::last_os_error()));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        drop(dir);
+        // SAFETY: no arguments.
+        unsafe { libc::sync() };
+    }
+    Ok(())
+}
+
 /// Whether the current user can create entries in the directory `path`.
 pub(crate) fn is_writable(path: &Path) -> Result<bool> {
     let c = c_path(path)?;
@@ -623,5 +643,106 @@ mod tests {
             vec![(PathBuf::from("a/abs"), PathBuf::from("/w/src/lib"))]
         );
         assert_eq!(scan.unreadable, 0);
+    }
+
+    // U-FS-28: the symlink at the destination is created or refused, never replaced
+    // (even a dangling one, or a directory), and read back exactly.
+    #[test]
+    fn symlink_exclusive_never_replaces_anything() {
+        let d = tmp();
+        let root = canon(&d);
+        symlink_exclusive(Path::new("/target"), &root.join("link")).unwrap();
+        assert_eq!(
+            read_link(&root.join("link")).unwrap(),
+            Some(PathBuf::from("/target"))
+        );
+        symlink("nowhere", root.join("dangling")).unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("file"), b"x").unwrap();
+        for name in ["link", "dangling", "dir", "file"] {
+            let err = symlink_exclusive(Path::new("/other"), &root.join(name)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::DestExists, "{name}: {err}");
+        }
+        assert_eq!(
+            read_link(&root.join("dangling")).unwrap(),
+            Some(PathBuf::from("nowhere")),
+            "untouched"
+        );
+        assert!(root.join("dir").is_dir() && root.join("file").is_file());
+        let missing = symlink_exclusive(Path::new("/t"), &root.join("no/parent")).unwrap_err();
+        assert_eq!(missing.code, ErrorCode::Io);
+    }
+
+    // U-FS-28b: `read_link` of what is not a symlink is `None`, not an error.
+    #[test]
+    fn read_link_of_what_is_not_a_symlink_is_none() {
+        let d = tmp();
+        let root = canon(&d);
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("file"), b"x").unwrap();
+        for name in ["dir", "file", "absent", "file/below"] {
+            assert_eq!(read_link(&root.join(name)).unwrap(), None, "{name}");
+        }
+    }
+
+    // U-FS-29: the registry grows by whole lines, created on first use.
+    #[test]
+    fn append_file_creates_then_appends() {
+        let d = tmp();
+        let path = canon(&d).join("links");
+        append_file(&path, b"a\tb\n", File::sync_all).unwrap();
+        append_file(&path, b"c\td\n", File::sync_all).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"a\tb\nc\td\n");
+        let err = append_file(&canon(&d).join("no/dir/links"), b"x", File::sync_all).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+    }
+
+    // U-FS-30: a store must be writable by the user; a read-only directory is not.
+    #[test]
+    fn is_writable_follows_the_directory_mode() {
+        let d = tmp();
+        let root = canon(&d);
+        fs::create_dir(root.join("open")).unwrap();
+        fs::create_dir(root.join("shut")).unwrap();
+        fs::set_permissions(root.join("shut"), fs::Permissions::from_mode(0o555)).unwrap();
+        let (open, shut) = (
+            is_writable(&root.join("open")),
+            is_writable(&root.join("shut")),
+        );
+        fs::set_permissions(root.join("shut"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(open.unwrap());
+        // root writes anywhere: the check means nothing for it.
+        // SAFETY: no arguments.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!shut.unwrap());
+        }
+        assert!(!is_writable(&root.join("absent")).unwrap());
+    }
+
+    // U-FS-31: space is measured on the nearest directory the user can search, so the
+    // root-owned directory of the image can be asked about, and free never exceeds total.
+    #[test]
+    fn space_falls_back_to_a_searchable_ancestor() {
+        let d = tmp();
+        let root = canon(&d);
+        let here = space(&root).unwrap();
+        assert!(here.total > 0 && here.free <= here.total, "{here:?}");
+        fs::create_dir(root.join("locked")).unwrap();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let below = space(&root.join("locked/child"));
+        let missing = space(&root.join("never/created"));
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(below.unwrap().total, here.total);
+        assert_eq!(missing.unwrap().total, here.total);
+    }
+
+    // U-FS-32: a flush succeeds on a directory and fails, naming it, on a missing one.
+    #[test]
+    fn flush_reports_what_it_cannot_reach() {
+        let d = tmp();
+        flush(&canon(&d)).unwrap();
+        let err = flush(&canon(&d).join("absent")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("absent"), "{err}");
     }
 }

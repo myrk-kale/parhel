@@ -327,6 +327,10 @@ impl CowFs for LinuxFs {
         unix::append_file(path, bytes, sync_file)
     }
 
+    fn flush(&self, path: &Path) -> Result<()> {
+        unix::flush(path)
+    }
+
     fn is_writable(&self, path: &Path) -> Result<bool> {
         unix::is_writable(path)
     }

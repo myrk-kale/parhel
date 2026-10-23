@@ -478,33 +478,51 @@ fn store_transaction(
         }
     }
     let baseline_lock = lock_baseline(env, &baseline_dir.join("lock"))?;
-    // Names the repository the baseline mirrors, for `doctor`, before the first write
-    // into it. A newline cannot be in the path of a source worktree line-by-line, but
-    // the value is the rest of its line: nothing to escape.
-    fs.write_file(
-        &baseline_dir.join("meta"),
-        format!(
-            "source={}\nsynced={}\n",
-            repo.toplevel.display(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs())
-        )
-        .as_bytes(),
-    )?;
     let baseline = baseline_dir.join("tree");
+    let meta_path = baseline_dir.join("meta");
+    // A sync that died without cleaning up (power loss, SIGKILL) may have left files
+    // whose metadata is right and whose data never reached the disk, and the sync only
+    // compares metadata: that baseline is not trusted, it is made again.
+    if baseline_unfinished(fs, &meta_path) {
+        fs.remove_dir_all(&baseline)?;
+    }
+    // Names the repository the baseline mirrors, for `doctor`, before the first write
+    // into it, and says that the baseline is being written.
+    let write_meta = |state: &str| {
+        let synced = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        fs.write_file(
+            &meta_path,
+            format!(
+                "source={}\nsynced={synced}\nstate={state}\n",
+                repo.toplevel.display()
+            )
+            .as_bytes(),
+        )
+    };
+    write_meta("syncing")?;
     if let Some(bytes) = first_sync_size(env.fs, &repo.toplevel, &baseline, &exclusions)? {
         if let Some(notice) = first_sync_notice(bytes) {
             eprintln!("parhel: {notice}");
         }
     }
-    sync_baseline(
+    let synced = sync_baseline(
         env.fs,
         &repo.toplevel,
         &baseline,
         &exclusions,
         env.interrupted,
-    )?;
+    );
+    // Whatever the sync did is on disk (or reported as failed: a full disk can show only
+    // here) before the baseline is called finished. A stopped sync is finished too: it
+    // leaves whole files only, and the next one completes it.
+    let flushed = fs.flush(&baseline_dir);
+    if flushed.is_ok() {
+        write_meta("synced")?;
+    }
+    synced?;
+    flushed?;
     crate::failpoint!("after_sync");
     check_interrupt(env)?;
 
@@ -517,6 +535,14 @@ fn store_transaction(
         exclusions,
     };
     transaction(env, request, plan, Some((&route, baseline_lock)))
+}
+
+/// Whether the baseline's `meta` says that a sync began and never reported its end.
+fn baseline_unfinished(fs: &dyn CowFs, meta_path: &Path) -> bool {
+    fs.read_file(meta_path).is_ok_and(|meta| {
+        meta.split(|&b| b == b'\n')
+            .any(|line| line == b"state=syncing")
+    })
 }
 
 /// The registry of links is `path TAB target NEWLINE`: refuse (before anything is
@@ -3667,6 +3693,163 @@ mod tests {
         assert_eq!(
             w.count(|c| *c == Call::Lock(p(&format!("{BASELINE_DIR}/lock")))),
             2
+        );
+    }
+
+    // U-STO-22c: the message of a store that cannot be used names `git parhel doctor`
+    // and `systemctl status`, with the mount unit when the marker still says which.
+    #[rstest]
+    #[case::unit_known(|w: &World| { w.unwritable.borrow_mut().insert(p("/store")); }, true)]
+    #[case::unit_unknown(|w: &World| { w.files.borrow_mut().remove(&p("/store/.parhel-store")); }, false)]
+    fn unavailable_store_message_names_the_way_to_look(
+        #[case] break_it: fn(&World),
+        #[case] unit_known: bool,
+    ) {
+        let w = store_world();
+        break_it(&w);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable);
+        for needle in ["git parhel doctor", "systemctl status", "/store"] {
+            assert!(
+                err.message.contains(needle),
+                "lacks `{needle}`: {}",
+                err.message
+            );
+        }
+        assert_eq!(
+            err.message.contains("parhel-alice.mount"),
+            unit_known,
+            "{}",
+            err.message
+        );
+    }
+
+    // U-STO-85: a baseline whose last sync never reported its end (power loss, SIGKILL)
+    // may hold files with the right metadata and no data: it is made again, not trusted.
+    // One that finished, or that was stopped and said so, is only brought up to date.
+    #[rstest]
+    #[case::died_syncing("state=syncing\n", true)]
+    #[case::finished("state=synced\n", false)]
+    #[case::no_state("", false)]
+    fn an_unfinished_baseline_is_rebuilt(#[case] state: &str, #[case] rebuilt: bool) {
+        let w = store_world();
+        w.put_dir(&baseline());
+        w.files.borrow_mut().insert(
+            p(&format!("{BASELINE_DIR}/meta")),
+            format!("source=/w/repo\n{state}").into_bytes(),
+        );
+        run_store(&w, &new_branch()).unwrap();
+        let removed = w.count(|c| *c == Call::RemoveDirAll(baseline()));
+        assert_eq!(removed, usize::from(rebuilt), "{:#?}", w.calls());
+        if rebuilt {
+            let wiped = w
+                .position(|c| *c == Call::RemoveDirAll(baseline()))
+                .unwrap();
+            let first = w.position(|c| matches!(c, Call::Mirror { .. })).unwrap();
+            assert!(wiped < first, "before the first copy");
+        }
+        let meta = w.files.borrow()[&p(&format!("{BASELINE_DIR}/meta"))].clone();
+        assert!(String::from_utf8(meta).unwrap().contains("state=synced"));
+    }
+
+    // U-STO-86: the sync is flushed to disk before the baseline counts as finished, and
+    // a flush that fails (a full disk shows itself only here) fails the run with that
+    // message, publishes nothing, and leaves the baseline marked unfinished.
+    #[test]
+    fn a_failed_flush_fails_the_run_and_leaves_the_baseline_unfinished() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        assert_eq!(w.flushes.get(), 1, "flushed once, before the clone");
+
+        let w = store_world();
+        w.fail_flush.set(true);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("No space left"), "{}", err.message);
+        assert_eq!(
+            w.count(|c| matches!(c, Call::CreateStaging { .. } | Call::Symlink { .. })),
+            0
+        );
+        let meta = w.files.borrow()[&p(&format!("{BASELINE_DIR}/meta"))].clone();
+        assert!(String::from_utf8(meta).unwrap().contains("state=syncing"));
+        assert_store_run_undone(&w, None);
+    }
+
+    // U-STO-87: the disk of the store fills up while mirroring or while cloning: the
+    // run fails with the system's words, and nothing of it remains.
+    #[rstest]
+    #[case::while_mirroring(Step::Mirror)]
+    #[case::while_cloning(Step::Clone)]
+    #[case::while_writing_the_registry(Step::Append)]
+    fn a_full_store_rolls_back_cleanly(#[case] step: Step) {
+        let w = store_world().failing(step, ErrorCode::Io);
+        *w.fail_message.borrow_mut() = "No space left on device (os error 28)".into();
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("No space left"), "{}", err.message);
+        assert_store_run_undone(&w, Some("feat"));
+    }
+
+    // U-STO-88: a path the registry (tab separated lines) could not hold is refused
+    // before anything is created in the store; the same name is fine where no registry
+    // is involved.
+    #[rstest]
+    #[case::tab("../fe\tat")]
+    #[case::newline("../fe\nat")]
+    fn destinations_the_registry_cannot_hold_are_refused(#[case] destination: &str) {
+        let w = store_world();
+        let req = AddRequest {
+            destination: p(destination),
+            ..new_branch()
+        };
+        let err = run_store(&w, &req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage, "{err}");
+        assert!(err.message.contains("tab or a newline"), "{}", err.message);
+        assert_no_mutation(&w);
+
+        // Copy-on-write in place has no registry.
+        let w = World {
+            volumes: vec![(p("/"), btrfs(3))],
+            ..World::default()
+        };
+        assert_eq!(run(&w, &req).unwrap().strategy, Strategy::CopyOnWrite);
+    }
+
+    // U-STO-89: a symlink the registry knows inside the source (a worktree requested
+    // there) is not mirrored, so no later worktree is born with a link to a sibling.
+    #[test]
+    fn registered_links_inside_the_source_are_not_mirrored() {
+        let w = store_world();
+        w.put_dir(&p("/w/repo/.worktrees"));
+        w.put_link(&p("/w/repo/.worktrees/old"), &real("old"));
+        w.put_link(&p("/w/repo/.worktrees/unrelated"), &p("/elsewhere"));
+        w.files.borrow_mut().insert(
+            p("/store/links"),
+            format!(
+                "/w/repo/.worktrees/old\t{}\n/w/repo/.worktrees/unrelated\t{}\n",
+                real("old").display(),
+                real("other").display()
+            )
+            .into_bytes(),
+        );
+        run_store(&w, &new_branch()).unwrap();
+        let mirrored: Vec<_> = w
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Mirror { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !mirrored.contains(&baseline().join(".worktrees/old")),
+            "{mirrored:?}"
+        );
+        // The registry is a record, not a license: a link that no longer points where it
+        // was registered is the user's, and is mirrored like any other.
+        assert!(
+            mirrored.contains(&baseline().join(".worktrees/unrelated")),
+            "{mirrored:?}"
         );
     }
 }
