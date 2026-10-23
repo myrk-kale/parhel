@@ -352,6 +352,24 @@ impl TestRepo {
             .collect()
     }
 
+    /// Why `worktree` is locked, `None` when it is not: read from the lock file in its admin
+    /// directory, because `git worktree list --porcelain` only says so since git 2.31.
+    pub fn lock_reason(&self, worktree: &Path) -> Option<String> {
+        let wanted = worktree.join(".git");
+        for entry in fs::read_dir(self.common_dir().join("worktrees"))
+            .ok()?
+            .flatten()
+        {
+            let gitdir = fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            if Path::new(gitdir.trim_end()) == wanted {
+                return fs::read_to_string(entry.path().join("locked"))
+                    .ok()
+                    .map(|reason| reason.trim_end().to_owned());
+            }
+        }
+        None
+    }
+
     // Without `--path-format=absolute` (git 2.31): the suite also runs on git 2.29.
     pub fn common_dir(&self) -> PathBuf {
         let p = PathBuf::from(self.git(&["rev-parse", "--git-common-dir"]));

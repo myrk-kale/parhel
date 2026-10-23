@@ -1524,12 +1524,10 @@ fn is39_pruning_while_the_store_is_down_keeps_the_registrations() {
     let dest = w.sb.path("wt");
     w.add_ok(&dest, "fa");
     let real = w.store.only_worktree();
-    let listed = w.src.git(&["worktree", "list", "--porcelain"]);
-    assert!(
-        listed
-            .lines()
-            .any(|l| l == format!("locked parhel store: {}", w.store.root.display())),
-        "published worktrees are locked, with the store named:\n{listed}"
+    assert_eq!(
+        w.src.lock_reason(&real).as_deref(),
+        Some(format!("parhel store: {}", w.store.root.display()).as_str()),
+        "published worktrees are locked, with the store named"
     );
     assert_eq!(registrations(&w.src).len(), 1);
 
