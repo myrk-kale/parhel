@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-23
+
 ### Added
 
 - Linux packages: a `.deb` (`parhel_<version>-1_amd64.deb`, `parhel_<version>-1_arm64.deb`)
