@@ -1255,3 +1255,51 @@ fn is36_an_unfinished_baseline_is_mirrored_again() {
     );
     assert!(fs::read_to_string(&meta).unwrap().contains("state=synced"));
 }
+
+// I-S37: a directory the source made read-only (a vendored tree, a Go module cache) is
+// mirrored with its mode, and a later change inside it still reaches the baseline: a new
+// subdirectory (`mkdir` in a 0555 directory is refused even for its owner), and a file
+// that became a directory.
+#[test]
+fn is37_changes_inside_a_read_only_directory_reach_the_baseline() {
+    let Some(w) = world() else { return };
+    let locked = w.src.path("target/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("file"), "f\n").unwrap();
+    fs::write(locked.join("was-a-file"), "w\n").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    let a = w.add_ok(&w.sb.path("a"), "fa");
+    let held = w.baseline("target/locked");
+    assert_eq!(fs::metadata(&held).unwrap().mode() & 0o7777, 0o555);
+
+    // The change, as its owner would make it: open the directory, change, close it.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir(locked.join("fresh")).unwrap();
+    fs::write(locked.join("fresh/inside"), "i\n").unwrap();
+    fs::remove_file(locked.join("was-a-file")).unwrap();
+    fs::create_dir(locked.join("was-a-file")).unwrap();
+    fs::write(locked.join("was-a-file/now"), "n\n").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = w.add(&w.sb.path("b"), "fb", &[]);
+    let restore = |path: &Path| {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+    };
+    restore(&locked);
+    restore(&held);
+    restore(&a.join("target/locked"));
+    assert_success(&out);
+    assert_eq!(
+        fs::read_to_string(held.join("fresh/inside")).unwrap(),
+        "i\n"
+    );
+    assert_eq!(
+        fs::read_to_string(held.join("was-a-file/now")).unwrap(),
+        "n\n"
+    );
+    let b = fs::canonicalize(w.sb.path("b")).unwrap();
+    assert_eq!(
+        fs::read_to_string(b.join("target/locked/fresh/inside")).unwrap(),
+        "i\n"
+    );
+}
