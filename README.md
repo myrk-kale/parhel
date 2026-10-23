@@ -71,10 +71,10 @@ You need git 2.29 or newer and one of these:
 
 - macOS on an APFS volume (the default since macOS 10.13). The git that ships
   with Xcode's command line tools works.
-- Linux on a filesystem that can reflink: Btrfs, XFS created with reflink
-  support (the default since xfsprogs 5.1), bcachefs, or ZFS 2.2 and newer.
-  On any other filesystem, `--copy` and `--fallback` still work; see
-  [Platform support](#platform-support).
+- Linux on a filesystem that can reflink: Btrfs or XFS created with reflink
+  support (the default since xfsprogs 5.1). bcachefs and ZFS 2.2 and newer
+  should work too, but parhel is not tested on them. On any other filesystem,
+  `--copy` and `--fallback` still work; see [Platform support](#platform-support).
 
 With Homebrew (macOS, and Linux with [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux)):
 
@@ -302,16 +302,26 @@ install script both install.
 | Platform | Status | Mechanism |
 |---|---|---|
 | macOS, APFS | Supported | `clonefile(2)` |
-| Linux: Btrfs, XFS with reflink, bcachefs, ZFS 2.2+ | Supported | reflink copies (`ioctl(FICLONE)`) per file |
+| Linux: Btrfs, XFS with reflink | Supported, tested | reflink copies (`ioctl(FICLONE)`) per file |
+| Linux: bcachefs, ZFS 2.2+ | Expected to work, not tested | the same reflinks; found by the same probe |
 | Linux: other filesystems (ext4, tmpfs, NFS...) | `--copy` or `--fallback` | full copies, or a regular worktree |
 | Windows | Planned | |
 
 parhel does not go by the filesystem's name. On Linux it asks the directory
 itself, with two anonymous temporary files and a reflink between them, so a
 mount that cannot reflink is detected even when its type usually can (an XFS
-created without `reflink=1`, for example). If that test cannot run, for example
-in a read-only directory, it falls back to the name: Btrfs and bcachefs count as
-copy-on-write, everything else does not.
+created without `reflink=1`, for example). When the source and the destination
+are on the same filesystem, the test runs in the destination's directory, which
+parhel has to write to anyway, so a read-only source directory does not matter.
+If a test cannot run at all, it falls back to the name: Btrfs and bcachefs count
+as copy-on-write, everything else does not.
+
+Two Btrfs subvolumes are one filesystem, and reflinks work between them, so
+`add` does not call them different volumes. A file marked NOCOW on Btrfs
+(`chattr +C`, usual for databases and VM images) cannot share its blocks with the
+copy-on-write file a clone creates. `add` then stops with `clone-failed`, names
+the file, and suggests `--copy` or listing it in `.parhelignore`; it never
+switches to a full copy by itself.
 
 When the source or the destination is on a filesystem without copy-on-write, or
 when they are on different volumes, `add` stops with `not-cow` or
@@ -329,6 +339,15 @@ recreated. Sockets and device files are skipped, as git does. Hard links inside
 the source become separate files in the copy. User extended attributes
 (`user.*`), modes, owners where permitted, and modification times to the
 nanosecond are kept, so build tools do not see every file as changed.
+
+POSIX ACLs (`setfacl`) are copied with the files, directories included. An
+entry created in a directory that has a default ACL inherits it, so parhel also
+removes what the source did not have: a file the source kept private does not
+become readable by a user named in the destination's default ACL. On macOS the
+extended ACLs (`chmod +a`) are kept the same way. There is one limit: macOS's
+`clonefile(2)` drops the ACLs of the entries inside a directory it clones, so
+parhel restores them only on the entries it clones one by one; use `--copy` when
+those ACLs matter.
 
 The code keeps filesystem access behind one interface (`CowFs` in
 `src/ports.rs`), so adding a platform means writing a new implementation of it
@@ -435,12 +454,18 @@ Other cases the tests cover:
 - Branch and ref names that start with `-` are rejected, and parhel passes all
   of your values to git after `--end-of-options`, so none of them can be read as
   an option.
-- Symlinks are copied as symlinks and never followed.
+- Symlinks are copied as symlinks and never followed, including when a
+  directory of the source is swapped for a symlink while the copy runs: the walk
+  opens each directory without following links, so that is an error and nothing
+  outside the source is copied. A file replaced by a FIFO meanwhile is refused
+  instead of waited for, and Ctrl-C stops a long copy at the next entry and rolls
+  back.
 - Cleaning up after a failure removes only what the run created. It never runs
   `git worktree prune`, which would also unregister other worktrees whose folders
   happen to be unreachable, such as one on an unmounted disk.
 - Directories parhel creates get the source's permissions, so a private source
-  does not produce a world-readable copy.
+  does not produce a world-readable copy. The worktree's root takes them last,
+  once it is in place, so a read-only source root works too.
 - With `--allow-dirty --submodules=reinit`, a submodule with uncommitted changes
   stops the command (`dirty-submodule`): reinit checks out the recorded commit,
   so those changes would not be in the copy.
@@ -551,7 +576,8 @@ usage errors and `128 + signal` when a signal interrupted the run.
 
 Less common codes: `not-a-repo`, `bare-repo`, `unborn-head`, `inside-git-dir`,
 `dest-is-source`, `dest-inside-git-dir`, `dest-inside-submodule`,
-`invalid-path`, `permission-denied`, `clone-failed` (also when a `--copy` fails),
+`invalid-path`, `permission-denied`, `clone-failed` (also when a `--copy` fails, or
+when a filesystem refuses to share one file's blocks),
 `interrupted`, `usage`,
 `io`.
 

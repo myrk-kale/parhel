@@ -27,7 +27,9 @@ fn ip01_formula_renderer_validates_the_version() {
             "{good} is in the formula"
         );
     }
-    for bad in ["", "v1.0.0", "1.0/../x", "1&2", "1;rm", "1 2", "1.0\n2.0", ".", "-1"] {
+    for bad in [
+        "", "v1.0.0", "1.0/../x", "1&2", "1;rm", "1 2", "1.0\n2.0", ".", "-1",
+    ] {
         let out = render(bad);
         assert_eq!(out.status.code(), Some(1), "{bad:?} must be refused");
         assert!(out.stdout.is_empty(), "{bad:?} printed a formula");

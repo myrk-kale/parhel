@@ -67,10 +67,10 @@ in `add_linux.rs` and the FIEMAP proof on Linux).
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
 | U-ENV-01…05 | Child `git` env sanitization, locale, cwd/args, error mapping, `GIT_OPTIONAL_LOCKS=0` | `src/git/runner.rs` |
-| U-FS-01…22 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check, parallel relocation scan; U-FS-21/22: the copy flavour (`--copy`) | `src/fs/apfs.rs` (macOS-only: U-FS-01…08, 12, 13, 17, 18, 21, 22) and `src/fs/unix.rs` (shared by Unix adapters: U-FS-09…11, 14…16, 19, 20) |
-| U-LFS-01…42 | Linux adapter on real btrfs / XFS / ext4 mounts (env `PARHEL_TEST_*`, skip-or-fail rule above): `volume` (`cow` from a probe, `fs_type` names, no leftovers from the probe, read-only dirs, unknown fs by magic number), `rename_exclusive` (`RENAME_NOREPLACE`: file, dir, empty dir, dangling symlink, 8 racers), `clone_entry` (contents, modes, symlinks never followed, empty dirs, FIFOs, sockets skipped, `user.*` xattrs, nanosecond file and directory mtimes, hard links separated, extents proven shared with FIEMAP, `cross-volume`, ext4 `clone-failed`, unreadable file named, read-only dirs), `copy_entry` (same tree, extents NOT shared even where `copy_file_range` would reflink, across volumes, sparse files, failures), `remove_dir_all` of read-only dirs, `write_file`, and the shared helpers being wired | `src/fs/linux.rs` (Linux-only) |
+| U-FS-01…23 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check, parallel relocation scan; U-FS-21/22: the copy flavour (`--copy`); U-FS-23: a partial copy is discarded even with read-only directories and immutable leftovers | `src/fs/apfs.rs` (macOS-only: U-FS-01…08, 12, 13, 17, 18, 21, 22), `src/fs/unix.rs` (shared by Unix adapters: U-FS-09…11, 14…16, 19, 20) and `src/fs/tree.rs` (U-FS-23) |
+| U-LFS-01…44 | Linux adapter on real btrfs / XFS / ext4 mounts (env `PARHEL_TEST_*`, skip-or-fail rule above): `volume` (`cow` from a probe, `fs_type` names, no leftovers from the probe, read-only dirs, unknown fs by magic number), `rename_exclusive` (`RENAME_NOREPLACE`: file, dir, empty dir, dangling symlink, 8 racers), `clone_entry` (contents, modes, symlinks never followed, empty dirs, FIFOs, sockets skipped, `user.*` xattrs, nanosecond file and directory mtimes, hard links separated, extents proven shared with FIEMAP, `cross-volume`, ext4 `clone-failed`, unreadable file named, read-only dirs), `copy_entry` (same tree, extents NOT shared even where `copy_file_range` would reflink, across volumes, sparse files, failures), `remove_dir_all` of read-only dirs, `write_file`, and the shared helpers being wired; U-LFS-43: filesystem identity (one per filesystem, shared by btrfs subvolumes, different between filesystems); U-LFS-44: a missing `RENAME_NOREPLACE` is explained | `src/fs/linux.rs` (Linux-only) |
 | U-RB-01…12, P1 (U-RB-10…12: a branch is deleted only while it still points at its start commit; U-RB-06: fallback removes only its own registration, never `worktree prune`) | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
-| U-TXN-01…91 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination (U-TXN-60 refused on macOS only; U-TXN-60b accepted on Linux unless it would name the implicit branch), publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs (U-TXN-72; U-TXN-91: applied after the directory's contents, deepest first, so a read-only source directory can be filled), dirty submodules with reinit; U-TXN-80…91: `--copy` (no copy-on-write requirement, cross-volume allowed, copies even where cloning works, the same call sequence as the clone transaction with every `Clone` replaced by `Copy` for nested worktrees, nested destination, `.parhelignore`, submodules, symlink ancestors and relocation, rollback at each step and mid-copy, SIGINT, `--copy` + `--fallback` is a usage error, no other refusal weakened, the refusal for a missing copy-on-write names both `--copy` and `--fallback` without mentioning APFS) | `src/app/add.rs` |
+| U-TXN-01…94 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination (U-TXN-60 refused on macOS only; U-TXN-60b accepted on Linux unless it would name the implicit branch), publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs (U-TXN-72; U-TXN-91: applied after the directory's contents, deepest first, so a read-only source directory can be filled), dirty submodules with reinit; U-TXN-80…91: `--copy` (no copy-on-write requirement, cross-volume allowed, copies even where cloning works, the same call sequence as the clone transaction with every `Clone` replaced by `Copy` for nested worktrees, nested destination, `.parhelignore`, submodules, symlink ancestors and relocation, rollback at each step and mid-copy, SIGINT, `--copy` + `--fallback` is a usage error, no other refusal weakened, the refusal for a missing copy-on-write names both `--copy` and `--fallback` without mentioning APFS); U-TXN-92/93: on one filesystem the destination's probe decides, devices of one filesystem (btrfs subvolumes) are not `cross-volume` while distinct filesystems are; U-TXN-94: the worktree's root takes the source's mode only after publishing and repair | `src/app/add.rs` |
 | U-DOC-01…19 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
 
 ## Integration tests (`tests/*.rs`, real `git`, real APFS or btrfs/XFS)
@@ -256,6 +256,7 @@ or untouched.
 | I-155 | Binaries mentioning the source are reported, not edited |
 | I-156 | `--no-relocate` copies as is |
 | I-157 | Read-only files are relocated and stay read-only |
+| I-160 | A symlink to rewrite and a foreign gitfile to detach inside read-only directories: done, directory modes restored |
 | I-158 | `.parhelignore` keeps untracked paths out; tracked files always present |
 | I-159 | A linked worktree of another repository inside an ignored folder is detached in the copy |
 | I-159b | A nested repo with `--separate-git-dir` in the source follows the copy (commits in the copy never move the source's) |
@@ -315,8 +316,34 @@ registrations must be identical after the run.
 | I-L41 | An empty directory created at the destination during assembly is not replaced (`RENAME_NOREPLACE`), reflink and copy |
 | I-L42 | Chained worktrees keep sharing |
 | I-L43 | Destination on tmpfs: `not-cow` without `--copy`, success with it |
+| I-L44 | POSIX ACLs (access and default; files, walked directories, directories created for `.parhelignore`, the worktree root) are copied exactly: btrfs and XFS reflink and copy, ext4 copy |
+| I-L45 | A default ACL on the destination directory does not leak into the copies (no named-user access the source never had) |
+| I-L46 | A read-only (0555) source top directory on XFS still clones, `doctor` stays quiet |
+| I-L47 | Two btrfs subvolumes (different `st_dev`) share storage: not `cross-volume` |
+| I-L48 | A NOCOW file (`chattr +C`) fails with `clone-failed` naming the file and offering `--copy` / `.parhelignore`; `--copy` works |
 
 The platform-neutral suites (`add_race.rs`, `add_rollback.rs`, `doctor.rs`, `blast_radius.rs`, ...) run unchanged on Linux. Harness changes for portability: `Sandbox::drop` runs `chflags` only on macOS; `tests/common/volume.rs` gates `DiskImage` (hdiutil) to macOS and adds the env-var mounts (`test_mount`, with `resolve_mount` as its testable core); `tests/common/cow.rs` proves sharing with FIEMAP on Linux and names filesystems from `f_type`; extended attributes go through libc (`tests/common/xattr.rs`) instead of the `xattr` binary; I-23d and I-46 are written for both platforms.
+
+### Walk hardening — `tests/add_walk.rs` (macOS and Linux)
+The walk is frozen with the `walk_entry:<path>` failpoint (or `mid_clone`), the source is changed, the walk is released.
+
+| ID | Behavior |
+|---|---|
+| I-W01 | A directory swapped for a symlink to the outside while the walk is about to enter it → `clone-failed`, nothing from outside copied, no trace (copy; reflink too on Linux) |
+| I-W02 | The same for an ancestor of an exclusion between the plan and the clone, every mode |
+| I-W03 | A regular file swapped for a FIFO → `clone-failed` at once instead of blocking forever |
+| I-W04 | SIGINT while the walk is paused → exit 130, the walk goes no further, full rollback |
+
+### ACLs on macOS — `tests/add_acl.rs`
+| ID | Behavior |
+|---|---|
+| I-A01 | `--copy` gives every entry its source's ACL and none inherited from the destination directory |
+| I-A02 | A clone does so for the entries it clones itself (below a cloned directory `clonefile(2)` carries none, documented) |
+
+### Packaging — `tests/packaging.rs`
+| ID | Behavior |
+|---|---|
+| I-P01 | The Homebrew formula renderer accepts semver-like versions and refuses anything it would splice into `sed` |
 
 ### Harness self-tests — `tests/harness.rs`
 They must pass on both platforms (they prove the tools the product tests rely on). Linux additions: a `cp --reflink=always` copy is detected as shared on btrfs and XFS and a plain copy is not, one file is not "shared" with itself, ext4 never reports sharing, `$TMPDIR` is a reflink filesystem, the three mounts have the announced filesystem and distinct devices, and the skip-or-fail rule of the mount helper (missing variable skips unless required; required, empty or non-directory values fail).

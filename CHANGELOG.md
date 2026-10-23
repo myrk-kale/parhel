@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Relocation failed with `permission-denied` on a symlink to rewrite or a foreign
+  `.git` file to detach inside a read-only directory. The directory is now
+  unlocked around the change and gets its mode back.
 - A read-only source directory (for example mode 0555) that contained a nested
   worktree, a submodule or a `.parhelignore`d path made `add` fail with
   `Permission denied` while its other entries were cloned or copied: parhel
@@ -25,10 +28,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- Linux support. On Btrfs, XFS (with reflink), bcachefs and ZFS 2.2+, `add`
-  clones each file with `ioctl(FICLONE)` and publishes with
-  `renameat2(RENAME_NOREPLACE)`. Whether a directory can reflink is found by a
-  probe with two anonymous temporary files, not by the filesystem's name.
+- Linux support. On Btrfs and XFS (with reflink), `add` clones each file with
+  `ioctl(FICLONE)` and publishes with `renameat2(RENAME_NOREPLACE)`. Whether a
+  directory can reflink is found by a probe with two anonymous temporary files,
+  not by the filesystem's name, in the destination's directory when both are on
+  one filesystem. bcachefs and ZFS 2.2+ should work and are not tested. Btrfs
+  subvolumes of one filesystem are not treated as different volumes, and a NOCOW
+  file (`chattr +C`) fails with a message that names the file and offers `--copy`
+  or `.parhelignore`.
+- ACLs travel with the files: POSIX ACLs on Linux, extended ACLs (`chmod +a`) on
+  macOS, for `--copy` and for the entries a macOS clone makes itself
+  (`clonefile(2)` drops the ACLs inside the directories it clones). Entries do
+  not keep the ACLs they inherit from the destination directory, which could have
+  given a named user access the source never granted.
+- The walk over the source cannot be turned against the copy while it runs: it
+  descends through directory descriptors without following symlinks, refuses a
+  file swapped for a FIFO instead of blocking, and Ctrl-C stops a long copy at the
+  next entry and rolls back.
 - Linux release binaries: static musl builds for x86_64 and aarch64
   (`parhel-v<version>-<target>.tar.gz` with a `.sha256` file and a build
   provenance attestation, like the macOS archive). The install script picks the
