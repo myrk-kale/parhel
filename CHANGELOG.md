@@ -15,6 +15,14 @@ All notable changes to this project are documented here. The format follows
   filesystem adapter, not by comparing the filesystem's name. The refusal now
   names `--copy` and `--fallback` as the ways out.
 
+### Fixed
+
+- A read-only source directory (for example mode 0555) that contained a nested
+  worktree, a submodule or a `.parhelignore`d path made `add` fail with
+  `Permission denied` while its other entries were cloned or copied: parhel
+  applied the directory's mode before filling it. The modes of directories parhel
+  creates are now applied after their contents, deepest first.
+
 ### Added
 
 - Linux support. On Btrfs, XFS (with reflink), bcachefs and ZFS 2.2+, `add`
