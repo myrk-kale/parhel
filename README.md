@@ -48,10 +48,14 @@ something looks wrong, please
 
 ## Contents
 
-- [Install](#install)
-  - [Skill for AI coding agents](#skill-for-ai-coding-agents)
 - [Quick start](#quick-start)
-  - [Read this before you rely on it](#read-this-before-you-rely-on-it)
+- [Install](#install)
+  - [macOS](#macos)
+  - [Linux](#linux)
+  - [Check that git can find it](#check-that-git-can-find-it)
+  - [Verify a download](#verify-a-download)
+  - [Skill for AI coding agents](#skill-for-ai-coding-agents)
+- [Read this before you rely on it](#read-this-before-you-rely-on-it)
 - [Commands](#commands)
 - [Platform support](#platform-support)
 - [How it works](#how-it-works)
@@ -65,6 +69,43 @@ something looks wrong, please
 - [Development](#development)
 - [Credits](#credits)
 
+## Quick start
+
+Install it:
+
+```sh
+# macOS
+brew install myrk-kale/tap/parhel
+
+# Linux, any distribution
+curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
+```
+
+On Debian, Ubuntu, Fedora and similar distributions you can install a `.deb` or
+`.rpm` package instead; see [Linux](#linux). Then create your first worktree:
+
+```sh
+cd ~/code/my-app                       # any path inside your worktree
+
+# New branch, new worktree, dependencies and build output included:
+git parhel add ../my-app-login --new-branch feature/login
+
+cd ../my-app-login
+npm test                               # no `npm install` needed
+```
+
+When you are done with it, remove the worktree with git itself:
+
+```sh
+git worktree remove ../my-app-login
+```
+
+Before you rely on parhel, read
+[Read this before you rely on it](#read-this-before-you-rely-on-it): a copy
+shares your `.env` files with the original, and removing a worktree deletes its
+ignored files without asking. The other forms of `add` (existing branch,
+detached, another start commit) are under [Commands](#commands).
+
 ## Install
 
 You need git 2.29 or newer and one of these:
@@ -73,18 +114,20 @@ You need git 2.29 or newer and one of these:
   with Xcode's command line tools works.
 - Linux on a filesystem that can reflink: Btrfs or XFS created with reflink
   support (the default since xfsprogs 5.1). bcachefs and ZFS 2.2 and newer
-  should work too, but parhel is not tested on them. On any other filesystem,
-  `--copy` and `--fallback` still work; see [Platform support](#platform-support).
+  should work too, but parhel is not tested on them. On any other filesystem
+  (ext4, tmpfs, NFS...), `--copy` and `--fallback` still work; see
+  [Platform support](#platform-support).
 
-With Homebrew (macOS, and Linux with [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux)):
+### macOS
+
+With Homebrew:
 
 ```sh
 brew install myrk-kale/tap/parhel
 ```
 
-Without Homebrew, the install script picks the release archive for your system
-(macOS, or Linux on x86_64 or aarch64), puts the binary in `~/.local/bin` and
-checks its SHA-256 before installing:
+Without Homebrew, the install script picks the release archive for your system,
+puts the binary in `~/.local/bin` and checks its SHA-256 before installing:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
@@ -100,29 +143,103 @@ cargo install parhel
 cargo install --git https://github.com/myrk-kale/parhel
 ```
 
-Or download an archive from the
+Or download the archive from the
 [releases page](https://github.com/myrk-kale/parhel/releases), check it against
-its `.sha256` file and unpack it. Each archive holds `git-parhel`, the man pages,
-the license and the changelog:
+its `.sha256` file and unpack it. It holds `git-parhel`, the man pages, the
+license and the changelog:
 
 | System | Archive |
 | --- | --- |
 | macOS, Apple silicon and Intel | `parhel-v<version>-universal-apple-darwin.tar.gz` |
+
+### Linux
+
+The Linux binaries are statically linked (musl): they run on any distribution,
+glibc or not, and need nothing but `git`. Releases ship them as packages for
+Debian and Fedora families and as plain archives, for x86_64 and aarch64.
+
+The package file names contain the version, so there is no fixed
+`latest/download` link. This looks up the latest release:
+
+```sh
+version=$(curl -fsSL https://api.github.com/repos/myrk-kale/parhel/releases/latest \
+  | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+base="https://github.com/myrk-kale/parhel/releases/download/v${version}"
+```
+
+**Debian, Ubuntu and derivatives** (`.deb`), for amd64 and arm64:
+
+```sh
+deb="parhel_${version}_$(dpkg --print-architecture).deb"
+curl -fsSLO "${base}/${deb}"
+sudo apt install "./${deb}"
+```
+
+**Fedora, RHEL, openSUSE and derivatives** (`.rpm`), for x86_64 and aarch64.
+`dnf` installs from a URL directly:
+
+```sh
+sudo dnf install "${base}/parhel-${version}-1.$(uname -m).rpm"
+```
+
+`zypper` installs from a URL too, but it refuses an unsigned package unless you
+pass `--no-gpg-checks`: the packages are not GPG-signed (see
+[Verify a download](#verify-a-download)).
+
+```sh
+sudo zypper --no-gpg-checks install "${base}/parhel-${version}-1.$(uname -m).rpm"
+```
+
+The packages install `/usr/bin/git-parhel` and the man pages. They require `git`
+and recommend `btrfs-progs`, which a planned `setup` command will use to prepare
+a Btrfs volume; parhel does not call it today. Packages are attached to the
+releases after 0.3.0. A signed apt or dnf repository, so that
+`apt install parhel` works without downloading anything and the package manager
+updates parhel for you, does not exist yet. For now, upgrade by installing the
+newer package.
+
+**Homebrew**, with [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux):
+
+```sh
+brew install myrk-kale/tap/parhel
+```
+
+**Install script**, for any Linux on x86_64 or aarch64. It puts the binary in
+`~/.local/bin` and checks the archive's SHA-256 before installing:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
+```
+
+Set `PARHEL_VERSION=0.3.0` to install a specific version, or
+`PARHEL_INSTALL_DIR` to put the binary somewhere else.
+
+**Cargo** (Rust 1.85 or newer):
+
+```sh
+cargo install parhel
+cargo install --git https://github.com/myrk-kale/parhel
+```
+
+**Archives**, from the
+[releases page](https://github.com/myrk-kale/parhel/releases). Check one against
+its `.sha256` file and unpack it. It holds `git-parhel`, the man pages, the
+license and the changelog:
+
+| System | Archive |
+| --- | --- |
 | Linux, x86_64 | `parhel-v<version>-x86_64-unknown-linux-musl.tar.gz` |
 | Linux, aarch64 | `parhel-v<version>-aarch64-unknown-linux-musl.tar.gz` |
 
-The Linux binaries are statically linked (musl): they run on any distribution,
-glibc or not, and need nothing but `git`.
+**Which filesystem?** Copy-on-write works on Btrfs and on XFS with reflink,
+which is the default for XFS created with xfsprogs 5.1 or newer. Check with
+`git parhel doctor`: it reports `not-cow` for a worktree on a filesystem that
+cannot reflink. On ext4, tmpfs, NFS and the like, `git parhel add` stops with
+`not-cow` until you pass `--copy` (every file copied in full, slower and larger,
+but the same worktree) or `--fallback` (a plain `git worktree add`, without the
+ignored files). See [Platform support](#platform-support).
 
-Release binaries carry a signed build provenance attestation, so you can check
-that a download was built by this repository's release workflow from a given
-commit:
-
-```sh
-gh attestation verify parhel-v0.3.0-x86_64-unknown-linux-musl.tar.gz -R myrk-kale/parhel
-```
-
-Then check that git can find it:
+### Check that git can find it
 
 ```sh
 git parhel --version
@@ -130,6 +247,21 @@ git parhel --version
 
 Git runs any executable called `git-<name>` on your `PATH` as `git <name>`, so
 installing the `git-parhel` binary is all the setup there is.
+
+### Verify a download
+
+Release binaries, archives and packages carry a signed build provenance
+attestation, so you can check that a download was built by this repository's
+release workflow from a given commit:
+
+```sh
+gh attestation verify parhel-v0.3.0-x86_64-unknown-linux-musl.tar.gz -R myrk-kale/parhel
+gh attestation verify parhel_0.3.0_amd64.deb -R myrk-kale/parhel
+```
+
+Every file on the release page also has a `.sha256` file: `sha256sum -c
+<file>.sha256` (`shasum -a 256 -c` on macOS). The `.deb` and `.rpm` files are not
+signed with a GPG key, which is also why there is no package repository yet.
 
 ### Skill for AI coding agents
 
@@ -149,34 +281,7 @@ It uses the [skills](https://github.com/vercel-labs/skills) CLI, which asks
 which agents to install it for. The skill itself is
 [skills/parhel/SKILL.md](skills/parhel/SKILL.md).
 
-## Quick start
-
-```sh
-cd ~/code/my-app                       # any path inside your worktree
-
-# New branch, new worktree, dependencies and build output included:
-git parhel add ../my-app-login --new-branch feature/login
-
-cd ../my-app-login
-npm test                               # no `npm install` needed
-```
-
-Other common forms:
-
-```sh
-git parhel add ../hotfix --branch release/1.2      # existing branch
-git parhel add ../review --detach v1.4.0           # detached at a tag/commit
-git parhel add ../spike                            # new branch named "spike"
-git parhel add ../older --new-branch old-ui 3f2a9c1   # start from another commit
-```
-
-To get rid of a worktree, use git itself:
-
-```sh
-git worktree remove ../my-app-login
-```
-
-### Read this before you rely on it
+## Read this before you rely on it
 
 A copy shares more with your project than its files suggest.
 
@@ -217,6 +322,16 @@ A copy shares more with your project than its files suggest.
 Creates a worktree at `<destination>` and checks out `[ref]`, which defaults to
 the commit your current worktree is on. The parent directory of
 `<destination>` has to exist already.
+
+Common forms:
+
+```sh
+git parhel add ../my-app-login --new-branch feature/login   # new branch
+git parhel add ../hotfix --branch release/1.2      # existing branch
+git parhel add ../review --detach v1.4.0           # detached at a tag/commit
+git parhel add ../spike                            # new branch named "spike"
+git parhel add ../older --new-branch old-ui 3f2a9c1   # start from another commit
+```
 
 | Option | Meaning |
 |---|---|
@@ -294,8 +409,8 @@ are still going hold a lock on their journal, and `doctor` skips them.
 ### Help
 
 `git parhel -h` prints a short summary. `git parhel --help` and
-`man git-parhel` open the manual page, which the Homebrew formula and the
-install script both install.
+`man git-parhel` open the manual page, which the Homebrew formula, the install
+script and the `.deb` and `.rpm` packages all install.
 
 ## Platform support
 
@@ -585,6 +700,8 @@ when a filesystem refuses to share one file's blocks),
 
 ```sh
 brew uninstall parhel                 # Homebrew
+sudo apt remove parhel                # Debian, Ubuntu (.deb)
+sudo dnf remove parhel                # Fedora, RHEL (.rpm)
 rm ~/.local/bin/git-parhel ~/.local/share/man/man1/git-parhel*.1   # install script
 cargo uninstall parhel                # cargo
 ```
@@ -609,6 +726,11 @@ use failpoints that work across processes to reproduce races and crashes on
 demand. [docs/test-catalog.md](docs/test-catalog.md) lists every behavior the
 tests cover, and [CONTRIBUTING.md](CONTRIBUTING.md) explains how to get
 started.
+
+`scripts/build-packages.sh <musl target> <dir>` builds the `.deb` and `.rpm` from
+a binary you have already built for that target, and
+`scripts/test-package.sh <docker image> <package>` installs one in a container
+and runs the smoke test as a normal user. CI does both on every change.
 
 ## Credits
 
