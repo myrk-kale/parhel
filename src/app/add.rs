@@ -3865,8 +3865,9 @@ mod tests {
         let meta = baseline_meta(&w)
             .lines()
             .filter(|l| !l.starts_with("sync_start_ns="))
-            .map(|l| format!("{l}\n"))
-            .collect::<String>();
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         w.files
             .borrow_mut()
             .insert(p(&format!("{BASELINE_DIR}/meta")), meta.into_bytes());
