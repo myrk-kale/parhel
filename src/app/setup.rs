@@ -506,11 +506,11 @@ fn new_image(host: &dyn Host, places: &Places) -> Result<()> {
     }
     host.with_signals_deferred(&mut || {
         host.run("chattr", &["-i", STATE_DIR])?;
-        let made = make();
+        let image = make();
         // Whatever happened.
         host.run("chattr", &["+i", STATE_DIR])
             .map_err(|e| lost_protection(&e.message))?;
-        made
+        image
     })?;
     host.verify_immutable(state_dir, &places.image)
         .map_err(|e| lost_protection(&e.message))
