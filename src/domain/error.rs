@@ -67,6 +67,17 @@ pub enum ErrorCode {
     /// The operation was interrupted (SIGINT, SIGTERM or SIGHUP) and rolled back.
     /// The process exits with `128 + signal` (130, 143, 129).
     Interrupted,
+    /// The user's store is configured but cannot be used (not mounted, marker missing,
+    /// not on a copy-on-write filesystem, not writable). Never a silent fallback.
+    StoreUnavailable,
+    /// `setup --remove` refused: worktrees still live in the store.
+    StoreInUse,
+    /// `setup` needs root and was not run as root.
+    NotRoot,
+    /// A program `setup` needs (`mkfs.btrfs`, `chattr`, ...) is not installed.
+    MissingTool,
+    /// The command only exists on Linux, or this Linux lacks what it needs (systemd, btrfs).
+    UnsupportedPlatform,
     /// Unexpected I/O error.
     Io,
     /// An error injected by a test failpoint (only with the `failpoints` feature).
@@ -105,6 +116,11 @@ impl ErrorCode {
             Self::CloneFailed => "clone-failed",
             Self::RollbackFailed => "rollback-failed",
             Self::Interrupted => "interrupted",
+            Self::StoreUnavailable => "store-unavailable",
+            Self::StoreInUse => "store-in-use",
+            Self::NotRoot => "not-root",
+            Self::MissingTool => "missing-tool",
+            Self::UnsupportedPlatform => "unsupported-platform",
             Self::Io => "io",
             Self::Failpoint => "failpoint",
         }

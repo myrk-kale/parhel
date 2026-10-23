@@ -60,3 +60,92 @@ pub struct DoctorRequest {
     /// `--fix`: repair what can be repaired safely.
     pub fix: bool,
 }
+
+/// `git parhel setup`: create or remove the per-user store (Linux, needs root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupRequest {
+    /// `--size`: apparent size of the sparse image, in bytes.
+    pub size: u64,
+    /// `--preallocate`: allocate the whole image up front.
+    pub preallocate: bool,
+    /// `--user`: whose store (default `$SUDO_USER`). `Some` is explicit, so
+    /// `--user root` is honored where an inferred root is refused.
+    pub user: Option<String>,
+    /// `--remove`: take the store down instead of creating it.
+    pub remove: bool,
+}
+
+/// Default image size: 100 GiB, sparse (nothing is allocated until used).
+pub const DEFAULT_STORE_SIZE: u64 = 100 << 30;
+
+/// Smallest image btrfs can be formatted on, with room for a baseline.
+pub const MIN_STORE_SIZE: u64 = 256 << 20;
+
+/// Parse a size such as `512M`, `100G` or `2T` (binary multiples; a bare number is
+/// bytes). Errors: `usage` for empty, malformed, overflowing or too small values.
+pub fn parse_size(text: &str) -> crate::domain::Result<u64> {
+    use crate::domain::{Error, ErrorCode};
+    let usage = |why: &str| Error::new(ErrorCode::Usage, format!("--size `{text}`: {why}"));
+    let text = text.trim();
+    let (digits, shift) = match text.chars().last() {
+        Some('k' | 'K') => (&text[..text.len() - 1], 10),
+        Some('m' | 'M') => (&text[..text.len() - 1], 20),
+        Some('g' | 'G') => (&text[..text.len() - 1], 30),
+        Some('t' | 'T') => (&text[..text.len() - 1], 40),
+        _ => (text, 0),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(usage(
+            "expected a number with an optional K, M, G or T suffix",
+        ));
+    }
+    let bytes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(1 << shift))
+        .ok_or_else(|| usage("too large"))?;
+    if bytes < MIN_STORE_SIZE {
+        return Err(usage("a store needs at least 256M"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::ErrorCode;
+    use rstest::rstest;
+
+    // U-CLI-25: sizes take binary suffixes, any case; a bare number is bytes.
+    #[rstest]
+    #[case("512M", 512 << 20)]
+    #[case("512m", 512 << 20)]
+    #[case("100G", 100 << 30)]
+    #[case("2T", 2 << 40)]
+    #[case("1048576K", 1 << 30)]
+    #[case("268435456", 256 << 20)]
+    #[case("256M", MIN_STORE_SIZE)]
+    fn parses_sizes(#[case] text: &str, #[case] want: u64) {
+        assert_eq!(parse_size(text).unwrap(), want);
+    }
+
+    // U-CLI-26: anything else is a usage error that names the value.
+    #[rstest]
+    #[case::empty("")]
+    #[case::only_a_suffix("G")]
+    #[case::words("lots")]
+    #[case::negative("-5G")]
+    #[case::decimal("1.5G")]
+    #[case::unknown_suffix("5P")]
+    #[case::two_suffixes("5GG")]
+    #[case::inner_space("5 G")]
+    #[case::too_small("255M")]
+    #[case::zero("0")]
+    #[case::overflow("99999999999999999999T")]
+    #[case::overflow_by_suffix("17179869184T")]
+    fn rejects_sizes(#[case] text: &str) {
+        let err = parse_size(text).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage, "{text:?}");
+        assert!(err.message.contains("--size"), "{}", err.message);
+    }
+}

@@ -11,9 +11,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::domain::store::{EntryKind, EntryMeta};
 use crate::domain::{BranchMode, Error, ErrorCode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
-use crate::ports::{CowFs, FileLock, Git, RepoInfo, Scan, VolumeInfo, WorktreeAddSpec};
+use crate::ports::{
+    CowFs, FileLock, Git, Host, ImageUsage, Owner, RepoInfo, Scan, Space, UserInfo, VolumeInfo,
+    WorktreeAddSpec,
+};
 
 pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -77,6 +81,22 @@ pub enum Call {
     RemoveDirAll(PathBuf),
     WriteFile(PathBuf),
     Lock(PathBuf),
+    /// `mirror_entry`: one entry copied into the baseline.
+    Mirror {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    /// `mirror_dir_meta`: a baseline directory given its source's metadata.
+    MirrorDirMeta {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    /// `symlink_exclusive`.
+    Symlink {
+        target: PathBuf,
+        link: PathBuf,
+    },
+    Append(PathBuf),
 }
 
 impl Call {
@@ -97,9 +117,14 @@ impl Call {
             | Call::CreateDir(path)
             | Call::RemoveDirAll(path)
             | Call::WriteFile(path)
+            | Call::Append(path)
             | Call::Lock(path) => vec![path],
+            Call::Symlink { link, .. } => vec![link],
             Call::CreateStaging { parent } => vec![parent],
-            Call::Clone { dst, .. } | Call::Copy { dst, .. } => vec![dst],
+            Call::Clone { dst, .. }
+            | Call::Copy { dst, .. }
+            | Call::Mirror { dst, .. }
+            | Call::MirrorDirMeta { dst, .. } => vec![dst],
             Call::Rename { from, to } => vec![from, to],
             Call::BranchDelete(_) => vec![],
         }
@@ -121,6 +146,10 @@ pub enum Step {
     RemoveForce,
     BranchDelete,
     RemoveDirAll,
+    RemoveFile,
+    Mirror,
+    Symlink,
+    Append,
 }
 
 /// Configurable fake world. Defaults describe a healthy repo at `/w/repo` on APFS,
@@ -185,6 +214,13 @@ pub struct World {
     pub staged_files: Vec<(PathBuf, Vec<u8>)>,
     /// Symlinks that appear in the staged worktree: (relative path, target).
     pub staged_links: Vec<(PathBuf, PathBuf)>,
+    /// `lstat` facts that differ from the defaults derived from `tree`, `files` and
+    /// `links` (size, mtime, mode of an entry).
+    pub meta: RefCell<HashMap<PathBuf, EntryMeta>>,
+    /// Directories the current user cannot write to.
+    pub unwritable: RefCell<HashSet<PathBuf>>,
+    /// Longest-prefix match: path prefix -> filesystem space.
+    pub spaces: RefCell<Vec<(PathBuf, Space)>>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -269,7 +305,156 @@ impl Default for World {
             parhelignored: vec![],
             staged_files: vec![],
             staged_links: vec![],
+            meta: RefCell::default(),
+            unwritable: RefCell::default(),
+            spaces: RefCell::default(),
         }
+    }
+}
+
+/// A btrfs volume (copy-on-write).
+pub fn btrfs(device: u64) -> VolumeInfo {
+    VolumeInfo {
+        fs_type: "btrfs".into(),
+        cow: true,
+        device,
+        filesystem: device,
+    }
+}
+
+/// An ext4 volume (no copy-on-write).
+pub fn ext4(device: u64) -> VolumeInfo {
+    VolumeInfo {
+        fs_type: "ext4".into(),
+        cow: false,
+        device,
+        filesystem: device,
+    }
+}
+
+/// The fake store's root.
+pub const STORE: &str = "/store";
+
+/// `repo_id("/w/repo")`: first 16 bytes of its SHA-256, in hex.
+pub const REPO_ID: &str = "7005185596c2e32bd0688ebe72725f92";
+
+/// A valid marker for the fake store.
+pub const MARKER: &str =
+    "format=1\nuser=alice\nimage=/var/lib/parhel/alice.img\nunit=parhel-alice.mount\n";
+
+impl World {
+    /// The healthy world of the store: sources and destinations on ext4 (device 1),
+    /// a store with its marker, `baselines/` and `worktrees/` on btrfs (device 2) at
+    /// [`STORE`], writable.
+    pub fn with_store(mut self) -> Self {
+        self.volumes = vec![(p("/"), ext4(1)), (p(STORE), btrfs(2))];
+        for dir in [STORE, "/store/baselines", "/store/worktrees"] {
+            self.put_dir(Path::new(dir));
+        }
+        self.files
+            .borrow_mut()
+            .insert(p("/store/.parhel-store"), MARKER.as_bytes().to_vec());
+        self.add_entry(Path::new("/store/.parhel-store"));
+        self
+    }
+
+    /// A directory (and its ancestors) in the fake tree.
+    pub fn put_dir(&self, path: &Path) {
+        self.add_entry(path);
+        self.tree
+            .borrow_mut()
+            .entry(path.to_path_buf())
+            .or_default();
+    }
+
+    /// A regular file with the given size and mtime (ns).
+    pub fn put_file(&self, path: &Path, size: u64, mtime_ns: i128) {
+        self.add_entry(path);
+        self.meta.borrow_mut().insert(
+            path.to_path_buf(),
+            EntryMeta {
+                kind: EntryKind::File,
+                size,
+                mtime_ns,
+                mode: 0o644,
+                link_target: None,
+            },
+        );
+    }
+
+    /// A symlink.
+    pub fn put_link(&self, path: &Path, target: &Path) {
+        self.add_entry(path);
+        self.links
+            .borrow_mut()
+            .insert(path.to_path_buf(), target.to_path_buf());
+    }
+
+    /// Give `to` the facts of `from` (a fixture standing in for a copy that already
+    /// happened, without going through the code under test).
+    pub fn copy_facts(&self, from: &Path, to: &Path) {
+        let meta = self.entry_meta(from).expect("the source entry exists");
+        if meta.kind == EntryKind::Dir {
+            self.put_dir(to);
+        } else {
+            self.add_entry(to);
+        }
+        if let Some(target) = &meta.link_target {
+            self.links
+                .borrow_mut()
+                .insert(to.to_path_buf(), target.clone());
+        }
+        self.meta.borrow_mut().insert(to.to_path_buf(), meta);
+    }
+
+    /// What `lstat` says about `path`, from the explicit facts or the defaults.
+    fn entry_meta(&self, path: &Path) -> Option<EntryMeta> {
+        if let Some(meta) = self.meta.borrow().get(path) {
+            return Some(meta.clone());
+        }
+        let listed = path.parent().is_some_and(|parent| {
+            self.tree
+                .borrow()
+                .get(parent)
+                .zip(path.file_name())
+                .is_some_and(|(entries, name)| entries.iter().any(|e| e == name))
+        });
+        if let Some(target) = self.links.borrow().get(path) {
+            return Some(EntryMeta {
+                kind: EntryKind::Symlink,
+                size: 0,
+                mtime_ns: 0,
+                mode: 0o777,
+                link_target: Some(target.clone()),
+            });
+        }
+        if self.tree.borrow().contains_key(path) {
+            return Some(EntryMeta {
+                kind: EntryKind::Dir,
+                size: 0,
+                mtime_ns: 0,
+                mode: 0o755,
+                link_target: None,
+            });
+        }
+        listed.then(|| EntryMeta {
+            kind: EntryKind::File,
+            size: self.files.borrow().get(path).map_or(0, |b| b.len() as u64),
+            mtime_ns: 0,
+            mode: 0o644,
+            link_target: None,
+        })
+    }
+
+    /// Drop `path` from its parent's listing and from the per-entry facts.
+    fn forget_entry(&self, path: &Path) {
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            if let Some(entries) = self.tree.borrow_mut().get_mut(parent) {
+                entries.retain(|e| e != name);
+            }
+        }
+        self.meta.borrow_mut().remove(path);
+        self.links.borrow_mut().remove(path);
     }
 }
 
@@ -529,7 +714,8 @@ impl CowFs for World {
     fn exists_no_follow(&self, path: &Path) -> Result<bool> {
         Ok(self.existing.borrow().contains(path)
             || self.is_dir_path(path)
-            || self.files.borrow().contains_key(path))
+            || self.files.borrow().contains_key(path)
+            || self.links.borrow().contains_key(path))
     }
 
     fn is_dir(&self, path: &Path) -> Result<bool> {
@@ -614,11 +800,8 @@ impl CowFs for World {
     fn remove_dir_all(&self, path: &Path) -> Result<()> {
         self.record(Call::RemoveDirAll(path.into()), Step::RemoveDirAll)?;
         self.tree.borrow_mut().retain(|k, _| !k.starts_with(path));
-        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-            if let Some(entries) = self.tree.borrow_mut().get_mut(parent) {
-                entries.retain(|e| e != name);
-            }
-        }
+        self.meta.borrow_mut().retain(|k, _| !k.starts_with(path));
+        self.forget_entry(path);
         Ok(())
     }
 
@@ -668,8 +851,9 @@ impl CowFs for World {
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
-        self.record(Call::RemoveFile(path.into()), Step::Clone)?;
+        self.record(Call::RemoveFile(path.into()), Step::RemoveFile)?;
         self.files.borrow_mut().remove(path);
+        self.forget_entry(path);
         Ok(())
     }
 
@@ -681,6 +865,123 @@ impl CowFs for World {
             },
             Step::Clone,
         )
+    }
+
+    fn stat_within(&self, root: &Path, rel: &Path) -> Result<Option<EntryMeta>> {
+        Ok(self.entry_meta(&root.join(rel)))
+    }
+
+    fn mirror_entry(&self, root: &Path, rel: &Path, dst: &Path) -> Result<u64> {
+        let src = root.join(rel);
+        let meta = self.entry_meta(&src).ok_or_else(|| {
+            Error::new(ErrorCode::CloneFailed, format!("{} is gone", src.display()))
+        })?;
+        self.record(
+            Call::Mirror {
+                src,
+                dst: dst.into(),
+            },
+            Step::Mirror,
+        )?;
+        // The contract: same kind or nothing there. A different kind must have been
+        // removed first.
+        if let Some(old) = self.entry_meta(dst) {
+            if old.kind != meta.kind {
+                return Err(Error::new(
+                    ErrorCode::Io,
+                    format!("{} holds another kind of entry", dst.display()),
+                ));
+            }
+        }
+        match meta.kind {
+            EntryKind::Dir => {
+                self.tree.borrow_mut().entry(dst.to_path_buf()).or_default();
+            }
+            EntryKind::Symlink => {
+                let target = meta.link_target.clone().unwrap_or_default();
+                self.links.borrow_mut().insert(dst.to_path_buf(), target);
+            }
+            EntryKind::File | EntryKind::Fifo => {}
+        }
+        self.add_entry(dst);
+        let copied = if meta.kind == EntryKind::File {
+            meta.size
+        } else {
+            0
+        };
+        self.meta.borrow_mut().insert(dst.to_path_buf(), meta);
+        Ok(copied)
+    }
+
+    fn mirror_dir_meta(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+        let src = root.join(rel);
+        self.record(
+            Call::MirrorDirMeta {
+                src: src.clone(),
+                dst: dst.into(),
+            },
+            Step::Mirror,
+        )?;
+        if let Some(meta) = self.entry_meta(&src) {
+            self.meta.borrow_mut().insert(dst.to_path_buf(), meta);
+        }
+        Ok(())
+    }
+
+    fn symlink_exclusive(&self, target: &Path, link: &Path) -> Result<()> {
+        self.record(
+            Call::Symlink {
+                target: target.into(),
+                link: link.into(),
+            },
+            Step::Symlink,
+        )?;
+        if self.exists_no_follow(link)? {
+            return Err(Error::new(
+                ErrorCode::DestExists,
+                "fake: symlink path exists",
+            ));
+        }
+        self.links
+            .borrow_mut()
+            .insert(link.to_path_buf(), target.to_path_buf());
+        self.add_entry(link);
+        Ok(())
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        Ok(self.links.borrow().get(path).cloned())
+    }
+
+    fn append_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.record(Call::Append(path.into()), Step::Append)?;
+        self.files
+            .borrow_mut()
+            .entry(path.to_path_buf())
+            .or_default()
+            .extend_from_slice(bytes);
+        self.add_entry(path);
+        Ok(())
+    }
+
+    fn is_writable(&self, path: &Path) -> Result<bool> {
+        Ok(!self.unwritable.borrow().contains(path))
+    }
+
+    fn space(&self, path: &Path) -> Result<Space> {
+        Ok(self
+            .spaces
+            .borrow()
+            .iter()
+            .filter(|(prefix, _)| path.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.components().count())
+            .map_or(
+                Space {
+                    total: 1 << 40,
+                    free: 1 << 39,
+                },
+                |(_, space)| *space,
+            ))
     }
 
     fn scan(
@@ -732,5 +1033,431 @@ impl CowFs for World {
         scan.gitfiles.sort();
         scan.links.sort();
         Ok(scan)
+    }
+}
+
+// ------------------------------------------------------------------------ the host
+
+/// A logged mutation of the machine, for `setup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostCall {
+    Run {
+        program: String,
+        args: Vec<String>,
+    },
+    CreateDir {
+        path: PathBuf,
+        mode: u32,
+        owner: Owner,
+    },
+    WriteFile {
+        path: PathBuf,
+        mode: u32,
+        owner: Owner,
+    },
+    CreateImage {
+        path: PathBuf,
+        bytes: u64,
+        preallocate: bool,
+    },
+    VerifyImmutable {
+        dir: PathBuf,
+        image: PathBuf,
+    },
+    RemoveFile(PathBuf),
+    RemoveDir(PathBuf),
+}
+
+impl HostCall {
+    /// One line per call, the way the tests spell the expected sequences.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Run { program, args } => format!("run {program} {}", args.join(" ")),
+            Self::CreateDir { path, .. } => format!("mkdir {}", path.display()),
+            Self::WriteFile { path, .. } => format!("write {}", path.display()),
+            Self::CreateImage {
+                path,
+                bytes,
+                preallocate: false,
+            } => format!("image {} {bytes} sparse", path.display()),
+            Self::CreateImage {
+                path,
+                bytes,
+                preallocate: true,
+            } => format!("image {} {bytes} allocated", path.display()),
+            Self::VerifyImmutable { dir, image } => {
+                format!("verify-immutable {} {}", dir.display(), image.display())
+            }
+            Self::RemoveFile(path) => format!("rm {}", path.display()),
+            Self::RemoveDir(path) => format!("rmdir {}", path.display()),
+        }
+    }
+}
+
+/// The unit directory the fake systemd reads.
+pub const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// A fake machine for `setup`: an ordered log of mutations and just enough
+/// simulation (files, mounts, immutable directories, units) for the answers to stay
+/// consistent across a re-run. Defaults: Linux, root via `sudo` as `alice`, systemd,
+/// btrfs in the kernel, every tool installed, nothing set up.
+// Each bool is an independent fact of the machine.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug)]
+pub struct FakeHost {
+    pub log: RefCell<Vec<HostCall>>,
+    pub linux: bool,
+    pub root: bool,
+    pub env: HashMap<String, String>,
+    pub users: Vec<UserInfo>,
+    pub tools: RefCell<HashSet<String>>,
+    pub systemd: bool,
+    /// Text files by path, including `/proc/filesystems` and the units.
+    pub files: RefCell<HashMap<PathBuf, String>>,
+    pub dirs: RefCell<HashSet<PathBuf>>,
+    pub images: RefCell<HashMap<PathBuf, ImageUsage>>,
+    /// Images `mkfs.btrfs` ran on.
+    pub formatted: RefCell<HashSet<PathBuf>>,
+    pub mounted: RefCell<HashSet<PathBuf>>,
+    pub immutable: RefCell<HashSet<PathBuf>>,
+    /// Modes and owners last given to a path.
+    pub attrs: RefCell<HashMap<PathBuf, (u32, Owner)>>,
+    /// Programs that fail when run.
+    pub fail_run: RefCell<HashMap<String, ErrorCode>>,
+    /// A `chattr` that succeeds without setting anything (a filesystem that ignores it).
+    pub chattr_does_nothing: bool,
+}
+
+impl Default for FakeHost {
+    fn default() -> Self {
+        let user = |name: &str, id: u32| UserInfo {
+            name: name.into(),
+            uid: id,
+            gid: id,
+        };
+        let tools = [
+            "mkfs.btrfs",
+            "chattr",
+            "systemctl",
+            "systemd-escape",
+            "modprobe",
+        ];
+        Self {
+            log: RefCell::default(),
+            linux: true,
+            root: true,
+            env: HashMap::from([("SUDO_USER".to_owned(), "alice".to_owned())]),
+            users: vec![user("root", 0), user("alice", 1000), user("bob", 1001)],
+            tools: RefCell::new(tools.iter().map(|t| (*t).to_owned()).collect()),
+            systemd: true,
+            files: RefCell::new(HashMap::from([(
+                p("/proc/filesystems"),
+                "nodev\tsysfs\nnodev\ttmpfs\n\text4\n\tbtrfs\n".to_owned(),
+            )])),
+            dirs: RefCell::new(
+                ["/", "/etc", "/etc/systemd", UNIT_DIR, "/var", "/var/lib"]
+                    .iter()
+                    .map(|d| p(d))
+                    .collect(),
+            ),
+            images: RefCell::default(),
+            formatted: RefCell::default(),
+            mounted: RefCell::default(),
+            immutable: RefCell::default(),
+            attrs: RefCell::default(),
+            fail_run: RefCell::default(),
+            chattr_does_nothing: false,
+        }
+    }
+}
+
+impl FakeHost {
+    pub fn calls(&self) -> Vec<HostCall> {
+        self.log.borrow().clone()
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        self.log.borrow().iter().map(HostCall::line).collect()
+    }
+
+    pub fn clear_log(&self) {
+        self.log.borrow_mut().clear();
+    }
+
+    pub fn without_tool(self, tool: &str) -> Self {
+        self.tools.borrow_mut().remove(tool);
+        self
+    }
+
+    pub fn failing(self, program: &str, code: ErrorCode) -> Self {
+        self.fail_run.borrow_mut().insert(program.to_owned(), code);
+        self
+    }
+
+    pub fn text(&self, path: &str) -> Option<String> {
+        self.files.borrow().get(Path::new(path)).cloned()
+    }
+
+    /// A mutation is refused inside an immutable directory, or inside a mount point
+    /// that is not mounted (it would land on the host filesystem underneath).
+    fn guard(&self, path: &Path, creating_or_removing: bool) -> Result<()> {
+        let parent = path.parent().unwrap_or(Path::new("/"));
+        if creating_or_removing && self.immutable.borrow().contains(parent) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: Operation not permitted", path.display()),
+            ));
+        }
+        let unmounted_mount_point = self.files.borrow().iter().any(|(unit, text)| {
+            unit.starts_with(UNIT_DIR)
+                && mount_point_of(text).is_some_and(|w| {
+                    path.starts_with(&w) && path != w && !self.mounted.borrow().contains(&w)
+                })
+        });
+        if unmounted_mount_point {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!(
+                    "{} is below a mount point that is not mounted",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn log(&self, call: HostCall) {
+        self.log.borrow_mut().push(call);
+    }
+
+    fn remember(&self, path: &Path, mode: u32, owner: Owner) {
+        self.attrs
+            .borrow_mut()
+            .insert(path.to_path_buf(), (mode, owner));
+    }
+}
+
+/// `Where=` of a unit file.
+fn mount_point_of(unit: &str) -> Option<PathBuf> {
+    unit.lines()
+        .find_map(|l| l.strip_prefix("Where="))
+        .map(PathBuf::from)
+}
+
+impl Host for FakeHost {
+    fn is_linux(&self) -> bool {
+        self.linux
+    }
+
+    fn is_root(&self) -> bool {
+        self.root
+    }
+
+    fn env_var(&self, name: &str) -> Option<String> {
+        self.env.get(name).cloned()
+    }
+
+    fn user(&self, name: &str) -> Result<Option<UserInfo>> {
+        Ok(self.users.iter().find(|u| u.name == name).cloned())
+    }
+
+    fn tool_exists(&self, tool: &str) -> bool {
+        self.tools.borrow().contains(tool)
+    }
+
+    fn systemd_running(&self) -> bool {
+        self.systemd
+    }
+
+    fn read_text(&self, path: &Path) -> Result<Option<String>> {
+        Ok(self.files.borrow().get(path).cloned())
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.files.borrow().contains_key(path)
+            || self.dirs.borrow().contains(path)
+            || self.images.borrow().contains_key(path)
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<OsString>> {
+        let files = self.files.borrow();
+        let dirs = self.dirs.borrow();
+        let images = self.images.borrow();
+        let mut names: Vec<OsString> = files
+            .keys()
+            .chain(dirs.iter())
+            .chain(images.keys())
+            .filter(|c| c.parent() == Some(path))
+            .filter_map(|c| c.file_name().map(OsString::from))
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    fn is_mount_point(&self, path: &Path) -> bool {
+        self.mounted.borrow().contains(path)
+    }
+
+    fn run(&self, program: &str, args: &[&str]) -> Result<String> {
+        // Queries are not mutations: not logged.
+        if program == "systemd-escape" {
+            let name = args.last().copied().unwrap_or_default();
+            // Like systemd: `/` becomes `-`, a literal `-` becomes `\x2d`.
+            let escaped = name
+                .trim_matches('/')
+                .split('/')
+                .map(|part| part.replace('-', "\\x2d"))
+                .collect::<Vec<_>>()
+                .join("-");
+            let suffix = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--suffix="))
+                .map_or(String::new(), |s| format!(".{s}"));
+            return Ok(format!("{escaped}{suffix}\n"));
+        }
+        self.log(HostCall::Run {
+            program: program.to_owned(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+        });
+        if let Some(code) = self.fail_run.borrow().get(program) {
+            return Err(Error::new(*code, format!("fake: {program} failed")));
+        }
+        match (program, args) {
+            ("modprobe", ["btrfs"]) => {
+                self.files
+                    .borrow_mut()
+                    .entry(p("/proc/filesystems"))
+                    .or_default()
+                    .push_str("\tbtrfs\n");
+            }
+            ("mkfs.btrfs", [.., image]) => {
+                if !self.images.borrow().contains_key(Path::new(image)) {
+                    return Err(Error::new(ErrorCode::Io, format!("{image}: no such file")));
+                }
+                self.formatted.borrow_mut().insert(p(image));
+            }
+            ("systemctl", ["enable", "--now", unit]) => {
+                let text = self
+                    .files
+                    .borrow()
+                    .get(&Path::new(UNIT_DIR).join(unit))
+                    .cloned()
+                    .ok_or_else(|| Error::new(ErrorCode::Io, format!("unit {unit} not found")))?;
+                if let Some(at) = mount_point_of(&text) {
+                    self.mounted.borrow_mut().insert(at);
+                }
+            }
+            ("systemctl", ["disable", "--now", unit]) => {
+                let text = self
+                    .files
+                    .borrow()
+                    .get(&Path::new(UNIT_DIR).join(unit))
+                    .cloned();
+                if let Some(at) = text.as_deref().and_then(mount_point_of) {
+                    self.mounted.borrow_mut().remove(&at);
+                }
+            }
+            ("chattr", ["+i", path]) => {
+                if !self.chattr_does_nothing {
+                    self.immutable.borrow_mut().insert(p(path));
+                }
+            }
+            ("chattr", ["-i", path]) => {
+                self.immutable.borrow_mut().remove(Path::new(path));
+            }
+            _ => {}
+        }
+        Ok(String::new())
+    }
+
+    fn create_dir(&self, path: &Path, mode: u32, owner: Owner) -> Result<()> {
+        self.log(HostCall::CreateDir {
+            path: path.into(),
+            mode,
+            owner,
+        });
+        if !self.dirs.borrow().contains(path) {
+            self.guard(path, true)?;
+            self.dirs.borrow_mut().insert(path.into());
+        }
+        self.remember(path, mode, owner);
+        Ok(())
+    }
+
+    fn write_file(&self, path: &Path, contents: &[u8], mode: u32, owner: Owner) -> Result<()> {
+        self.log(HostCall::WriteFile {
+            path: path.into(),
+            mode,
+            owner,
+        });
+        self.guard(path, !self.files.borrow().contains_key(path))?;
+        self.files
+            .borrow_mut()
+            .insert(path.into(), String::from_utf8_lossy(contents).into_owned());
+        self.remember(path, mode, owner);
+        Ok(())
+    }
+
+    fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()> {
+        self.log(HostCall::CreateImage {
+            path: path.into(),
+            bytes,
+            preallocate,
+        });
+        self.guard(path, true)?;
+        self.images.borrow_mut().insert(
+            path.into(),
+            ImageUsage {
+                apparent: bytes,
+                allocated: if preallocate { bytes } else { 4096 },
+            },
+        );
+        self.remember(path, 0o600, None);
+        Ok(())
+    }
+
+    fn image_usage(&self, path: &Path) -> Result<ImageUsage> {
+        self.images
+            .borrow()
+            .get(path)
+            .copied()
+            .ok_or_else(|| Error::new(ErrorCode::Io, format!("no image {}", path.display())))
+    }
+
+    fn verify_immutable(&self, dir: &Path, image: &Path) -> Result<()> {
+        self.log(HostCall::VerifyImmutable {
+            dir: dir.into(),
+            image: image.into(),
+        });
+        if self.immutable.borrow().contains(dir) {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorCode::Io,
+                format!("{} can be modified: it is not immutable", image.display()),
+            ))
+        }
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.log(HostCall::RemoveFile(path.into()));
+        self.guard(path, true)?;
+        self.files.borrow_mut().remove(path);
+        self.images.borrow_mut().remove(path);
+        Ok(())
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        self.log(HostCall::RemoveDir(path.into()));
+        self.guard(path, true)?;
+        if self.mounted.borrow().contains(path) || !self.list_dir(path)?.is_empty() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: Directory not empty or busy", path.display()),
+            ));
+        }
+        self.dirs.borrow_mut().remove(path);
+        Ok(())
     }
 }

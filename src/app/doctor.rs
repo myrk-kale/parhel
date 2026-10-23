@@ -24,6 +24,26 @@ pub enum Finding {
     ForeignGitfile { path: PathBuf },
     /// A staging dir whose journal is locked by a live `add`: not a problem, never touched.
     InProgress { path: PathBuf },
+    /// The store is configured but unusable (not mounted, marker missing, ...).
+    StoreUnavailable { path: PathBuf, reason: String },
+    /// The store is mounted but its backing image was deleted: copy work out before
+    /// unmounting, the data disappears with the last reference.
+    StoreImageDeleted { path: PathBuf, image: String },
+    /// The store or the filesystem holding its image is nearly full. `path` is
+    /// the one that is (the store root, or the directory of the image).
+    StoreLowSpace {
+        path: PathBuf,
+        free: u64,
+        total: u64,
+    },
+    /// A directory under `worktrees/<id>/` that git does not know. Reported only:
+    /// its contents are never deleted.
+    StoreOrphan { path: PathBuf },
+    /// A symlink recorded in the store's registry that points into the store at
+    /// something that no longer exists.
+    StoreDanglingLink { link: PathBuf, target: PathBuf },
+    /// A baseline whose source is no longer a git worktree.
+    StoreStaleBaseline { path: PathBuf },
 }
 
 impl Finding {
@@ -35,6 +55,12 @@ impl Finding {
             Self::OrphanRegistration { .. } => "orphan-registration",
             Self::ForeignGitfile { .. } => "foreign-gitfile",
             Self::InProgress { .. } => "in-progress",
+            Self::StoreUnavailable { .. } => "store-unavailable",
+            Self::StoreImageDeleted { .. } => "store-image-deleted",
+            Self::StoreLowSpace { .. } => "store-low-space",
+            Self::StoreOrphan { .. } => "store-orphan",
+            Self::StoreDanglingLink { .. } => "store-dangling-link",
+            Self::StoreStaleBaseline { .. } => "store-stale-baseline",
         }
     }
 
@@ -43,7 +69,10 @@ impl Finding {
     pub const fn fixable(&self) -> bool {
         matches!(
             self,
-            Self::OrphanStaging { .. } | Self::OrphanRegistration { .. }
+            Self::OrphanStaging { .. }
+                | Self::OrphanRegistration { .. }
+                | Self::StoreDanglingLink { .. }
+                | Self::StoreStaleBaseline { .. }
         )
     }
 }
@@ -269,6 +298,8 @@ fn trusted(
         created_branch,
         publish_to,
         branch_start: journal.branch_start,
+        // TDD: a crashed store run's link is trusted (and undone) in the store work.
+        store_link: None,
     })
 }
 
@@ -382,10 +413,11 @@ fn find_foreign_gitfiles(env: &Env<'_>, repo: &RepoInfo, dir: &Path, report: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fakes::{Call, SHA_A, World, p};
+    use crate::app::fakes::{Call, SHA_A, World, btrfs, p};
     use crate::app::rollback::{JOURNAL_FILE, Journal};
     use crate::git::parse::WorktreeEntry;
-    use crate::ports::VolumeInfo;
+    use crate::ports::{CowFs, Space, VolumeInfo};
+    use rstest::rstest;
     use std::ffi::OsString;
     use std::path::Path;
 
@@ -395,6 +427,7 @@ mod tests {
             fs: w,
             cwd: Path::new("/w/repo"),
             interrupted: &w.interrupted,
+            store: None,
         };
         doctor(&env, &DoctorRequest { from: p("."), fix }).unwrap()
     }
@@ -421,6 +454,7 @@ mod tests {
             created_branch: Some("feat".into()),
             publish_to: None,
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         };
         w.files
             .borrow_mut()
@@ -627,6 +661,7 @@ mod tests {
             created_branch: Some("feat".into()),
             publish_to: Some(p("/w/feat")),
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         };
         w.files
             .borrow_mut()
@@ -756,6 +791,7 @@ mod tests {
             created_branch: Some("feat".into()),
             publish_to: None,
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         };
         let w = published_before_repair(Some(old));
         assert!(run(&w, true).healthy());
@@ -820,6 +856,7 @@ mod tests {
             created_branch: None,
             publish_to: Some(p("/x/feat")),
             branch_start: None,
+            store_link: None,
         };
         w.files
             .borrow_mut()
@@ -935,6 +972,7 @@ mod tests {
             created_branch: Some("victim-branch".into()),
             publish_to: Some(p("/w/victim")),
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         });
         run(&w, true);
         assert!(!w.touched(Path::new("/w/victim")), "{:#?}", w.calls());
@@ -952,6 +990,7 @@ mod tests {
             created_branch: Some("victim-branch".into()),
             publish_to: None,
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         });
         run(&w, true);
         assert_eq!(
@@ -959,6 +998,477 @@ mod tests {
             0,
             "{:#?}",
             w.calls()
+        );
+    }
+
+    // ------------------------------------------------------------ the store
+
+    const ID: &str = "7005185596c2e32bd0688ebe72725f92";
+
+    fn real() -> PathBuf {
+        p(&format!("/store/worktrees/{ID}/feat"))
+    }
+
+    fn baseline_dir() -> PathBuf {
+        p(&format!("/store/baselines/{ID}"))
+    }
+
+    const MOUNTINFO: &str = "36 25 0:32 / /store rw,noatime shared:1 - btrfs /dev/loop3 rw,ssd\n";
+
+    fn run_store(w: &World, fix: bool) -> DoctorReport {
+        run_with(w, fix, Some(Path::new("/store")))
+    }
+
+    fn run_with(w: &World, fix: bool, store: Option<&Path>) -> DoctorReport {
+        let env = Env {
+            git: w,
+            fs: w,
+            cwd: Path::new("/w/repo"),
+            interrupted: &w.interrupted,
+            store,
+        };
+        doctor(&env, &DoctorRequest { from: p("."), fix }).unwrap()
+    }
+
+    /// A healthy store with one worktree of `/w/repo` at its real path, reached through
+    /// the symlink `/w/feat` (recorded in the registry), the baseline of `/w/repo`,
+    /// and a loop device backed by a file that exists.
+    fn store_world() -> World {
+        let mut w = World::default().with_store();
+        // The source is on a filesystem with copy-on-write: `not-cow` is not what
+        // these tests are about (see U-STO-84 for a source on ext4).
+        w.volumes = vec![(p("/"), btrfs(3)), (p("/store"), btrfs(2))];
+        w.put_dir(&real());
+        w.worktrees.push(WorktreeEntry {
+            path: real(),
+            head: Some(SHA_A.into()),
+            branch: Some("refs/heads/feat".into()),
+            ..WorktreeEntry::default()
+        });
+        w.put_link(Path::new("/w/feat"), &real());
+        let registry = format!("/w/feat\t{}\n", real().display());
+        w.files
+            .borrow_mut()
+            .insert(p("/store/links"), registry.into_bytes());
+        w.put_dir(&baseline_dir());
+        w.files
+            .borrow_mut()
+            .insert(baseline_dir().join("meta"), b"source=/w/repo\n".to_vec());
+        w.files
+            .borrow_mut()
+            .insert(p("/proc/self/mountinfo"), MOUNTINFO.as_bytes().to_vec());
+        w.files.borrow_mut().insert(
+            p("/sys/block/loop3/loop/backing_file"),
+            b"/var/lib/parhel/alice.img\n".to_vec(),
+        );
+        w
+    }
+
+    fn store_findings(report: &DoctorReport) -> Vec<&Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.code().starts_with("store-"))
+            .collect()
+    }
+
+    // U-STO-70: a healthy store is silent.
+    #[test]
+    fn healthy_store_has_no_findings() {
+        let w = store_world();
+        let report = run_store(&w, false);
+        assert_eq!(report, DoctorReport::default());
+        assert!(w.calls().is_empty(), "{:#?}", w.calls());
+    }
+
+    // U-STO-71: no store configured: no store findings, whatever lies around, and no
+    // store files are even looked at.
+    #[test]
+    fn no_store_means_no_store_findings() {
+        let w = store_world();
+        w.files.borrow_mut().remove(&p("/store/.parhel-store"));
+        assert_eq!(run_with(&w, false, None), DoctorReport::default());
+        // Configured path that does not exist: the user never ran `setup`.
+        let w = World::default();
+        assert_eq!(
+            run_with(&w, false, Some(Path::new("/store"))),
+            DoctorReport::default()
+        );
+    }
+
+    // U-STO-72: a store that cannot be used is one finding, with the reason; the
+    // deeper checks (which need the store) are skipped instead of piling up noise.
+    #[rstest]
+    #[case::marker_missing(|w: &World| { w.files.borrow_mut().remove(&p("/store/.parhel-store")); }, ".parhel-store")]
+    #[case::not_writable(|w: &World| { w.unwritable.borrow_mut().insert(p("/store")); }, "writable")]
+    fn unavailable_store_is_one_finding(#[case] break_it: fn(&World), #[case] reason: &str) {
+        let w = store_world();
+        break_it(&w);
+        // Things that would be findings if the store were readable.
+        w.files
+            .borrow_mut()
+            .insert(baseline_dir().join("meta"), b"source=/gone\n".to_vec());
+        w.put_dir(&p(&format!("/store/worktrees/{ID}/ghost")));
+        let report = run_store(&w, false);
+        let found = store_findings(&report);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        match found[0] {
+            Finding::StoreUnavailable { path, reason: why } => {
+                assert_eq!(path, &p("/store"));
+                assert!(why.contains(reason), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!report.healthy());
+        assert!(!found[0].fixable());
+    }
+
+    // U-STO-73: the backing image was deleted while the store is still mounted: the
+    // data lives on only until unmount, so say it loudly.
+    #[test]
+    fn deleted_backing_image_is_reported() {
+        let w = store_world();
+        w.files.borrow_mut().insert(
+            p("/sys/block/loop3/loop/backing_file"),
+            b"/var/lib/parhel/alice.img (deleted)\n".to_vec(),
+        );
+        let report = run_store(&w, false);
+        assert_eq!(
+            store_findings(&report),
+            vec![&Finding::StoreImageDeleted {
+                path: p("/store"),
+                image: "/var/lib/parhel/alice.img".into(),
+            }]
+        );
+        assert!(!report.healthy());
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    // U-STO-74: low space on the host filesystem (where the image grows) or in the
+    // store: under 10% free, or under 2 GiB.
+    #[rstest]
+    #[case::host_under_ten_percent("/var/lib/parhel", 1000 * GIB, 90 * GIB, true)]
+    #[case::host_fine("/var/lib/parhel", 1000 * GIB, 120 * GIB, false)]
+    #[case::host_under_two_gib("/var/lib/parhel", 20 * GIB, GIB + GIB / 2, true)]
+    #[case::host_exactly_two_gib_is_fine("/var/lib/parhel", 20 * GIB, 2 * GIB, false)]
+    #[case::store_under_ten_percent("/store", 100 * GIB, 9 * GIB, true)]
+    #[case::store_fine("/store", 100 * GIB, 50 * GIB, false)]
+    fn low_space_is_reported(
+        #[case] at: &str,
+        #[case] total: u64,
+        #[case] free: u64,
+        #[case] reported: bool,
+    ) {
+        let w = store_world();
+        w.spaces.borrow_mut().push((p(at), Space { total, free }));
+        let report = run_store(&w, false);
+        let want: Vec<Finding> = if reported {
+            vec![Finding::StoreLowSpace {
+                path: p(at),
+                free,
+                total,
+            }]
+        } else {
+            vec![]
+        };
+        assert_eq!(store_findings(&report), want.iter().collect::<Vec<_>>());
+    }
+
+    // U-STO-75: a directory under worktrees/<id>/ that git does not know is reported,
+    // and nothing is ever deleted for it.
+    #[test]
+    fn unregistered_worktree_directory_is_an_orphan_and_is_kept() {
+        let w = store_world();
+        let ghost = p(&format!("/store/worktrees/{ID}/ghost"));
+        w.put_dir(&ghost);
+        w.put_file(&ghost.join("work.txt"), 10, 1);
+        let report = run_store(&w, true);
+        assert_eq!(
+            store_findings(&report),
+            vec![&Finding::StoreOrphan {
+                path: ghost.clone()
+            }]
+        );
+        assert!(report.fixed.is_empty(), "{report:#?}");
+        assert!(!report.healthy());
+        assert!(!w.touched(&ghost), "never deleted: {:#?}", w.calls());
+    }
+
+    // U-STO-76: a link whose worktree is gone is dangling; --fix removes the link.
+    #[test]
+    fn dangling_link_is_reported_and_fixed() {
+        let mut w = store_world();
+        w.tree.borrow_mut().remove(&real());
+        w.tree
+            .borrow_mut()
+            .get_mut(real().parent().unwrap())
+            .unwrap()
+            .clear();
+        w.worktrees.clear();
+        w.worktrees.push(WorktreeEntry {
+            path: p("/w/repo"),
+            head: Some(SHA_A.into()),
+            branch: Some("refs/heads/main".into()),
+            ..WorktreeEntry::default()
+        });
+        let finding = Finding::StoreDanglingLink {
+            link: p("/w/feat"),
+            target: real(),
+        };
+        let report = run_store(&w, false);
+        assert_eq!(store_findings(&report), vec![&finding]);
+        assert!(finding.fixable());
+        assert_eq!(w.calls(), vec![]);
+
+        let report = run_store(&w, true);
+        assert_eq!(report.fixed, vec![finding]);
+        assert!(report.healthy());
+        assert_eq!(w.calls(), vec![Call::RemoveFile(p("/w/feat"))]);
+    }
+
+    // U-STO-77: the registry is a record of what we created, not a license: a path
+    // that is no longer a symlink to exactly that target is left alone and unreported.
+    #[rstest]
+    #[case::retargeted(|w: &World| { w.links.borrow_mut().insert(p("/w/feat"), p("/store/worktrees/other/x")); })]
+    #[case::replaced_by_a_directory(|w: &World| { w.links.borrow_mut().remove(&p("/w/feat")); w.put_dir(&p("/w/feat")); })]
+    #[case::gone(|w: &World| { w.links.borrow_mut().remove(&p("/w/feat")); })]
+    fn registry_entries_that_are_not_our_link_are_ignored(#[case] change: fn(&World)) {
+        let w = store_world();
+        w.tree.borrow_mut().remove(&real());
+        change(&w);
+        let report = run_store(&w, true);
+        assert!(
+            !store_findings(&report)
+                .iter()
+                .any(|f| matches!(f, Finding::StoreDanglingLink { .. })),
+            "{report:#?}"
+        );
+        assert_eq!(
+            w.count(|c| matches!(c, Call::RemoveFile(_) | Call::RemoveDirAll(_))),
+            0
+        );
+    }
+
+    // U-STO-78: a baseline whose source is not a worktree any more is stale; --fix
+    // deletes that baseline (it is a cache), and only it.
+    #[test]
+    fn stale_baseline_is_reported_and_fixed() {
+        let w = store_world();
+        w.files
+            .borrow_mut()
+            .insert(baseline_dir().join("meta"), b"source=/gone/repo\n".to_vec());
+        let finding = Finding::StoreStaleBaseline {
+            path: baseline_dir(),
+        };
+        let report = run_store(&w, false);
+        assert_eq!(store_findings(&report), vec![&finding]);
+        assert_eq!(w.calls(), vec![]);
+
+        let report = run_store(&w, true);
+        assert_eq!(report.fixed, vec![finding]);
+        assert_eq!(w.calls(), vec![Call::RemoveDirAll(baseline_dir())]);
+    }
+
+    // U-STO-79: a baseline whose source is still a registered worktree (the main one
+    // or a linked one) is not stale.
+    #[test]
+    fn baseline_of_a_linked_worktree_is_not_stale() {
+        let w = store_world();
+        w.files.borrow_mut().insert(
+            baseline_dir().join("meta"),
+            format!("source={}\n", real().display()).into_bytes(),
+        );
+        assert_eq!(store_findings(&run_store(&w, true)), Vec::<&Finding>::new());
+        assert_eq!(w.calls(), vec![]);
+    }
+
+    // U-STO-80: whatever --fix repairs, no worktree directory is ever deleted.
+    #[test]
+    fn fix_never_deletes_a_worktree_directory() {
+        let w = store_world();
+        let ghost = p(&format!("/store/worktrees/{ID}/ghost"));
+        w.put_dir(&ghost);
+        w.files
+            .borrow_mut()
+            .insert(baseline_dir().join("meta"), b"source=/gone/repo\n".to_vec());
+        w.links
+            .borrow_mut()
+            .insert(p("/w/dangling"), p("/store/worktrees/x/y"));
+        let registry = format!(
+            "/w/feat\t{}\n/w/dangling\t/store/worktrees/x/y\n",
+            real().display()
+        );
+        w.files
+            .borrow_mut()
+            .insert(p("/store/links"), registry.into_bytes());
+        run_store(&w, true);
+        assert!(
+            !w.touched(Path::new("/store/worktrees")),
+            "{:#?}",
+            w.calls()
+        );
+        assert!(!w.touched(&real()));
+        assert_eq!(w.count(|c| *c == Call::RemoveFile(p("/w/dangling"))), 1);
+        assert_eq!(w.count(|c| *c == Call::RemoveDirAll(baseline_dir())), 1);
+    }
+
+    /// A store run killed before (or after) its publishing rename.
+    fn crashed_store_run(renamed: bool, link: Option<(&str, &str)>) -> World {
+        let w = store_world();
+        // The finished worktree of `store_world` is not part of this story.
+        w.tree.borrow_mut().remove(&real());
+        w.links.borrow_mut().clear();
+        let staging = p("/store/worktrees/.parhel-staging-dead");
+        let staged = staging.join("feat");
+        w.put_dir(&staging);
+        w.put_file(&staging.join(JOURNAL_FILE), 1, 1);
+        let journal = Journal {
+            repo: p("/w/repo"),
+            worktree: Some(staged.clone()),
+            created_branch: Some("feat".into()),
+            publish_to: Some(real()),
+            branch_start: Some(SHA_A.into()),
+            store_link: link.map(|(path, target)| crate::app::rollback::StoreLink {
+                path: p(path),
+                target: p(target),
+            }),
+        };
+        w.files
+            .borrow_mut()
+            .insert(staging.join(JOURNAL_FILE), journal.encode());
+        w.branches.borrow_mut().insert("feat".into());
+        if let Some((path, target)) = link {
+            w.links.borrow_mut().insert(p(path), p(target));
+        }
+        let gitfile = b"gitdir: /w/repo/.git/worktrees/feat\n".to_vec();
+        let backlink = format!("{}/.git\n", staged.display()).into_bytes();
+        w.files
+            .borrow_mut()
+            .insert(p("/w/repo/.git/worktrees/feat/gitdir"), backlink);
+        if renamed {
+            w.put_dir(&real());
+            w.files.borrow_mut().insert(real().join(".git"), gitfile);
+        } else {
+            w.put_dir(&staged);
+            w.files.borrow_mut().insert(staged.join(".git"), gitfile);
+        }
+        let mut w = w;
+        w.worktrees.retain(|e| e.path != real());
+        w.worktrees.push(WorktreeEntry {
+            path: staged,
+            head: Some(SHA_A.into()),
+            branch: Some("refs/heads/feat".into()),
+            ..WorktreeEntry::default()
+        });
+        w
+    }
+
+    // U-STO-81: killed before the rename: the symlink this run created goes with the
+    // rest, because it still points where the journal says.
+    #[test]
+    fn fix_removes_the_symlink_of_a_crashed_store_run() {
+        let w = crashed_store_run(false, Some(("/w/feat", real().to_str().unwrap())));
+        let report = run_store(&w, true);
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p("/w/feat"))),
+            1,
+            "{:#?}",
+            w.calls()
+        );
+        assert_eq!(
+            w.count(|c| *c
+                == Call::RemoveForce {
+                    path: p("/store/worktrees/.parhel-staging-dead/feat")
+                }),
+            1
+        );
+        assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
+        assert_eq!(
+            w.calls().last(),
+            Some(&Call::RemoveDirAll(p(
+                "/store/worktrees/.parhel-staging-dead"
+            )))
+        );
+    }
+
+    // U-STO-82: a journal is data in a folder anyone could write: it cannot make
+    // doctor remove a symlink that does not point into this store, or that someone
+    // retargeted.
+    #[rstest]
+    #[case::points_outside_the_store("/w/precious", "/w/other")]
+    #[case::points_into_the_store_elsewhere("/w/precious", "/store/baselines/x")]
+    fn fix_ignores_forged_links(#[case] link: &str, #[case] target: &str) {
+        let w = crashed_store_run(false, Some((link, target)));
+        run_store(&w, true);
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p(link))),
+            0,
+            "{:#?}",
+            w.calls()
+        );
+    }
+
+    #[test]
+    fn fix_keeps_a_retargeted_link_of_a_crashed_run() {
+        let w = crashed_store_run(false, Some(("/w/feat", real().to_str().unwrap())));
+        w.links
+            .borrow_mut()
+            .insert(p("/w/feat"), p("/somewhere/else"));
+        run_store(&w, true);
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p("/w/feat"))),
+            0,
+            "{:#?}",
+            w.calls()
+        );
+    }
+
+    // U-STO-83: killed after the rename, before the registration was repaired: the
+    // worktree at its real path is repaired and the symlink stays.
+    #[test]
+    fn fix_repairs_a_store_worktree_published_before_the_crash() {
+        let w = crashed_store_run(true, Some(("/w/feat", real().to_str().unwrap())));
+        let report = run_store(&w, true);
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(
+            w.calls(),
+            vec![
+                Call::Repair { path: real() },
+                Call::RemoveDirAll(p("/store/worktrees/.parhel-staging-dead")),
+            ],
+            "repair at the real path; keep the worktree, its branch and the symlink"
+        );
+    }
+
+    // U-STO-84: a source on ext4 is not a problem while the store can take it: `add`
+    // works, so `not-cow` would be a false alarm. Without a usable store it stays.
+    #[test]
+    fn not_cow_is_not_reported_while_the_store_can_serve_the_source() {
+        let w = World::default().with_store();
+        assert!(!w.volume(Path::new("/w/repo")).unwrap().cow);
+        assert_eq!(run_store(&w, false), DoctorReport::default());
+        // The store is configured but broken: the source's problem is real again.
+        w.files.borrow_mut().remove(&p("/store/.parhel-store"));
+        let report = run_store(&w, false);
+        assert!(
+            report.findings.iter().any(|f| f.code() == "not-cow"),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code() == "store-unavailable"),
+            "{report:#?}"
+        );
+        // And with no store configured at all.
+        let w = World::default().with_store();
+        let report = run_with(&w, false, None);
+        assert!(
+            report.findings.iter().any(|f| f.code() == "not-cow"),
+            "{report:#?}"
         );
     }
 }

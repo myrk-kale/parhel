@@ -211,6 +211,7 @@ fn i80j_forged_journal_cannot_delete_outside_its_folder() {
         created_branch: Some("victim-branch".into()),
         publish_to: Some(victim.clone()),
         branch_start: tip.clone(),
+        store_link: None,
     };
     fs::write(staging.join("journal"), journal.encode()).unwrap();
 

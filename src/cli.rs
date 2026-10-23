@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::domain::request::{DEFAULT_STORE_SIZE, parse_size};
 use crate::domain::{
-    AddRequest, BranchMode, DoctorRequest, Error, ErrorCode, Result, SubmodulePolicy,
+    AddRequest, BranchMode, DoctorRequest, Error, ErrorCode, Result, SetupRequest, SubmodulePolicy,
 };
 
 const ABOUT: &str = "Create Git worktrees with copy-on-write, so node_modules, target/ \
@@ -35,6 +36,7 @@ Examples:
   git parhel add ../hotfix --branch release/1.2
   git parhel add ../review --detach v1.4.0
   git parhel doctor --fix
+  sudo git parhel setup        # Linux, ext4: a store for worktrees without copy-on-write
 
 Remove a worktree with `git worktree remove <path>`.
 Docs: https://github.com/myrk-kale/parhel";
@@ -84,6 +86,22 @@ With --fix, leftovers are undone using the crashed run's journal: only what that
 created is removed, and a worktree that was already published is repaired, not removed."
     )]
     Doctor(DoctorArgs),
+    /// Linux: create the store that gives filesystems without copy-on-write (ext4) cheap worktrees.
+    #[command(
+        long_about = "Create a per-user btrfs image (the store) mounted at /parhel/<user> \
+through a systemd mount unit, so `add` can create worktrees from sources on filesystems \
+without copy-on-write, such as ext4. The worktree lives in the store and the requested \
+destination becomes a symlink to it. Needs root (run it with sudo); the store belongs \
+to the user who ran sudo, or to --user.
+
+Safe to re-run: a healthy store is left as it is. With --remove the store is taken down \
+(refused while worktrees live in it).",
+        after_help = "Examples:
+  sudo git parhel setup
+  sudo git parhel setup --size 200G --user alice
+  sudo git parhel setup --remove"
+    )]
+    Setup(SetupArgs),
 }
 
 // Each bool is an independent command-line switch.
@@ -142,11 +160,29 @@ pub struct DoctorArgs {
     pub fix: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Size of the store image: a number with an optional K, M, G or T suffix.
+    /// The image is sparse, so it takes disk space only as it fills.
+    #[arg(long, value_name = "size")]
+    pub size: Option<String>,
+    /// Allocate the whole image now instead of letting it grow.
+    #[arg(long)]
+    pub preallocate: bool,
+    /// Whose store to create (default: the user who ran sudo).
+    #[arg(long, value_name = "name")]
+    pub user: Option<String>,
+    /// Take the store down: unmount, remove the unit and the image.
+    #[arg(long)]
+    pub remove: bool,
+}
+
 /// What the process should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Add(AddRequest),
     Doctor(DoctorRequest),
+    Setup(SetupRequest),
     /// `--help` (exit 0): text to print on stdout.
     Help(String),
     /// `--version` (exit 0): text to print on stdout.
@@ -179,6 +215,7 @@ where
             from: args.from,
             fix: args.fix,
         })),
+        Command::Setup(args) => args.into_request().map(Invocation::Setup),
     }
 }
 
@@ -196,6 +233,29 @@ fn check_name(flag: &str, value: &str) -> Result<()> {
         return Err(usage(format!("{flag} `{value}` looks like an option")));
     }
     Ok(())
+}
+
+impl SetupArgs {
+    fn into_request(self) -> Result<SetupRequest> {
+        if self.remove && (self.size.is_some() || self.preallocate) {
+            return Err(usage(
+                "--remove takes the store down; --size and --preallocate only apply when creating it",
+            ));
+        }
+        if let Some(user) = &self.user {
+            check_name("--user", user)?;
+        }
+        let size = match &self.size {
+            Some(text) => parse_size(text)?,
+            None => DEFAULT_STORE_SIZE,
+        };
+        Ok(SetupRequest {
+            size,
+            preallocate: self.preallocate,
+            user: self.user,
+            remove: self.remove,
+        })
+    }
 }
 
 impl AddArgs {
@@ -509,5 +569,88 @@ mod tests {
             .join(" ");
         assert!(copy.contains("disk space"), "{text}");
         assert!(copy.contains("across volumes"), "{text}");
+    }
+
+    fn setup(args: &[&str]) -> Result<SetupRequest> {
+        let full = ["git-parhel", "setup"].iter().chain(args).copied();
+        match parse(full)? {
+            Invocation::Setup(req) => Ok(req),
+            other => panic!("expected setup, got {other:?}"),
+        }
+    }
+
+    // U-CLI-20: `setup` with no options is a 100G sparse store for the sudo user.
+    #[test]
+    fn setup_defaults() {
+        assert_eq!(
+            setup(&[]).unwrap(),
+            SetupRequest {
+                size: 100 << 30,
+                preallocate: false,
+                user: None,
+                remove: false,
+            }
+        );
+    }
+
+    // U-CLI-21
+    #[test]
+    fn setup_flags() {
+        let req = setup(&["--size", "200G", "--preallocate", "--user", "alice"]).unwrap();
+        assert_eq!(req.size, 200 << 30);
+        assert!(req.preallocate && !req.remove);
+        assert_eq!(req.user.as_deref(), Some("alice"));
+        assert_eq!(setup(&["--size=512m"]).unwrap().size, 512 << 20);
+        assert!(setup(&["--remove"]).unwrap().remove);
+        assert_eq!(
+            setup(&["--user=root"]).unwrap().user.as_deref(),
+            Some("root")
+        );
+    }
+
+    // U-CLI-22: removing a store has no size; the contradiction is reported, not ignored.
+    #[rstest]
+    #[case::size(&["--remove", "--size", "1G"])]
+    #[case::preallocate(&["--remove", "--preallocate"])]
+    fn setup_remove_conflicts(#[case] args: &[&str]) {
+        let err = setup(args).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage);
+        assert!(err.message.contains("--remove"), "{}", err.message);
+    }
+
+    // U-CLI-23
+    #[rstest]
+    #[case::bad_size(&["--size", "lots"])]
+    #[case::small_size(&["--size", "1M"])]
+    #[case::size_without_value(&["--size"])]
+    #[case::empty_user(&["--user="])]
+    #[case::option_like_user(&["--user=-x"])]
+    #[case::positional(&["alice"])]
+    #[case::unknown_flag(&["--frobnicate"])]
+    fn setup_rejects_invalid_usage(#[case] args: &[&str]) {
+        assert_eq!(setup(args).unwrap_err().code, ErrorCode::Usage, "{args:?}");
+    }
+
+    // U-CLI-24: the help says it needs root and what it creates.
+    #[test]
+    fn setup_help_says_it_needs_sudo() {
+        let Invocation::Help(text) = parse(["git-parhel", "setup", "--help"]).unwrap() else {
+            panic!("expected help");
+        };
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "sudo",
+            "/parhel/<user>",
+            "--size",
+            "--preallocate",
+            "--user",
+            "--remove",
+        ] {
+            assert!(flat.contains(needle), "help lacks `{needle}`: {text}");
+        }
+        let Invocation::Help(top) = parse(["git-parhel", "--help"]).unwrap() else {
+            panic!("expected help");
+        };
+        assert!(top.contains("setup"), "{top}");
     }
 }

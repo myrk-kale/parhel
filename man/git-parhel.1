@@ -26,6 +26,9 @@ Create a copy\-on\-write worktree
 git\-parhel\-doctor(1)
 Diagnose the environment and clean up after crashed runs
 .TP
+git\-parhel\-setup(1)
+Linux: create the store that gives filesystems without copy\-on\-write (ext4) cheap worktrees
+.TP
 git\-parhel\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH EXTRA
@@ -34,6 +37,7 @@ Examples:
   git parhel add ../hotfix \-\-branch release/1.2
   git parhel add ../review \-\-detach v1.4.0
   git parhel doctor \-\-fix
+  sudo git parhel setup        # Linux, ext4: a store for worktrees without copy\-on\-write
 
 Remove a worktree with `git worktree remove <path>`.
 Docs: https://github.com/myrk\-kale/parhel

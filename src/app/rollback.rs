@@ -71,6 +71,20 @@ pub struct Journal {
     /// deleted on rollback only while it still points there, so commits made on it
     /// after a crash are never lost. Missing (older journals): never deleted.
     pub branch_start: Option<String>,
+    /// Store runs: the symlink placed at the requested destination and the real
+    /// worktree path it points to, recorded before the symlink is created. Rollback
+    /// removes the symlink only while it still is a symlink to exactly this target.
+    /// Missing (journals of runs without the store, and older ones): none.
+    pub store_link: Option<StoreLink>,
+}
+
+/// The symlink a store run claims at the requested destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreLink {
+    /// Where the symlink lives (the destination the user asked for).
+    pub path: PathBuf,
+    /// What it points to (the worktree's real path inside the store).
+    pub target: PathBuf,
 }
 
 impl Journal {
@@ -89,6 +103,14 @@ impl Journal {
             self.publish_to.as_ref().map(|p| p.as_os_str().as_bytes()),
         );
         put(&mut out, self.branch_start.as_ref().map(String::as_bytes));
+        // One field, `path NUL target` (neither can contain NUL), added in 0.4.
+        let link = self.store_link.as_ref().map(|l| {
+            let mut bytes = l.path.as_os_str().as_bytes().to_vec();
+            bytes.push(0);
+            bytes.extend_from_slice(l.target.as_os_str().as_bytes());
+            bytes
+        });
+        put(&mut out, link.as_deref());
         out
     }
 
@@ -116,6 +138,22 @@ impl Journal {
         } else {
             r.field()?.map(|b| String::from_utf8_lossy(b).into_owned())
         };
+        // Added in 0.4: absent from journals written by older versions.
+        let store_link = if r.0.is_empty() {
+            None
+        } else {
+            r.field()?
+                .map(|b| {
+                    let split = b.iter().position(|&c| c == 0).ok_or_else(|| {
+                        Error::new(ErrorCode::Io, "malformed store link in parhel journal")
+                    })?;
+                    Ok(StoreLink {
+                        path: path(&b[..split]),
+                        target: path(&b[split + 1..]),
+                    })
+                })
+                .transpose()?
+        };
         if !r.0.is_empty() {
             return Err(Error::new(
                 ErrorCode::Io,
@@ -128,6 +166,7 @@ impl Journal {
             created_branch,
             publish_to,
             branch_start,
+            store_link,
         })
     }
 }
@@ -211,6 +250,7 @@ mod tests {
             created_branch: Some("feat".into()),
             publish_to: Some(p("/w/feat")),
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         }
     }
 
@@ -238,6 +278,7 @@ mod tests {
             created_branch: Some("feat/with=equals".into()),
             publish_to: Some(weird.join("dest")),
             branch_start: Some(SHA_A.into()),
+            store_link: None,
         };
         assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
     }
@@ -359,7 +400,7 @@ mod tests {
                 publish_to in prop::option::of(path()),
                 branch_start in prop::option::of("[0-9a-f]{40}"),
             ) {
-                let j = Journal { repo, worktree, created_branch: branch, publish_to, branch_start };
+                let j = Journal { repo, worktree, created_branch: branch, publish_to, branch_start, store_link: None };
                 prop_assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
             }
 
@@ -404,9 +445,128 @@ mod tests {
             ..full_journal()
         }
         .encode();
-        bytes.pop(); // drop the trailing "absent" marker of the newest field
+        // Drop the trailing "absent" markers of the two newest fields.
+        bytes.truncate(bytes.len() - 2);
         let j = Journal::decode(&bytes).unwrap();
         assert_eq!(j.branch_start, None);
         assert_eq!(j.created_branch.as_deref(), Some("feat"));
+    }
+
+    const REAL: &str = "/store/worktrees/7005185596c2e32bd0688ebe72725f92/feat";
+    const STORE_STAGING: &str = "/store/worktrees/.parhel-staging-test";
+
+    fn store_journal() -> Journal {
+        Journal {
+            worktree: Some(p(STORE_STAGING).join("feat")),
+            publish_to: Some(p(REAL)),
+            store_link: Some(StoreLink {
+                path: p("/w/feat"),
+                target: p(REAL),
+            }),
+            ..full_journal()
+        }
+    }
+
+    // U-STO-60: the link field is data like the rest (real: pure encoding).
+    #[test]
+    fn journal_round_trips_the_store_link() {
+        let j = store_journal();
+        assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
+        let weird = PathBuf::from(OsStr::from_bytes(b"/w/a b\nc=d\xff"));
+        let j = Journal {
+            store_link: Some(StoreLink {
+                path: weird.clone(),
+                target: weird.join("t\te"),
+            }),
+            ..store_journal()
+        };
+        assert_eq!(Journal::decode(&j.encode()).unwrap(), j);
+    }
+
+    // U-STO-61: journals written before the link existed (every journal of 0.3 and
+    // earlier) still decode, with no link.
+    #[test]
+    fn decodes_journal_without_store_link() {
+        let mut bytes = full_journal().encode();
+        bytes.pop(); // the "absent" marker of the link field
+        let j = Journal::decode(&bytes).unwrap();
+        assert_eq!(j.store_link, None);
+        assert_eq!(j, full_journal());
+    }
+
+    // U-STO-62: a half-written link field is corruption, not "no link".
+    #[test]
+    fn decode_rejects_a_link_without_a_target() {
+        let mut bytes = full_journal().encode();
+        bytes.pop();
+        bytes.extend_from_slice(&[1, 3, 0, 0, 0, b'/', b'w', b'x']); // no NUL separator
+        assert_eq!(Journal::decode(&bytes).unwrap_err().code, ErrorCode::Io);
+    }
+
+    fn rollback_store(w: &World) {
+        rollback(w, w, &p(STORE_STAGING), &store_journal()).unwrap();
+    }
+
+    // U-STO-63: the symlink this run created is removed, and nothing at its place
+    // is removed with a recursive delete.
+    #[test]
+    fn rollback_removes_the_symlink_it_created() {
+        let w = World::default();
+        w.put_link(Path::new("/w/feat"), Path::new(REAL));
+        rollback_store(&w);
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p("/w/feat"))),
+            1,
+            "{:#?}",
+            w.calls()
+        );
+        assert_eq!(w.count(|c| *c == Call::RemoveDirAll(p("/w/feat"))), 0);
+        assert_eq!(
+            w.calls().last(),
+            Some(&Call::RemoveDirAll(p(STORE_STAGING))),
+            "staging still goes last"
+        );
+    }
+
+    // U-STO-64: a link that now points elsewhere is somebody else's.
+    #[test]
+    fn rollback_keeps_a_symlink_that_was_retargeted() {
+        let w = World::default();
+        w.put_link(Path::new("/w/feat"), Path::new("/somewhere/else"));
+        rollback_store(&w);
+        assert!(!w.touched(Path::new("/w/feat")), "{:#?}", w.calls());
+    }
+
+    // U-STO-65: a regular file or directory at the path is never removed.
+    #[test]
+    fn rollback_keeps_a_directory_or_file_in_its_place() {
+        let w = World::default();
+        w.put_dir(Path::new("/w/feat"));
+        w.put_file(Path::new("/w/feat/precious"), 1, 1);
+        rollback_store(&w);
+        assert!(!w.touched(Path::new("/w/feat")), "{:#?}", w.calls());
+
+        let w = World::default();
+        w.put_file(Path::new("/w/feat"), 1, 1);
+        rollback_store(&w);
+        assert!(!w.touched(Path::new("/w/feat")), "{:#?}", w.calls());
+    }
+
+    // U-STO-66: nothing there (the run died before claiming it) is fine.
+    #[test]
+    fn rollback_without_the_symlink_is_not_an_error() {
+        let w = World::default();
+        rollback_store(&w);
+        assert!(!w.touched(Path::new("/w/feat")), "{:#?}", w.calls());
+    }
+
+    // U-STO-67: a symlink that cannot be removed is reported with the command to run.
+    #[test]
+    fn rollback_names_the_symlink_it_could_not_remove() {
+        let w = World::default().failing(Step::RemoveFile, ErrorCode::Io);
+        w.put_link(Path::new("/w/feat"), Path::new(REAL));
+        let err = rollback(&w, &w, &p(STORE_STAGING), &store_journal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::RollbackFailed);
+        assert!(err.message.contains("/w/feat"), "{}", err.message);
     }
 }
