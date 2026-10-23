@@ -2474,6 +2474,65 @@ mod tests {
         assert_no_mutation(&w);
     }
 
+    // U-TXN-91: a source directory that is an ancestor of an exclusion is recreated
+    // empty; it takes the source's mode only after everything inside it is in place
+    // (a read-only source directory could not be filled otherwise), deepest first,
+    // for clones and copies alike.
+    #[rstest::rstest]
+    fn created_directories_take_their_mode_after_their_contents(#[values(false, true)] copy: bool) {
+        let mut w = World::default();
+        for other in ["/w/repo/wt/other", "/w/repo/wt/deep/other"] {
+            w.worktrees.push(WorktreeEntry {
+                path: p(other),
+                ..WorktreeEntry::default()
+            });
+        }
+        w.tree
+            .borrow_mut()
+            .get_mut(&p("/w/repo"))
+            .unwrap()
+            .push(OsString::from("wt"));
+        w.tree.borrow_mut().insert(
+            p("/w/repo/wt"),
+            ["deep", "notes", "other"].map(OsString::from).to_vec(),
+        );
+        w.tree.borrow_mut().insert(
+            p("/w/repo/wt/deep"),
+            ["data", "other"].map(OsString::from).to_vec(),
+        );
+        let mut req = new_branch();
+        req.copy = copy;
+        run(&w, &req).unwrap();
+
+        let calls = w.calls();
+        let mode_at = |to: &str| {
+            calls
+                .iter()
+                .position(|c| matches!(c, Call::CopyMode { to: t, .. } if *t == p(to)))
+                .unwrap_or_else(|| panic!("no mode for {to}: {calls:#?}"))
+        };
+        let (deep, wt) = (
+            mode_at(&format!("{STAGED_WT}/wt/deep")),
+            mode_at(&format!("{STAGED_WT}/wt")),
+        );
+        let root = mode_at(STAGED_WT);
+        assert!(deep < wt && wt < root, "deepest first: {calls:#?}");
+        // Every entry created or filled below a directory precedes its mode.
+        for (i, call) in calls.iter().enumerate() {
+            let below = |dir: &str| match call {
+                Call::Clone { dst, .. } | Call::Copy { dst, .. } | Call::CreateDir(dst) => {
+                    dst.starts_with(format!("{STAGED_WT}/{dir}"))
+                }
+                _ => false,
+            };
+            assert!(
+                !below("wt/deep") || i < deep,
+                "{call:?} after the mode of deep"
+            );
+            assert!(!below("wt") || i < wt, "{call:?} after the mode of wt");
+        }
+    }
+
     // U-TXN-90: without --copy nothing changes: still clones, still reports
     // copy-on-write.
     #[test]

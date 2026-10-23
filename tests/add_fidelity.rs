@@ -9,6 +9,7 @@ use std::process::Command;
 
 use common::xattr;
 use common::*;
+use rstest::rstest;
 
 fn add_ok(sb: &Sandbox, src: &TestRepo, dest: &Path) -> TestRepo {
     let out = parhel(&sb.env, &src.root, &add_args(dest, &["--new-branch", "f"]));
@@ -211,4 +212,74 @@ fn i23i_directory_permissions_are_not_widened() {
     assert_eq!(mode(&wt.path(".worktrees")), 0o700, "created ancestor");
     assert_eq!(mode(&wt.path(".env")), 0o600);
     src.chmod(".", 0o755);
+}
+
+/// Makes the given directories writable again when dropped, so the sandbox can be
+/// removed even when an assertion failed.
+struct Unlock(Vec<std::path::PathBuf>);
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+// I-23j: a read-only source directory that is an ancestor of an exclusion (a nested
+// worktree, a `.parhelignore` entry) is rebuilt by parhel and filled before it is
+// locked: every entry arrives and the mode is the source's, for clones and copies.
+#[rstest]
+fn i23j_read_only_ancestors_of_exclusions_are_filled_then_locked(
+    #[values(false, true)] copy: bool,
+) {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    src.write(".parhelignore", "ro/inner/skip/\n");
+    src.write("ro/kept.txt", "kept\n");
+    src.write("ro/inner/kept.txt", "kept too\n");
+    src.write("ro/inner/skip/big.bin", "skipped\n");
+    src.commit_all("read-only tree");
+    // Ignored files and a nested worktree below another read-only directory.
+    src.write(".worktrees/notes.txt", "notes\n");
+    let nested = src.path(".worktrees/other");
+    src.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "other",
+        nested.to_str().unwrap(),
+    ]);
+    let locked = ["ro/inner", "ro", ".worktrees"].map(|d| src.path(d));
+    let _unlock_source = Unlock(locked.to_vec());
+    for dir in &locked {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    let dest = sb.path("locked");
+    let _unlock_dest = Unlock(
+        ["ro/inner", "ro", ".worktrees"]
+            .map(|d| dest.join(d))
+            .to_vec(),
+    );
+    let mut extra = vec!["--new-branch", "ro-copy"];
+    if copy {
+        extra.push("--copy");
+    }
+    let out = parhel(&sb.env, &src.root, &add_args(&dest, &extra));
+    assert_success(&out);
+
+    let wt = TestRepo::open(&sb.env, &dest);
+    wt.assert_clean();
+    assert_eq!(wt.read("ro/kept.txt"), "kept\n");
+    assert_eq!(wt.read("ro/inner/kept.txt"), "kept too\n");
+    assert_eq!(wt.read(".worktrees/notes.txt"), "notes\n");
+    assert!(!wt.exists("ro/inner/skip"), "`.parhelignore` entry copied");
+    assert!(!wt.exists(".worktrees/other"), "nested worktree copied");
+    let mode = |rel: &str| fs::metadata(wt.path(rel)).unwrap().permissions().mode() & 0o777;
+    for rel in ["ro", "ro/inner", ".worktrees"] {
+        assert_eq!(mode(rel), 0o555, "{rel}");
+    }
+    assert_no_staging(&[&sb.root]);
 }
