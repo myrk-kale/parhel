@@ -1,14 +1,15 @@
 //! The store: discovery and the baseline sync.
-//!
-//! TDD state: both entry points answer `not-implemented`; the tests in this module
-//! and in `add`, `doctor` and `rollback` describe what they must do.
 
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::exclusions::Exclusions;
-use crate::domain::store::StoreState;
-use crate::domain::{Error, Result};
+use crate::domain::store::{
+    EntryKind, EntryMeta, MARKER_FILE, Marker, Store, StoreState, SyncAction, sync_action,
+};
+use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::CowFs;
 
 /// What a sync did to the baseline.
@@ -31,24 +32,259 @@ pub struct SyncReport {
 ///   copy-on-write filesystem, or not writable: [`StoreState::Unavailable`] with the
 ///   reason;
 /// - otherwise [`StoreState::Available`].
-pub fn discover(_fs: &dyn CowFs, _path: &Path) -> Result<StoreState> {
-    Err(Error::not_implemented("store discovery"))
+///
+/// Only looks: nothing is created or changed.
+pub fn discover(fs: &dyn CowFs, path: &Path) -> Result<StoreState> {
+    if !fs.exists_no_follow(path)? {
+        return Ok(StoreState::NotConfigured);
+    }
+    let unavailable = |reason: String| {
+        Ok(StoreState::Unavailable {
+            root: path.to_path_buf(),
+            reason,
+        })
+    };
+    // The marker lives inside the mounted image: without it the path is an empty mount
+    // point (the unit is not running) or somebody else's directory.
+    let marker_path = path.join(MARKER_FILE);
+    let text = match fs.read_file(&marker_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => {
+            return unavailable(format!(
+                "`{}` has no `{MARKER_FILE}` marker: the store is not mounted or was not set \
+                 up by `git parhel setup`",
+                path.display()
+            ));
+        }
+    };
+    let marker = match Marker::parse(&text) {
+        Ok(marker) => marker,
+        Err(e) => return unavailable(e.message),
+    };
+    let volume = fs.volume(path)?;
+    if !volume.cow {
+        return unavailable(format!(
+            "`{}` is on {}, which has no copy-on-write; a store must be on btrfs (or another \
+             filesystem that can reflink)",
+            path.display(),
+            volume.fs_type
+        ));
+    }
+    if !fs.is_writable(path)? {
+        return unavailable(format!(
+            "`{}` is not writable by the current user",
+            path.display()
+        ));
+    }
+    Ok(StoreState::Available(Store {
+        root: path.to_path_buf(),
+        marker,
+    }))
+}
+
+/// Size from which the first sync of a repository announces itself.
+pub const NOTICE_BYTES: u64 = 1 << 30;
+
+/// Bytes the first sync of `source` into an empty or missing `baseline` would copy, or
+/// `None` when the baseline already holds something (later syncs copy only the
+/// difference). Only `stat`s: nothing is read.
+pub fn first_sync_size(
+    fs: &dyn CowFs,
+    source: &Path,
+    baseline: &Path,
+    exclusions: &Exclusions,
+) -> Result<Option<u64>> {
+    let occupied = fs
+        .stat_within(baseline, Path::new(""))?
+        .is_some_and(|meta| meta.kind == EntryKind::Dir)
+        && fs
+            .list_dir_within(baseline, Path::new(""))?
+            .is_some_and(|names| !names.is_empty());
+    if occupied {
+        return Ok(None);
+    }
+    let mut total = 0u64;
+    let mut pending = vec![PathBuf::new()];
+    while let Some(dir) = pending.pop() {
+        for name in fs.list_dir_within(source, &dir)?.unwrap_or_default() {
+            let rel = dir.join(name);
+            if exclusions.is_excluded(&rel) {
+                continue;
+            }
+            match fs.stat_within(source, &rel)? {
+                Some(EntryMeta {
+                    kind: EntryKind::Dir,
+                    ..
+                }) => pending.push(rel),
+                Some(EntryMeta {
+                    kind: EntryKind::File,
+                    size,
+                    ..
+                }) => total = total.saturating_add(size),
+                _ => {}
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
+/// The one-line notice printed before a first sync that copies `bytes`, if it is big
+/// enough to be worth one.
+#[must_use]
+pub fn first_sync_notice(bytes: u64) -> Option<String> {
+    (bytes > NOTICE_BYTES).then(|| {
+        #[allow(clippy::cast_precision_loss)]
+        let gib = bytes as f64 / f64::from(1u32 << 30);
+        format!(
+            "copying {gib:.1} GiB into the store: the first worktree of a repository mirrors it \
+             once, the next ones copy only what changed"
+        )
+    })
 }
 
 /// Bring the baseline tree `baseline` in line with the live source worktree `source`:
 /// walk the source anchored on directory descriptors (`CowFs::list_dir_within`,
 /// `stat_within`), skip `exclusions`, and for each entry apply
-/// [`sync_action`](crate::domain::store::sync_action); delete baseline entries the
+/// [`sync_action`]; delete baseline entries the
 /// source does not have (or that are now excluded); set a directory's metadata after
 /// its children. Stops with `interrupted` when `interrupted` is raised.
+///
+/// Safe to repeat and to run after a crash: it always compares everything, so a
+/// half-synced baseline is repaired by the next run. Existing worktrees are
+/// independent reflink clones, so rewriting baseline files in place never reaches them.
 pub fn sync_baseline(
-    _fs: &dyn CowFs,
-    _source: &Path,
-    _baseline: &Path,
-    _exclusions: &Exclusions,
-    _interrupted: &AtomicBool,
+    fs: &dyn CowFs,
+    source: &Path,
+    baseline: &Path,
+    exclusions: &Exclusions,
+    interrupted: &AtomicBool,
 ) -> Result<SyncReport> {
-    Err(Error::not_implemented("baseline sync"))
+    let mut sync = Sync {
+        fs,
+        source,
+        baseline,
+        exclusions,
+        interrupted,
+        report: SyncReport::default(),
+    };
+    sync.check_interrupt()?;
+    sync.entry(Path::new(""))?;
+    Ok(sync.report)
+}
+
+struct Sync<'a> {
+    fs: &'a dyn CowFs,
+    source: &'a Path,
+    baseline: &'a Path,
+    exclusions: &'a Exclusions,
+    interrupted: &'a AtomicBool,
+    report: SyncReport,
+}
+
+impl Sync<'_> {
+    fn check_interrupt(&self) -> Result<()> {
+        if self.interrupted.load(Ordering::SeqCst) {
+            return Err(Error::new(
+                ErrorCode::Interrupted,
+                "interrupted; rolled back",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compare and fix the entry `rel` and, for a directory, everything below it.
+    /// Returns whether the entry itself was created, rewritten or replaced (which
+    /// changes its parent directory).
+    fn entry(&mut self, rel: &Path) -> Result<bool> {
+        self.check_interrupt()?;
+        if !rel.as_os_str().is_empty() {
+            crate::failpoint!("sync_entry", rel);
+        }
+        let Some(source) = self.fs.stat_within(self.source, rel)? else {
+            // Gone since it was listed (or a socket, which a worktree never holds):
+            // the baseline must not keep it.
+            return self.remove_if_present(rel);
+        };
+        let dst = self.baseline.join(rel);
+        let held = self.fs.stat_within(self.baseline, rel)?;
+        let action = sync_action(&source, held.as_ref());
+        match action {
+            SyncAction::Keep => self.report.unchanged += 1,
+            SyncAction::Create | SyncAction::Update => {}
+            SyncAction::Replace => {
+                self.remove(rel, held.as_ref())?;
+            }
+        }
+        if action != SyncAction::Keep {
+            self.report.bytes += self.fs.mirror_entry(self.source, rel, &dst)?;
+            if source.kind != EntryKind::Dir {
+                self.report.copied += 1;
+            }
+        }
+        let mut touched = action != SyncAction::Keep;
+        if source.kind == EntryKind::Dir {
+            touched |=
+                self.children(rel, held.as_ref().filter(|_| action != SyncAction::Replace))?;
+            if touched {
+                self.check_interrupt()?;
+                self.fs.mirror_dir_meta(self.source, rel, &dst)?;
+            }
+        }
+        Ok(action != SyncAction::Keep)
+    }
+
+    /// Sync the entries of the directory `rel`; whether any of them changed.
+    fn children(&mut self, rel: &Path, held: Option<&EntryMeta>) -> Result<bool> {
+        let wanted: BTreeSet<OsString> = self
+            .fs
+            .list_dir_within(self.source, rel)?
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| !self.exclusions.is_excluded(&rel.join(name)))
+            .collect();
+        let mut touched = false;
+        // What the baseline has and the source does not (or no longer wants).
+        if held.is_some_and(|meta| meta.kind == EntryKind::Dir) {
+            let mut extra: Vec<OsString> = self
+                .fs
+                .list_dir_within(self.baseline, rel)?
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|name| !wanted.contains(name))
+                .collect();
+            extra.sort();
+            for name in extra {
+                self.check_interrupt()?;
+                touched |= self.remove_if_present(&rel.join(name))?;
+            }
+        }
+        for name in wanted {
+            touched |= self.entry(&rel.join(name))?;
+        }
+        Ok(touched)
+    }
+
+    fn remove_if_present(&mut self, rel: &Path) -> Result<bool> {
+        let held = self.fs.stat_within(self.baseline, rel)?;
+        if held.is_none() {
+            return Ok(false);
+        }
+        self.remove(rel, held.as_ref())?;
+        Ok(true)
+    }
+
+    /// Remove the baseline entry `rel`: a directory whole, anything else by name.
+    fn remove(&mut self, rel: &Path, held: Option<&EntryMeta>) -> Result<()> {
+        let Some(held) = held else { return Ok(()) };
+        let path = self.baseline.join(rel);
+        if held.kind == EntryKind::Dir {
+            self.fs.remove_dir_all(&path)?;
+        } else {
+            self.fs.remove_file(&path)?;
+        }
+        self.report.deleted += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -190,12 +426,13 @@ mod tests {
     }
 
     /// `/w/repo` with `.git/`, `node_modules/big` (100 bytes) and `src/main.rs`
-    /// (20 bytes), and an empty baseline directory.
+    /// (20 bytes), and no baseline yet: the first sync creates the tree itself, root
+    /// included (`baselines/<id>` exists, `tree` does not).
     fn world() -> World {
         let w = World::default().with_store();
         w.put_file(&src("node_modules/big"), 100, 10);
         w.put_file(&src("src/main.rs"), 20, 20);
-        w.put_dir(&base());
+        w.put_dir(base().parent().unwrap());
         w
     }
 
