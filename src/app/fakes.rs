@@ -15,8 +15,8 @@ use crate::domain::store::{EntryKind, EntryMeta};
 use crate::domain::{BranchMode, Error, ErrorCode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
 use crate::ports::{
-    CowFs, FileLock, Git, Host, ImageUsage, Owner, RepoInfo, Scan, Space, UserInfo, VolumeInfo,
-    WorktreeAddSpec,
+    CowFs, FileLock, Git, Host, ImageUsage, MountBacking, Owner, RepoInfo, Scan, Space, UserInfo,
+    VolumeInfo, WorktreeAddSpec,
 };
 
 pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1194,6 +1194,8 @@ pub struct FakeHost {
     /// Images that hold some other filesystem, by type (not made by `setup`).
     pub foreign: RefCell<HashMap<PathBuf, String>>,
     pub mounted: RefCell<HashSet<PathBuf>>,
+    /// Mount points where what is mounted is not the store's image, by what it is.
+    pub foreign_mounts: RefCell<HashMap<PathBuf, String>>,
     pub immutable: RefCell<HashSet<PathBuf>>,
     /// Modes and owners last given to a path.
     pub attrs: RefCell<HashMap<PathBuf, (u32, Owner)>>,
@@ -1242,6 +1244,7 @@ impl Default for FakeHost {
             formatted: RefCell::default(),
             foreign: RefCell::default(),
             mounted: RefCell::default(),
+            foreign_mounts: RefCell::default(),
             immutable: RefCell::default(),
             attrs: RefCell::default(),
             fail_run: RefCell::default(),
@@ -1399,6 +1402,16 @@ impl Host for FakeHost {
 
     fn is_mount_point(&self, path: &Path) -> bool {
         self.mounted.borrow().contains(path)
+    }
+
+    fn mount_backing(&self, mount_point: &Path, _image: &Path) -> Result<MountBacking> {
+        if !self.mounted.borrow().contains(mount_point) {
+            return Ok(MountBacking::NotMounted);
+        }
+        Ok(match self.foreign_mounts.borrow().get(mount_point) {
+            Some(what) => MountBacking::Other(what.clone()),
+            None => MountBacking::Image,
+        })
     }
 
     fn is_immutable(&self, path: &Path) -> bool {

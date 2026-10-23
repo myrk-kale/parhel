@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::app::add::Env;
 use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
 use crate::app::store::discover;
+use crate::domain::mounts;
 use crate::domain::paths::{self, is_staging_name};
 use crate::domain::store::{
     BASELINES_DIR, LINKS_FILE, Store, StoreState, WORKTREES_DIR, is_repo_id, repo_id,
@@ -497,23 +498,12 @@ fn check_store(
 /// deleted: the data lives on only until the store is unmounted.
 fn deleted_image(fs: &dyn CowFs, root: &Path) -> Option<String> {
     let info = fs.read_file(Path::new("/proc/self/mountinfo")).ok()?;
-    let info = String::from_utf8_lossy(&info);
+    let entries = mounts::parse(&String::from_utf8_lossy(&info));
     // The deepest mount point that holds the store: the store itself in production.
-    let mut best: Option<(usize, &str)> = None;
-    for line in info.lines() {
-        let Some((before, after)) = line.split_once(" - ") else {
-            continue;
-        };
-        let (Some(mount), Some(source)) = (before.split(' ').nth(4), after.split(' ').nth(1))
-        else {
-            continue;
-        };
-        let mount = unescape_mount(mount);
-        if root.starts_with(&mount) && best.is_none_or(|(len, _)| mount.as_os_str().len() >= len) {
-            best = Some((mount.as_os_str().len(), source));
-        }
-    }
-    let device = Path::new(best?.1).file_name()?.to_str()?;
+    let device = Path::new(&mounts::mount_holding(&entries, root)?.source)
+        .file_name()?
+        .to_str()?
+        .to_owned();
     if !device.starts_with("loop") {
         return None;
     }
@@ -523,29 +513,6 @@ fn deleted_image(fs: &dyn CowFs, root: &Path) -> Option<String> {
     let backing = String::from_utf8_lossy(&backing);
     let image = backing.trim_end().strip_suffix(" (deleted)")?;
     Some(image.to_owned())
-}
-
-/// `/proc/self/mountinfo` writes a space, tab, newline or backslash in a path as `\040`
-/// (octal).
-fn unescape_mount(field: &str) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let octal = (bytes[i] == b'\\' && i + 3 < bytes.len())
-            .then(|| std::str::from_utf8(&bytes[i + 1..i + 4]).ok())
-            .flatten()
-            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
-        if let Some(byte) = octal {
-            out.push(byte);
-            i += 4;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
 /// The filesystem holding the image grows with the store (under 10% free or under 2 GiB

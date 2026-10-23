@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::request::DEFAULT_STORE_SIZE;
 use crate::domain::store::{BASELINES_DIR, MARKER_FILE, Marker, WORKTREES_DIR};
 use crate::domain::{Error, ErrorCode, Result, SetupRequest};
-use crate::ports::{Host, Owner, UserInfo};
+use crate::ports::{Host, MountBacking, Owner, UserInfo};
 
 /// Where the images live: root's, and immutable once there is one.
 const STATE_DIR: &str = "/var/lib/parhel";
@@ -325,6 +325,10 @@ fn create(host: &dyn Host, places: &Places, request: &SetupRequest) -> Result<Se
         ));
     }
 
+    if mounted {
+        verify_mount(host, places)?;
+    }
+
     // A directory that already protects other images cannot take a new one.
     let lifted = !image_present && host.is_immutable(Path::new(STATE_DIR));
     if lifted {
@@ -379,7 +383,13 @@ fn build(
         host.create_image(&places.image, request.size, request.preallocate)?;
         progress.built = true;
     }
-    match host.filesystem_of(&places.image)? {
+    // A mounted image is in use - and has a filesystem, whatever `blkid` makes of it.
+    let found = if existing.mounted {
+        Some("btrfs".to_owned())
+    } else {
+        host.filesystem_of(&places.image)?
+    };
+    match found {
         None => {
             let label = format!("parhel-{}", places.user.name);
             let image = places.image.to_string_lossy();
@@ -436,6 +446,8 @@ fn build(
                 ),
             ));
         }
+        // What is there now is the unit's doing - unless something else was mounted over it.
+        verify_mount(host, places)?;
         progress.changed = true;
     }
 
@@ -460,6 +472,25 @@ fn build(
         progress.changed = true;
     }
     Ok(())
+}
+
+/// The filesystem mounted at the store's place must be the store's image. Whatever else is
+/// there is not ours: it is not laid out (a directory, a marker, a `chown`), not protected on
+/// its behalf and not unmounted.
+fn verify_mount(host: &dyn Host, places: &Places) -> Result<()> {
+    match host.mount_backing(&places.root, &places.image)? {
+        MountBacking::NotMounted | MountBacking::Image => Ok(()),
+        MountBacking::Other(what) => Err(Error::new(
+            ErrorCode::StoreUnavailable,
+            format!(
+                "{} is a mount point of {what}, not of {}: `git parhel setup` does not lay \
+                 out, protect or unmount what it did not mount. Unmount it (or move it \
+                 elsewhere) and run this again; nothing was changed",
+                places.root.display(),
+                places.image.display()
+            ),
+        )),
+    }
 }
 
 /// A unit that exists must be this user's: never overwrite somebody's.
@@ -570,6 +601,9 @@ fn remove(host: &dyn Host, places: &Places) -> Result<SetupOutcome> {
     }
     if let Some(text) = &unit_text {
         check_unit(places, text)?;
+    }
+    if mounted {
+        verify_mount(host, places)?;
     }
 
     // The worktrees are the user's work. They can only be seen with the store mounted:
@@ -1418,6 +1452,64 @@ mod tests {
         assert_eq!(h.lines(), expected_setup());
     }
 
+    // U-SET-27: what is mounted at the store's place is the store only if it is the store's
+    // image. Anything else - a tmpfs somebody mounted there, another disk, a loop device of
+    // another file - is not laid out (directories, a marker, chown), not protected on its
+    // behalf, and not unmounted.
+    #[rstest]
+    #[case::tmpfs("tmpfs (tmpfs)")]
+    #[case::another_disk("/dev/sdb1 (ext4)")]
+    #[case::another_image("a loop device backed by /srv/other.img")]
+    fn a_mount_that_is_not_the_stores_image_is_left_alone(#[case] what: &str) {
+        let h = FakeHost::default();
+        installed(&h);
+        h.foreign_mounts.borrow_mut().insert(p(ROOT), what.into());
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        assert!(err.message.contains(what), "{}", err.message);
+        assert!(err.message.contains(IMG), "{}", err.message);
+        assert_no_mutation(&h);
+    }
+
+    // U-SET-27b: ... also when it only turns out after the unit was started (something
+    // is mounted over it, or the unit mounts something else): nothing is laid out inside.
+    #[test]
+    fn a_foreign_filesystem_after_the_start_is_not_laid_out() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.mounted.borrow_mut().clear();
+        h.foreign_mounts
+            .borrow_mut()
+            .insert(p(ROOT), "tmpfs (tmpfs)".into());
+        h.files
+            .borrow_mut()
+            .remove(&p("/parhel/alice/.parhel-store"));
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        assert_eq!(
+            h.lines(),
+            vec!["run systemctl enable --now parhel-alice.mount"],
+            "started, found something else there, stopped there"
+        );
+        assert!(h.text("/parhel/alice/.parhel-store").is_none());
+    }
+
+    // U-SET-27c: a store that is mounted is not looked at for a filesystem or formatted:
+    // the image is in use, whatever `blkid` makes of it.
+    #[test]
+    fn a_mounted_store_is_never_formatted() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.formatted.borrow_mut().clear();
+        h.immutable.borrow_mut().clear();
+        setup(&h, &request()).unwrap();
+        assert!(
+            !h.lines().iter().any(|l| l.contains("mkfs")),
+            "{:?}",
+            h.lines()
+        );
+    }
+
     // ------------------------------------------------------------------- removal
 
     // U-SET-30: worktrees in the store are not ours to destroy: refuse, naming them.
@@ -1626,6 +1718,27 @@ mod tests {
             Some("run umount /parhel/alice")
         );
         assert!(!h.exists(Path::new(IMG)) && !h.exists(Path::new(ROOT)));
+    }
+
+    // U-SET-28: removal unmounts the store only if it is the store: a foreign mount at the
+    // place is refused before the unit is touched, the image deleted or anything unmounted.
+    #[rstest]
+    #[case::with_the_unit(true)]
+    #[case::without_the_unit(false)]
+    fn remove_leaves_a_foreign_mount_alone(#[case] unit: bool) {
+        let h = FakeHost::default();
+        installed(&h);
+        if !unit {
+            h.files.borrow_mut().remove(&p(UNIT_FILE));
+        }
+        h.foreign_mounts
+            .borrow_mut()
+            .insert(p(ROOT), "tmpfs (tmpfs)".into());
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        assert!(err.message.contains("tmpfs"), "{}", err.message);
+        assert_no_mutation(&h);
+        assert!(h.exists(Path::new(IMG)));
     }
 
     // U-SET-40: staging directories of an `add` are not worktrees.
