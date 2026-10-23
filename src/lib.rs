@@ -197,23 +197,58 @@ fn print_doctor(report: &DoctorReport) -> ExitCode {
     }
 }
 
+/// `1073741824` as `1.0 GiB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn report_setup(outcome: &SetupOutcome) {
     let show = |summary: &StoreSummary| {
         println!("store   {}", summary.store.display());
         println!("image   {}", summary.image.display());
         println!(
-            "size    {} bytes ({} allocated)",
-            summary.apparent, summary.allocated
+            "size    {} ({} bytes), {} allocated now",
+            human_size(summary.apparent),
+            summary.apparent,
+            human_size(summary.allocated)
         );
         println!("unit    {}", summary.unit);
+        println!(
+            "remove  sudo git parhel setup --remove --user {}",
+            summary.user
+        );
     };
     match outcome {
         SetupOutcome::Created(summary) => {
             println!("Created the store for {}", summary.user);
             show(summary);
+            println!(
+                "The image is one file: /var/lib/parhel is immutable, so even root cannot \
+                 delete it by accident. Commits are safe in each repository's .git; push \
+                 work you cannot lose."
+            );
         }
         SetupOutcome::AlreadySetUp(summary) => {
             println!("The store for {} is already set up", summary.user);
+            show(summary);
+        }
+        SetupOutcome::Restored(summary) => {
+            println!(
+                "The store for {} was set up already; it is mounted and protected again",
+                summary.user
+            );
             show(summary);
         }
         SetupOutcome::Removed(summary) => {
