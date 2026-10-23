@@ -21,7 +21,8 @@ use crate::domain::exclusions::{ExclusionInput, Exclusions};
 use crate::domain::paths::{self, Placement};
 use crate::domain::relocate::{MAX_RELOCATE_BYTES, Relocation, Rewrite};
 use crate::domain::store::{
-    BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, Store, StoreState, WORKTREES_DIR, repo_id,
+    BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, Store, StoreState, WORKTREES_DIR, last_sync_of,
+    render_meta, repo_id,
 };
 use crate::domain::{AddRequest, BranchMode, Error, ErrorCode, Result, SubmodulePolicy};
 use crate::git::parse::ensure_supported;
@@ -481,25 +482,38 @@ fn store_transaction(
     // A sync that died without cleaning up (power loss, SIGKILL) may have left files
     // whose metadata is right and whose data never reached the disk, and the sync only
     // compares metadata: that baseline is not trusted, it is made again.
-    if baseline_unfinished(fs, &meta_path) {
+    let unfinished = baseline_unfinished(fs, &meta_path);
+    if unfinished {
         fs.remove_dir_all(&baseline)?;
     }
+    // The sync compares size, mtime and mode, which a program can put back after
+    // rewriting a file; what it cannot put back is the status-change time, so entries
+    // changed since the last finished sync began are copied whatever those say. With no
+    // such sync on record (a first run, a `meta` that lost the field, a baseline that was
+    // just discarded) nothing is trusted.
+    let last_sync = if unfinished {
+        None
+    } else {
+        fs.read_file(&meta_path)
+            .ok()
+            .and_then(|meta| last_sync_of(&meta))
+    };
     // Names the repository the baseline mirrors, for `doctor`, before the first write
-    // into it, and says that the baseline is being written.
-    let write_meta = |state: &str| {
+    // into it, and says that the baseline is being written (a baseline found in that
+    // state is discarded, so the moment of the last finished sync is of no use to it).
+    let write_meta = |state: &str, last_sync: Option<i128>| {
         let synced = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         fs.write_file(
             &meta_path,
-            format!(
-                "source={}\nsynced={synced}\nstate={state}\n",
-                repo.toplevel.display()
-            )
-            .as_bytes(),
+            render_meta(&repo.toplevel, synced, state, last_sync).as_bytes(),
         )
     };
-    write_meta("syncing")?;
+    // Taken before the first entry is looked at: whatever is changed after this is
+    // changed after the sync began.
+    let started = unix_nanos();
+    write_meta("syncing", None)?;
     if let Some(bytes) = first_sync_size(env.fs, &repo.toplevel, &baseline, &exclusions)? {
         if let Some(notice) = first_sync_notice(bytes) {
             eprintln!("parhel: {notice}");
@@ -511,13 +525,22 @@ fn store_transaction(
         &baseline,
         &exclusions,
         env.interrupted,
+        last_sync,
     );
     // Whatever the sync did is on disk (or reported as failed: a full disk can show only
     // here) before the baseline is called finished. A stopped sync is finished too: it
-    // leaves whole files only, and the next one completes it.
+    // leaves whole files only, and the next one completes it - against the sync before
+    // it, because this one did not look at everything.
     let flushed = fs.flush(&baseline_dir);
     if flushed.is_ok() {
-        write_meta("synced")?;
+        write_meta(
+            "synced",
+            if synced.is_ok() {
+                Some(started)
+            } else {
+                last_sync
+            },
+        )?;
     }
     synced?;
     flushed?;
@@ -533,6 +556,13 @@ fn store_transaction(
         exclusions,
     };
     transaction(env, request, plan, Some((&route, baseline_lock)))
+}
+
+/// Now, in nanoseconds since the epoch (the unit of a status-change time).
+fn unix_nanos() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
 }
 
 /// Whether the baseline's `meta` says that a sync began and never reported its end.
@@ -3705,6 +3735,127 @@ mod tests {
             w.count(|c| *c == Call::Lock(p(&format!("{BASELINE_DIR}/lock")))),
             2
         );
+    }
+
+    fn baseline_meta(w: &World) -> String {
+        let meta = w.files.borrow()[&p(&format!("{BASELINE_DIR}/meta"))].clone();
+        String::from_utf8(meta).unwrap()
+    }
+
+    fn sync_start(meta: &str) -> Option<i128> {
+        crate::domain::store::last_sync_of(meta.as_bytes())
+    }
+
+    fn second_request() -> AddRequest {
+        AddRequest {
+            destination: p("../feat2"),
+            branch: BranchMode::New("feat2".into()),
+            ..new_branch()
+        }
+    }
+
+    // U-STO-59b: a finished sync records when it began, and the next one is judged
+    // against it: a file whose status changed after that moment is copied again even
+    // though its size, mtime and mode are what the baseline has.
+    #[test]
+    fn a_finished_sync_records_its_start_and_the_next_uses_it() {
+        let w = store_world();
+        w.put_file(&p("/w/repo/src/main.rs"), 20, 20);
+        run_store(&w, &new_branch()).unwrap();
+        let meta = baseline_meta(&w);
+        assert!(meta.lines().any(|l| l == "state=synced"), "{meta}");
+        let started = sync_start(&meta).expect("the start of the sync is recorded");
+        assert!(started > 1_600_000_000_000_000_000, "{started}");
+
+        // The file as the baseline holds it, then rewritten after the sync, with the
+        // same size, mtime and mode: only its ctime shows.
+        w.copy_facts(&p("/w/repo/src/main.rs"), &baseline().join("src/main.rs"));
+        let mut rewritten = w
+            .stat_within(Path::new("/w/repo"), Path::new("src/main.rs"))
+            .unwrap()
+            .unwrap();
+        rewritten.ctime_ns = started + 1_000_000_000;
+        w.meta
+            .borrow_mut()
+            .insert(p("/w/repo/src/main.rs"), rewritten);
+        let before = w.count(|c| matches!(c, Call::Mirror { .. }));
+        run_store(&w, &second_request()).unwrap();
+        let copied: Vec<_> = w
+            .calls()
+            .into_iter()
+            .skip_while(|c| !matches!(c, Call::Rename { .. }))
+            .filter_map(|c| match c {
+                Call::Mirror { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, vec![baseline().join("src/main.rs")], "{before}");
+        assert!(sync_start(&baseline_meta(&w)).unwrap() > started);
+    }
+
+    // U-STO-59c: a sync that did not finish does not move the mark: the entries it did
+    // not get to are judged against the last sync that did. One that fails keeps the
+    // mark of the one before it; a first sync that fails leaves none.
+    #[test]
+    fn a_sync_that_fails_keeps_the_last_finished_marks() {
+        let w = store_world();
+        w.put_file(&p("/w/repo/src/main.rs"), 20, 20);
+        w.fail
+            .borrow_mut()
+            .insert(Step::Mirror, ErrorCode::CloneFailed);
+        run_store(&w, &new_branch()).unwrap_err();
+        let meta = baseline_meta(&w);
+        assert!(meta.lines().any(|l| l == "state=synced"), "{meta}");
+        assert_eq!(sync_start(&meta), None, "{meta}");
+        w.fail.borrow_mut().clear();
+
+        run_store(&w, &second_request()).unwrap();
+        let first = sync_start(&baseline_meta(&w)).expect("a finished sync records its start");
+
+        // A change in the source that the next sync would have to copy, and it fails.
+        w.copy_facts(&p("/w/repo/src/main.rs"), &baseline().join("src/main.rs"));
+        w.put_file(&p("/w/repo/src/main.rs"), 21, 20);
+        w.fail
+            .borrow_mut()
+            .insert(Step::Mirror, ErrorCode::CloneFailed);
+        let third = AddRequest {
+            destination: p("../feat3"),
+            branch: BranchMode::New("feat3".into()),
+            ..new_branch()
+        };
+        run_store(&w, &third).unwrap_err();
+        assert_eq!(
+            sync_start(&baseline_meta(&w)),
+            Some(first),
+            "{}",
+            baseline_meta(&w)
+        );
+    }
+
+    // U-STO-59d: a baseline whose `meta` has no mark (written before the field existed,
+    // or damaged) is not trusted: everything in it is copied again.
+    #[test]
+    fn a_baseline_without_a_mark_is_copied_again() {
+        let w = store_world();
+        w.put_file(&p("/w/repo/src/main.rs"), 20, 20);
+        run_store(&w, &new_branch()).unwrap();
+        w.copy_facts(&p("/w/repo/src/main.rs"), &baseline().join("src/main.rs"));
+        let meta = baseline_meta(&w)
+            .lines()
+            .filter(|l| !l.starts_with("sync_start_ns="))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>();
+        w.files
+            .borrow_mut()
+            .insert(p(&format!("{BASELINE_DIR}/meta")), meta.into_bytes());
+        let first = w.count(
+            |c| matches!(c, Call::Mirror { dst, .. } if *dst == baseline().join("src/main.rs")),
+        );
+        run_store(&w, &second_request()).unwrap();
+        let after = w.count(
+            |c| matches!(c, Call::Mirror { dst, .. } if *dst == baseline().join("src/main.rs")),
+        );
+        assert_eq!(after, first + 1, "the file was copied again");
     }
 
     // U-STO-22c: the message of a store that cannot be used names `git parhel doctor`

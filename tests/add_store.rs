@@ -104,6 +104,15 @@ impl World {
     }
 }
 
+/// Let the fixture age past the sync's margin. A file changed within 2 s of the start of a
+/// sync (its status-change time cannot tell whether that was before or after the sync
+/// looked) is copied again by the next one, which is right, and which the tests that
+/// count what a second `add` copies, or that look at what the worktrees still share with
+/// the baseline, must not be confused by.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(2_200));
+}
+
 fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
@@ -186,6 +195,7 @@ fn is02_the_source_is_not_modified() {
 #[test]
 fn is03_worktrees_share_storage_with_each_other_and_the_baseline() {
     let Some(w) = world() else { return };
+    settle();
     let a = w.add_ok(&w.sb.path("a"), "fa");
     let b = w.add_ok(&w.sb.path("b"), "fb");
     for rel in BLOBS {
@@ -229,6 +239,7 @@ fn is04_writes_do_not_cross() {
 #[test]
 fn is05_second_add_copies_only_the_changed_files() {
     let Some(w) = world() else { return };
+    settle();
     w.add_ok(&w.sb.path("a"), "fa");
     let unchanged: Vec<_> = ["assets/tracked.bin", "target/ignored.bin"]
         .iter()
@@ -1301,5 +1312,104 @@ fn is37_changes_inside_a_read_only_directory_reach_the_baseline() {
     assert_eq!(
         fs::read_to_string(b.join("target/locked/fresh/inside")).unwrap(),
         "i\n"
+    );
+}
+
+/// Rewrite `path` with `content` (the same length as before) and put its modification
+/// time and mode back: the file is, to a comparison of size, mtime and mode, untouched.
+fn rewrite_and_restore(path: &Path, content: &[u8]) {
+    let before = fs::metadata(path).unwrap();
+    assert_eq!(
+        before.len(),
+        content.len() as u64,
+        "not a same-size rewrite"
+    );
+    fs::write(path, content).unwrap();
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
+    fs::set_permissions(path, before.permissions()).unwrap();
+    let after = fs::metadata(path).unwrap();
+    assert_eq!(
+        (after.len(), after.mtime(), after.mtime_nsec(), after.mode()),
+        (
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.mode()
+        ),
+        "the rewrite did not restore the file's looks"
+    );
+}
+
+// I-S38: the sync does not take size, mtime and mode on trust: a file rewritten with the
+// same size and its times put back (a build tool, `cp -p`, `touch -d`) is still copied,
+// because its status-change time cannot be put back. The worktree made next has the new
+// content.
+#[test]
+fn is38_a_same_size_rewrite_with_the_mtime_restored_reaches_the_baseline() {
+    let Some(w) = world() else { return };
+    w.add_ok(&w.sb.path("a"), "fa");
+    let victim = "target/ignored.bin";
+    let old = fs::read(w.src.path(victim)).unwrap();
+    let new: Vec<u8> = old.iter().map(|b| !b).collect();
+    rewrite_and_restore(&w.src.path(victim), &new);
+    w.src.assert_clean();
+
+    let b = w.add_ok(&w.sb.path("b"), "fb");
+    assert_eq!(
+        fs::read(w.baseline(victim)).unwrap(),
+        new,
+        "baseline is stale"
+    );
+    assert_eq!(
+        fs::read(b.join(victim)).unwrap(),
+        new,
+        "the worktree is stale"
+    );
+    // And only that file was rewritten: its neighbours kept their inodes.
+    assert_same_content(&w.src, &b);
+}
+
+// I-S38b: a baseline whose `meta` has no mark of a finished sync (an older store, a
+// damaged file) is not trusted at all: a file in it that is wrong with the right size and
+// mtime is replaced.
+#[test]
+fn is38b_a_baseline_without_a_mark_is_copied_again() {
+    let Some(w) = world() else { return };
+    w.add_ok(&w.sb.path("a"), "fa");
+    let victim = w.baseline("target/ignored.bin");
+    let (len, mtime) = {
+        let md = fs::metadata(&victim).unwrap();
+        (md.len(), md.modified().unwrap())
+    };
+    fs::write(&victim, vec![0u8; usize::try_from(len).unwrap()]).unwrap();
+    File::options()
+        .write(true)
+        .open(&victim)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(mtime))
+        .unwrap();
+    let meta = w.store.baselines().remove(0).join("meta");
+    let text = fs::read_to_string(&meta).unwrap();
+    assert!(text.contains("sync_start_ns="), "{text}");
+    fs::write(
+        &meta,
+        text.lines()
+            .filter(|l| !l.starts_with("sync_start_ns="))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    let b = w.add_ok(&w.sb.path("b"), "fb");
+    assert_same_content(&w.src, &b);
+    assert!(
+        fs::read_to_string(&meta)
+            .unwrap()
+            .contains("sync_start_ns=")
     );
 }

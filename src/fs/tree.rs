@@ -202,6 +202,8 @@ struct Meta {
     gid: libc::gid_t,
     atime: libc::timespec,
     mtime: libc::timespec,
+    /// Status-change time.
+    ctime: libc::timespec,
     size: u64,
     /// BSD file flags.
     #[cfg(target_os = "macos")]
@@ -221,6 +223,10 @@ impl Meta {
             mtime: libc::timespec {
                 tv_sec: st.st_mtime,
                 tv_nsec: st.st_mtime_nsec,
+            },
+            ctime: libc::timespec {
+                tv_sec: st.st_ctime,
+                tv_nsec: st.st_ctime_nsec,
             },
             size: u64::try_from(st.st_size).unwrap_or(0),
             #[cfg(target_os = "macos")]
@@ -1022,6 +1028,7 @@ fn entry_meta(st: &libc::stat, link_target: Option<PathBuf>) -> Option<EntryMeta
         kind,
         size: if kind == EntryKind::File { md.size } else { 0 },
         mtime_ns: i128::from(md.mtime.tv_sec) * 1_000_000_000 + i128::from(md.mtime.tv_nsec),
+        ctime_ns: i128::from(md.ctime.tv_sec) * 1_000_000_000 + i128::from(md.ctime.tv_nsec),
         mode: u32::from(md.mode) & 0o7777,
         link_target,
     })
@@ -1223,12 +1230,26 @@ mod tests {
         mkfifo(&root.join("fifo"), 0o600);
 
         let file = stat_entry(&root, Path::new("file")).unwrap().unwrap();
+        // The status-change time is the moment of the last change, whatever the
+        // modification time was set to: here, the `utimes` and `chmod` just made.
+        let now_ns = i128::from(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        ) * 1_000_000_000;
+        assert!(
+            file.ctime_ns > now_ns - 60_000_000_000 && file.ctime_ns <= now_ns + 60_000_000_000,
+            "ctime {} is not about now ({now_ns})",
+            file.ctime_ns
+        );
         assert_eq!(
             file,
             EntryMeta {
                 kind: EntryKind::File,
                 size: 5,
                 mtime_ns: 1_600_000_000 * 1_000_000_000 + i128::from(NANOS),
+                ctime_ns: file.ctime_ns,
                 mode: 0o640,
                 link_target: None,
             }

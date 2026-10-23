@@ -149,6 +149,10 @@ pub fn first_sync_notice(bytes: u64) -> Option<String> {
 /// source does not have (or that are now excluded); set a directory's metadata after
 /// its children. Stops with `interrupted` when `interrupted` is raised.
 ///
+/// `last_sync` is when the last sync that finished began (ns since the epoch): entries
+/// changed since then are copied whatever their size, times and mode say (see
+/// [`sync_action`]); `None` when there is no such record, and then everything is copied.
+///
 /// Safe to repeat and to run after a crash: it always compares everything, so a
 /// half-synced baseline is repaired by the next run. Existing worktrees are
 /// independent reflink clones, so rewriting baseline files in place never reaches them.
@@ -158,6 +162,7 @@ pub fn sync_baseline(
     baseline: &Path,
     exclusions: &Exclusions,
     interrupted: &AtomicBool,
+    last_sync: Option<i128>,
 ) -> Result<SyncReport> {
     let mut sync = Sync {
         fs,
@@ -165,6 +170,7 @@ pub fn sync_baseline(
         baseline,
         exclusions,
         interrupted,
+        last_sync,
         report: SyncReport::default(),
     };
     sync.check_interrupt()?;
@@ -178,6 +184,7 @@ struct Sync<'a> {
     baseline: &'a Path,
     exclusions: &'a Exclusions,
     interrupted: &'a AtomicBool,
+    last_sync: Option<i128>,
     report: SyncReport,
 }
 
@@ -207,7 +214,7 @@ impl Sync<'_> {
         };
         let dst = self.baseline.join(rel);
         let held = self.fs.stat_within(self.baseline, rel)?;
-        let action = sync_action(&source, held.as_ref());
+        let action = sync_action(&source, held.as_ref(), self.last_sync);
         match action {
             SyncAction::Keep => self.report.unchanged += 1,
             SyncAction::Create | SyncAction::Update => {}
@@ -437,8 +444,27 @@ mod tests {
         w
     }
 
+    /// The start of the last finished sync in these tests: well after the entries'
+    /// default status-change time (the epoch), so nothing looks recently changed.
+    const LAST_SYNC: i128 = 100_000_000_000;
+
     fn sync(w: &World, exclusions: &Exclusions) -> Result<SyncReport> {
-        sync_baseline(w, Path::new("/w/repo"), &base(), exclusions, &w.interrupted)
+        sync_since(w, exclusions, Some(LAST_SYNC))
+    }
+
+    fn sync_since(
+        w: &World,
+        exclusions: &Exclusions,
+        last_sync: Option<i128>,
+    ) -> Result<SyncReport> {
+        sync_baseline(
+            w,
+            Path::new("/w/repo"),
+            &base(),
+            exclusions,
+            &w.interrupted,
+            last_sync,
+        )
     }
 
     fn mirrors(w: &World) -> Vec<PathBuf> {
@@ -572,6 +598,37 @@ mod tests {
         w.meta.borrow_mut().insert(src("src/main.rs"), meta);
         sync(&w, &exclusions()).unwrap();
         assert_eq!(mirrors(&w), vec![at("src/main.rs")]);
+    }
+
+    // U-STO-33b: a rewrite that restored the size, the mtime and the mode (`touch -d`,
+    // `cp -p`, rsync -t, a tool that puts times back) looks identical to a comparison of
+    // those three; the status-change time does not lie, so the file is copied.
+    #[test]
+    fn a_same_size_rewrite_with_the_mtime_restored_is_copied() {
+        let w = synced();
+        let mut meta = w
+            .stat_within(Path::new("/w/repo"), Path::new("src/main.rs"))
+            .unwrap()
+            .unwrap();
+        meta.ctime_ns = LAST_SYNC + 5_000_000_000;
+        w.meta.borrow_mut().insert(src("src/main.rs"), meta);
+        let report = sync(&w, &exclusions()).unwrap();
+        assert_eq!(mirrors(&w), vec![at("src/main.rs")]);
+        assert_eq!((report.copied, report.unchanged, report.bytes), (1, 4, 20));
+    }
+
+    // U-STO-33c: no finished sync on record (the meta was lost, or never said): the
+    // baseline is not trusted and everything is copied again, files and directories.
+    #[test]
+    fn without_a_sync_on_record_the_whole_tree_is_copied_again() {
+        let w = synced();
+        let report = sync_since(&w, &exclusions(), None).unwrap();
+        assert_eq!(report.copied, 2, "{report:?}");
+        assert_eq!(report.unchanged, 0);
+        let mirrored = mirrors(&w);
+        for rel in ["node_modules/big", "src/main.rs"] {
+            assert!(mirrored.contains(&at(rel)), "{rel}: {mirrored:?}");
+        }
     }
 
     // U-STO-34

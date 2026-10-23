@@ -6,7 +6,7 @@
 //! ```text
 //! .parhel-store                 marker (format=1, user, image, unit)
 //! baselines/<id>/tree           mirror of one repository's source worktree
-//! baselines/<id>/meta           source=<path>, last sync time
+//! baselines/<id>/meta           source=<path>, state, when the last finished sync began
 //! baselines/<id>/lock           flock held for sync AND clone
 //! worktrees/<id>/<name>         the real worktrees (reflink clones of the baseline)
 //! worktrees/.parhel-staging-*   staging of a run in progress
@@ -170,11 +170,50 @@ pub struct EntryMeta {
     pub size: u64,
     /// Modification time in nanoseconds since the epoch.
     pub mtime_ns: i128,
+    /// Status-change time in nanoseconds since the epoch. Unlike the modification time
+    /// it cannot be set by a program: any write, `chmod`, rename or attribute change
+    /// moves it to now.
+    pub ctime_ns: i128,
     /// Permission bits (`st_mode & 0o7777`).
     pub mode: u32,
     /// Target for symlinks.
     pub link_target: Option<PathBuf>,
 }
+
+/// Contents of a baseline's `meta`: the source it mirrors, whether a sync is under way
+/// (`syncing`) or finished (`synced`), when that was in seconds, and `sync_start_ns`, the
+/// moment (ns since the epoch) the last sync that ran to its end *began*. That moment is
+/// what [`sync_action`] compares status-change times with; a sync that failed or was
+/// interrupted does not advance it.
+#[must_use]
+pub fn render_meta(source: &Path, seconds: u64, state: &str, last_sync_ns: Option<i128>) -> String {
+    let mut text = format!(
+        "source={}\nsynced={seconds}\nstate={state}\n",
+        source.display()
+    );
+    if let Some(ns) = last_sync_ns {
+        let _ = writeln!(text, "sync_start_ns={ns}");
+    }
+    text
+}
+
+/// `sync_start_ns` of a baseline's `meta`; `None` when it is not there or not a number
+/// (a `meta` from before the field existed, or one that was damaged).
+#[must_use]
+pub fn last_sync_of(meta: &[u8]) -> Option<i128> {
+    meta.split(|&b| b == b'\n')
+        .find_map(|line| line.strip_prefix(b"sync_start_ns="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse::<i128>().ok())
+        .filter(|&ns| ns > 0)
+}
+
+/// How long before the start of the last sync a change of an entry still counts as
+/// possibly after it: the status-change time comes from the filesystem's clock, which
+/// ticks coarsely (a jiffy, and two seconds on FAT) and on a network filesystem may be
+/// the server's. An entry changed within this much of the start is copied again, which
+/// is what a file saved just before `add` deserves anyway.
+pub const CTIME_MARGIN_NS: i128 = 2_000_000_000;
 
 /// What syncing does with one source entry given what the baseline holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,24 +229,38 @@ pub enum SyncAction {
 }
 
 /// Compare a source entry with the baseline's, by kind, size, mtime (ns), mode and
-/// symlink target.
+/// symlink target, and by when it last changed.
+///
+/// Size, mtime and mode are things a program can put back: a same-size rewrite followed
+/// by `touch -d` or `cp -p` leaves all three as they were. The status-change time
+/// (`ctime`) cannot be put back, so an entry whose ctime is not older than the start of
+/// the last finished sync (`last_sync`, ns since the epoch, less [`CTIME_MARGIN_NS`])
+/// may have changed since and is copied again. With no sync on record (`None`) nothing
+/// is trusted and every entry that exists is copied. A symlink is its target and is
+/// compared by it alone.
 #[must_use]
-pub fn sync_action(source: &EntryMeta, baseline: Option<&EntryMeta>) -> SyncAction {
+pub fn sync_action(
+    source: &EntryMeta,
+    baseline: Option<&EntryMeta>,
+    last_sync: Option<i128>,
+) -> SyncAction {
     let Some(baseline) = baseline else {
         return SyncAction::Create;
     };
     if source.kind != baseline.kind {
         return SyncAction::Replace;
     }
+    let possibly_changed = || last_sync.is_none_or(|t| source.ctime_ns >= t - CTIME_MARGIN_NS);
     let same = match source.kind {
         // A directory's mtime moves whenever a child does; it is set last anyway.
-        EntryKind::Dir => source.mode == baseline.mode,
+        EntryKind::Dir => source.mode == baseline.mode && !possibly_changed(),
         // A symlink is its target; its own mode and times mean nothing.
         EntryKind::Symlink => source.link_target == baseline.link_target,
         EntryKind::File | EntryKind::Fifo => {
             source.size == baseline.size
                 && source.mtime_ns == baseline.mtime_ns
                 && source.mode == baseline.mode
+                && !possibly_changed()
         }
     };
     if same {
@@ -300,6 +353,7 @@ mod tests {
             kind,
             size,
             mtime_ns,
+            ctime_ns: 0,
             mode,
             link_target: None,
         }
@@ -359,6 +413,108 @@ mod tests {
         #[case] baseline: Option<EntryMeta>,
         #[case] want: SyncAction,
     ) {
-        assert_eq!(sync_action(&source, baseline.as_ref()), want);
+        assert_eq!(
+            sync_action(&source, baseline.as_ref(), Some(LAST_SYNC)),
+            want
+        );
+    }
+
+    /// Start of the last finished sync in the tests below: ten seconds after the epoch.
+    const LAST_SYNC: i128 = 10_000_000_000;
+
+    fn with_ctime(mut entry: EntryMeta, ctime_ns: i128) -> EntryMeta {
+        entry.ctime_ns = ctime_ns;
+        entry
+    }
+
+    // U-STO-07b: size, mtime and mode can all be put back by a program (`touch -d`,
+    // `cp -p`, a build tool that restores times), the status-change time cannot: an
+    // entry changed since the last sync began - or within CTIME_MARGIN_NS before it,
+    // for clocks that tick coarsely - is copied again whatever else says it is the same.
+    #[rstest]
+    #[case::changed_long_before(0, SyncAction::Keep)]
+    #[case::just_outside_the_margin(LAST_SYNC - CTIME_MARGIN_NS - 1, SyncAction::Keep)]
+    #[case::exactly_at_the_margin(LAST_SYNC - CTIME_MARGIN_NS, SyncAction::Update)]
+    #[case::just_before_the_sync(LAST_SYNC - 1, SyncAction::Update)]
+    #[case::after_the_sync_began(LAST_SYNC + 1, SyncAction::Update)]
+    #[case::far_after(LAST_SYNC * 100, SyncAction::Update)]
+    fn a_recent_status_change_forces_a_copy(#[case] ctime_ns: i128, #[case] want: SyncAction) {
+        // The same size, mtime and mode: a rewrite that restored them.
+        let held = file(10, 100, 0o644);
+        for kind in [EntryKind::File, EntryKind::Fifo] {
+            let entry = with_ctime(meta(kind, 10, 100, 0o644), ctime_ns);
+            let on_disk = EntryMeta {
+                kind,
+                ..held.clone()
+            };
+            assert_eq!(
+                sync_action(&entry, Some(&on_disk), Some(LAST_SYNC)),
+                want,
+                "{kind:?}"
+            );
+        }
+        // A directory too: its extended attributes and ACLs are only in the ctime.
+        let entry = with_ctime(dir(100, 0o755), ctime_ns);
+        assert_eq!(
+            sync_action(&entry, Some(&dir(100, 0o755)), Some(LAST_SYNC)),
+            want,
+            "Dir"
+        );
+    }
+
+    // U-STO-07c: without a finished sync on record (a first sync, `meta` lost or from
+    // another version) nothing is trusted: every entry that exists is copied again; a
+    // symlink is its target, so it is compared by it as always.
+    #[test]
+    fn without_a_sync_on_record_everything_is_copied() {
+        for entry in [file(10, 100, 0o644), dir(100, 0o755)] {
+            assert_eq!(
+                sync_action(&entry, Some(&entry.clone()), None),
+                SyncAction::Update,
+                "{:?}",
+                entry.kind
+            );
+        }
+        assert_eq!(
+            sync_action(&link("a"), Some(&link("a")), None),
+            SyncAction::Keep
+        );
+        assert_eq!(
+            sync_action(&file(10, 100, 0o644), None, None),
+            SyncAction::Create
+        );
+    }
+
+    // U-STO-08: the baseline's `meta` says which sync to trust; one without the field
+    // (older, damaged) or with garbage in it trusts none.
+    #[test]
+    fn meta_round_trips_the_start_of_the_last_finished_sync() {
+        let text = render_meta(
+            Path::new("/w/repo"),
+            77,
+            "synced",
+            Some(1_700_000_000_123_456_789),
+        );
+        assert_eq!(
+            text,
+            "source=/w/repo\nsynced=77\nstate=synced\nsync_start_ns=1700000000123456789\n"
+        );
+        assert_eq!(
+            last_sync_of(text.as_bytes()),
+            Some(1_700_000_000_123_456_789)
+        );
+        let none = render_meta(Path::new("/w/repo"), 77, "syncing", None);
+        assert!(!none.contains("sync_start_ns"), "{none}");
+        assert_eq!(last_sync_of(none.as_bytes()), None);
+        for bad in [
+            "source=/w/repo\nstate=synced\n",
+            "sync_start_ns=\n",
+            "sync_start_ns=soon\n",
+            "sync_start_ns=0\n",
+            "sync_start_ns=-5\n",
+            "",
+        ] {
+            assert_eq!(last_sync_of(bad.as_bytes()), None, "{bad:?}");
+        }
     }
 }
