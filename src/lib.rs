@@ -180,6 +180,11 @@ fn print_doctor(report: &DoctorReport) -> ExitCode {
             Finding::StoreDanglingLink { link, target } => {
                 format!("{} -> {}", describe(link), describe(target))
             }
+            Finding::StoreWorktreesUnreachable {
+                root,
+                worktrees,
+                unlocked,
+            } => unreachable_detail(root, worktrees, unlocked),
         };
         let status = if report.fixed.contains(finding) {
             " (fixed)"
@@ -195,6 +200,34 @@ fn print_doctor(report: &DoctorReport) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// What `store-worktrees-unreachable` says: which worktrees, which of them a `prune` would
+/// forget, and what to do (nothing destructive).
+fn unreachable_detail(root: &Path, worktrees: &[PathBuf], unlocked: &[PathBuf]) -> String {
+    let list = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|p| describe(p))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut text = format!(
+        "{} is not available and git lists {} worktree(s) of this repository in it: {}. Do \
+         not run `git worktree prune` or `git gc` until it is back: they forget the \
+         registration of a worktree whose directory is missing",
+        describe(root),
+        worktrees.len(),
+        list(worktrees)
+    );
+    if !unlocked.is_empty() {
+        text.push_str(&format!(
+            "; these are not locked and would be forgotten ({}): lock each with `git worktree \
+             lock <path>`",
+            list(unlocked)
+        ));
+    }
+    text
 }
 
 /// `1073741824` as `1.0 GiB`.

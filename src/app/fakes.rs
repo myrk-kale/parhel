@@ -47,6 +47,11 @@ pub enum Call {
     RemoveForce {
         path: PathBuf,
     },
+    /// `worktree_lock`.
+    WorktreeLock {
+        path: PathBuf,
+        reason: String,
+    },
     Unregister {
         path: PathBuf,
     },
@@ -109,6 +114,7 @@ impl Call {
             | Call::SubmodulesReinit { worktree } => vec![worktree],
             Call::Repair { path }
             | Call::RemoveForce { path }
+            | Call::WorktreeLock { path, .. }
             | Call::Unregister { path }
             | Call::Rewrite(path)
             | Call::RemoveFile(path)
@@ -144,6 +150,7 @@ pub enum Step {
     Rename,
     Repair,
     RemoveForce,
+    WorktreeLock,
     BranchDelete,
     RemoveDirAll,
     RemoveFile,
@@ -694,6 +701,16 @@ impl Git for World {
 
     fn worktree_remove_force(&self, _: &Path, path: &Path) -> Result<()> {
         self.record(Call::RemoveForce { path: path.into() }, Step::RemoveForce)
+    }
+
+    fn worktree_lock(&self, _: &Path, path: &Path, reason: &str) -> Result<()> {
+        self.record(
+            Call::WorktreeLock {
+                path: path.into(),
+                reason: reason.into(),
+            },
+            Step::WorktreeLock,
+        )
     }
 
     fn unregister_worktree(&self, _: &Path, path: &Path) -> Result<()> {

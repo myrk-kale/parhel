@@ -76,6 +76,10 @@ pub trait Git {
     /// `git worktree repair`, which also rewrites other worktrees' links).
     fn repoint_worktree(&self, repo: &Path, old: &Path, new: &Path) -> Result<()>;
     fn worktree_remove_force(&self, repo: &Path, path: &Path) -> Result<()>;
+    /// `git worktree lock --reason <reason> <path>`: `git worktree prune`, and the `gc`
+    /// that runs it, leave a locked worktree's registration alone even when its
+    /// directory is out of reach (a store whose mount is down).
+    fn worktree_lock(&self, repo: &Path, path: &Path, reason: &str) -> Result<()>;
     /// Remove only the registration (`.git/worktrees/<id>`) whose gitdir points to
     /// `path`, even when `path` no longer exists. Unlike `worktree prune`, it never
     /// touches other worktrees whose directories are merely unreachable (e.g. on an

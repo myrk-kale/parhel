@@ -1413,3 +1413,102 @@ fn is38b_a_baseline_without_a_mark_is_copied_again() {
             .contains("sync_start_ns=")
     );
 }
+
+/// The store as `systemctl stop` leaves it: its directory is there, empty, and what was
+/// in it is out of reach. Here the whole directory is moved away and back.
+struct StoreDown {
+    root: PathBuf,
+    away: PathBuf,
+}
+
+impl StoreDown {
+    fn new(store: &TestStore) -> Self {
+        let away = store.root.with_extension("away");
+        fs::rename(&store.root, &away).unwrap();
+        Self {
+            root: store.root.clone(),
+            away,
+        }
+    }
+
+    fn up(&self) {
+        if self.away.exists() {
+            fs::rename(&self.away, &self.root).unwrap();
+        }
+    }
+}
+
+impl Drop for StoreDown {
+    fn drop(&mut self) {
+        self.up();
+    }
+}
+
+fn registrations(src: &TestRepo) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(src.common_dir().join("worktrees"))
+        .map(|rd| {
+            rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// I-S39: the store's mount is down (reboot gone wrong, `systemctl stop`) and git cleans
+// up: `git worktree prune`, and the `gc` that runs it, forget the registration of a
+// worktree whose directory is missing. The worktrees of the store are locked when they
+// are published, so they survive it; `doctor` says what is at stake while the store is
+// down; and the same worktree unlocked is forgotten (the control that makes this test
+// able to fail).
+#[test]
+fn is39_pruning_while_the_store_is_down_keeps_the_registrations() {
+    let Some(w) = world() else { return };
+    let dest = w.sb.path("wt");
+    w.add_ok(&dest, "fa");
+    let real = w.store.only_worktree();
+    let listed = w.src.git(&["worktree", "list", "--porcelain"]);
+    assert!(
+        listed
+            .lines()
+            .any(|l| l == format!("locked parhel store: {}", w.store.root.display())),
+        "published worktrees are locked, with the store named:\n{listed}"
+    );
+    assert_eq!(registrations(&w.src).len(), 1);
+
+    let down = StoreDown::new(&w.store);
+    // doctor, with the store down, names the registrations at stake (and changes nothing).
+    let out = parhel_store(&w.sb.env, &w.src.root, &["doctor", "--fix"], &w.store);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let said = stdout(&out);
+    assert!(said.contains("store-worktrees-unreachable"), "{said}");
+    assert!(said.contains(real.to_str().unwrap()), "{said}");
+    assert!(said.contains("git worktree prune"), "{said}");
+    assert!(!said.contains("(fixed)"), "{said}");
+
+    w.src.git(&["worktree", "prune", "--expire", "now"]);
+    w.src
+        .git(&["-c", "gc.worktreePruneExpire=now", "gc", "--quiet"]);
+    assert_eq!(
+        registrations(&w.src).len(),
+        1,
+        "prune forgot a locked worktree"
+    );
+    down.up();
+    // The worktree is as it was, through the symlink.
+    let wt = w.open(&dest);
+    wt.assert_clean();
+    assert!(w.src.worktree_paths().contains(&real));
+    let out = parhel_store(&w.sb.env, &w.src.root, &["doctor"], &w.store);
+    assert_success(&out);
+
+    // Control: unlocked, the same prune forgets it.
+    w.src.git(&["worktree", "unlock", real.to_str().unwrap()]);
+    let down = StoreDown::new(&w.store);
+    w.src.git(&["worktree", "prune", "--expire", "now"]);
+    assert!(
+        registrations(&w.src).is_empty(),
+        "an unlocked one should be pruned"
+    );
+    down.up();
+}

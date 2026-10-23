@@ -49,6 +49,15 @@ pub enum Finding {
     StoreDanglingLink { link: PathBuf, target: PathBuf },
     /// A baseline whose source is no longer a git worktree.
     StoreStaleBaseline { path: PathBuf },
+    /// The store cannot be reached and git lists worktrees of this repository that live
+    /// in it. `git worktree prune` (and the `gc` that runs it) forgets the registration
+    /// of a worktree whose directory is not there, and with it the branch checked out
+    /// there, unless the worktree is locked: `unlocked` are those that are not.
+    StoreWorktreesUnreachable {
+        root: PathBuf,
+        worktrees: Vec<PathBuf>,
+        unlocked: Vec<PathBuf>,
+    },
 }
 
 impl Finding {
@@ -66,6 +75,7 @@ impl Finding {
             Self::StoreOrphan { .. } => "store-orphan",
             Self::StoreDanglingLink { .. } => "store-dangling-link",
             Self::StoreStaleBaseline { .. } => "store-stale-baseline",
+            Self::StoreWorktreesUnreachable { .. } => "store-worktrees-unreachable",
         }
     }
 
@@ -203,6 +213,7 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
                 path: root.clone(),
                 reason: reason.clone(),
             });
+            unreachable_worktrees(env, root, &worktrees, &mut report);
         }
         StoreState::Available(store) => {
             check_store(
@@ -215,9 +226,47 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
                 &mut report,
             );
         }
-        StoreState::NotConfigured => {}
+        StoreState::NotConfigured => {
+            if let Some(root) = env.store {
+                unreachable_worktrees(env, root, &worktrees, &mut report);
+            }
+        }
     }
     Ok(report)
+}
+
+/// Worktrees git lists inside the store at `root`, which cannot be reached: a `git
+/// worktree prune` (the `gc` runs one) would forget their registrations, and the
+/// branches checked out in them would lose their worktree. Locked ones are skipped by
+/// prune; `unlocked` are the ones that are not. Reported only.
+fn unreachable_worktrees(
+    env: &Env<'_>,
+    root: &Path,
+    worktrees: &[WorktreeEntry],
+    report: &mut DoctorReport,
+) {
+    // Registrations name canonical paths, and the store's own directory is the only
+    // part of the path that may be reached through a link.
+    let mut bases = vec![root.join(WORKTREES_DIR)];
+    if let Ok(canonical) = env.fs.canonicalize(root) {
+        bases.push(canonical.join(WORKTREES_DIR));
+    }
+    let inside: Vec<&WorktreeEntry> = worktrees
+        .iter()
+        .filter(|w| bases.iter().any(|base| w.path.starts_with(base)))
+        .collect();
+    if inside.is_empty() {
+        return;
+    }
+    report.findings.push(Finding::StoreWorktreesUnreachable {
+        root: root.to_path_buf(),
+        worktrees: inside.iter().map(|w| w.path.clone()).collect(),
+        unlocked: inside
+            .iter()
+            .filter(|w| w.locked.is_none())
+            .map(|w| w.path.clone())
+            .collect(),
+    });
 }
 
 /// `not-cow` for the source's volume, unless the store can serve it.
@@ -278,7 +327,7 @@ fn fix(
                     .map(|dest| (staged, dest))
             });
             match published {
-                Some((staged, dest)) => complete_publish(env, repo, staging, staged, &dest),
+                Some((staged, dest)) => complete_publish(env, repo, staging, staged, &dest, store),
                 None => rollback(env.git, env.fs, staging, &journal).is_ok(),
             }
         } else {
@@ -709,18 +758,32 @@ fn published_dest(
     (Path::new(&backlink) == staged.join(".git")).then_some(dest)
 }
 
-/// Finish what the crashed run was doing: point the registration at the destination.
+/// Finish what the crashed run was doing: point the registration at the destination,
+/// and in a store lock it as `add` does (the run may have died before it got to).
 fn complete_publish(
     env: &Env<'_>,
     repo: &RepoInfo,
     staging: &Path,
     staged: &Path,
     dest: &Path,
+    store: Option<&Path>,
 ) -> bool {
-    env.git
+    if env
+        .git
         .repoint_worktree(&repo.toplevel, staged, dest)
-        .is_ok()
-        && env.fs.remove_dir_all(staging).is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(root) = store.filter(|root| dest.starts_with(root.join(WORKTREES_DIR))) {
+        // A worktree that is valid but unlocked is the lesser harm: the cleanup goes on.
+        let _ = env.git.worktree_lock(
+            &repo.toplevel,
+            dest,
+            &format!("parhel store: {}", root.display()),
+        );
+    }
+    env.fs.remove_dir_all(staging).is_ok()
 }
 
 /// Without a trusted journal nothing proves a registered worktree is parhel's
@@ -1471,7 +1534,12 @@ mod tests {
             .insert(baseline_dir().join("meta"), b"source=/gone\n".to_vec());
         w.put_dir(&p(&format!("/store/worktrees/{ID}/ghost")));
         let report = run_store(&w, false);
-        let found = store_findings(&report);
+        // (`store-worktrees-unreachable` is the one more thing that is reported with the
+        // store down - the registrations of its worktrees; see U-STO-93.)
+        let found: Vec<_> = store_findings(&report)
+            .into_iter()
+            .filter(|f| f.code() != "store-worktrees-unreachable")
+            .collect();
         assert_eq!(found.len(), 1, "{found:#?}");
         match found[0] {
             Finding::StoreUnavailable { path, reason: why } => {
@@ -1797,9 +1865,120 @@ mod tests {
             w.calls(),
             vec![
                 Call::Repair { path: real() },
+                Call::WorktreeLock {
+                    path: real(),
+                    reason: "parhel store: /store".into(),
+                },
                 Call::RemoveDirAll(p("/store/worktrees/.parhel-staging-dead")),
             ],
-            "repair at the real path; keep the worktree, its branch and the symlink"
+            "repair at the real path and lock it as `add` does; keep the worktree, its \
+             branch and the symlink"
+        );
+    }
+
+    /// `store_world` with the store gone: unmounted (the marker, which lives on the
+    /// image, is out of reach) and the worktree directories with it. Git still lists
+    /// the registrations.
+    fn store_down(locked: Option<&str>) -> World {
+        let mut w = store_world();
+        w.files.borrow_mut().remove(&p("/store/.parhel-store"));
+        w.tree.borrow_mut().remove(&real());
+        for entry in &mut w.worktrees {
+            if entry.path == real() {
+                entry.locked = locked.map(str::to_owned);
+            }
+        }
+        w
+    }
+
+    fn unreachable_findings(report: &DoctorReport) -> Vec<&Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.code() == "store-worktrees-unreachable")
+            .collect()
+    }
+
+    // U-STO-93: the store is down and git lists worktrees that live in it: say so,
+    // naming those a `git worktree prune` would forget (not locked) apart from the
+    // others. Reported only: doctor changes nothing about them.
+    #[rstest]
+    #[case::locked(Some("parhel store: /store"), vec![])]
+    #[case::locked_without_a_reason(Some(""), vec![])]
+    #[case::not_locked(None, vec![real()])]
+    fn worktrees_of_an_unreachable_store_are_reported(
+        #[case] locked: Option<&str>,
+        #[case] unlocked: Vec<PathBuf>,
+    ) {
+        for fix in [false, true] {
+            let w = store_down(locked);
+            let report = run_store(&w, fix);
+            assert_eq!(
+                unreachable_findings(&report),
+                vec![&Finding::StoreWorktreesUnreachable {
+                    root: p("/store"),
+                    worktrees: vec![real()],
+                    unlocked: unlocked.clone(),
+                }],
+                "{report:#?}"
+            );
+            assert!(!report.healthy());
+            assert!(!unreachable_findings(&report)[0].fixable());
+            assert_eq!(w.calls(), vec![], "doctor changes nothing here");
+        }
+    }
+
+    // U-STO-93b: ... but only when there is something to lose: no registration in the
+    // store, a store that is up, or no store at all say nothing of the kind.
+    #[test]
+    fn no_unreachable_worktrees_no_finding() {
+        // Down, and git lists none of its worktrees.
+        let mut w = store_down(None);
+        w.worktrees.retain(|e| e.path != real());
+        assert_eq!(
+            unreachable_findings(&run_store(&w, false)),
+            Vec::<&Finding>::new()
+        );
+        // Up: the worktrees are there to be seen.
+        let w = store_world();
+        assert_eq!(
+            unreachable_findings(&run_store(&w, false)),
+            Vec::<&Finding>::new()
+        );
+        // The registrations of another place are none of the store's business.
+        let mut w = store_down(None);
+        for entry in &mut w.worktrees {
+            if entry.path == real() {
+                entry.path = p("/elsewhere/feat");
+            }
+        }
+        assert_eq!(
+            unreachable_findings(&run_store(&w, false)),
+            Vec::<&Finding>::new()
+        );
+    }
+
+    // U-STO-93c: ... also when the directory of the store itself is gone (a store that
+    // was removed with its worktrees registered): the path does not exist, and git
+    // still lists them.
+    #[test]
+    fn a_store_directory_that_is_gone_is_reported_with_its_registrations() {
+        let w = World::default();
+        let mut w = w;
+        w.worktrees.push(WorktreeEntry {
+            path: real(),
+            head: Some(SHA_A.into()),
+            branch: Some("refs/heads/feat".into()),
+            ..WorktreeEntry::default()
+        });
+        let report = run_store(&w, false);
+        assert_eq!(
+            unreachable_findings(&report),
+            vec![&Finding::StoreWorktreesUnreachable {
+                root: p("/store"),
+                worktrees: vec![real()],
+                unlocked: vec![real()],
+            }]
         );
     }
 
