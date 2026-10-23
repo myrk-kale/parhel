@@ -286,7 +286,7 @@ fn publish_failpoint_variants_are_exercised() {
 // ---------------------------------------------------------------- Linux evidence
 
 /// Copy-on-write evidence on Linux (`FIEMAP`): a reflink is detected as shared, an
-/// ordinary copy is not, and one file compared with itself is not "shared" either.
+/// ordinary copy is not, and an unshared file compared with itself is not "shared" either.
 #[cfg(target_os = "linux")]
 fn reflink_evidence_on(fs_kind: MountedFs) {
     let Some(dir) = test_mount(fs_kind) else {
@@ -336,7 +336,10 @@ fn reflink_evidence_on(fs_kind: MountedFs) {
         );
     }
     // Same physical block but nothing shared: the SHARED flag matters, too.
-    assert!(!shares_storage(&a, &a), "one file is not a clone of itself");
+    assert!(
+        !shares_storage(&copied, &copied),
+        "an unshared file is not a clone of itself"
+    );
 }
 
 #[cfg(target_os = "linux")]
