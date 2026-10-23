@@ -1143,6 +1143,8 @@ pub struct FakeHost {
     pub images: RefCell<HashMap<PathBuf, ImageUsage>>,
     /// Images `mkfs.btrfs` ran on.
     pub formatted: RefCell<HashSet<PathBuf>>,
+    /// Images that hold some other filesystem, by type (not made by `setup`).
+    pub foreign: RefCell<HashMap<PathBuf, String>>,
     pub mounted: RefCell<HashSet<PathBuf>>,
     pub immutable: RefCell<HashSet<PathBuf>>,
     /// Modes and owners last given to a path.
@@ -1187,6 +1189,7 @@ impl Default for FakeHost {
             ),
             images: RefCell::default(),
             formatted: RefCell::default(),
+            foreign: RefCell::default(),
             mounted: RefCell::default(),
             immutable: RefCell::default(),
             attrs: RefCell::default(),
@@ -1255,6 +1258,22 @@ impl FakeHost {
         self.log.borrow_mut().push(call);
     }
 
+    /// Whether the contents of the store's filesystem are out of reach at `path`: the
+    /// root of a store is the directory that holds its marker, and while it is not
+    /// mounted whatever is below it lives on the image, not on the host. `include_root`
+    /// counts the root's own entries (its listing), which the image holds too.
+    fn out_of_reach(&self, path: &Path, include_root: bool) -> bool {
+        let mounted = self.mounted.borrow();
+        self.files
+            .borrow()
+            .keys()
+            .filter(|f| f.file_name().is_some_and(|n| n == ".parhel-store"))
+            .filter_map(|f| f.parent())
+            .any(|root| {
+                !mounted.contains(root) && path.starts_with(root) && (include_root || path != root)
+            })
+    }
+
     fn remember(&self, path: &Path, mode: u32, owner: Owner) {
         self.attrs
             .borrow_mut()
@@ -1295,16 +1314,23 @@ impl Host for FakeHost {
     }
 
     fn read_text(&self, path: &Path) -> Result<Option<String>> {
+        if self.out_of_reach(path, false) {
+            return Ok(None);
+        }
         Ok(self.files.borrow().get(path).cloned())
     }
 
     fn exists(&self, path: &Path) -> bool {
-        self.files.borrow().contains_key(path)
-            || self.dirs.borrow().contains(path)
-            || self.images.borrow().contains_key(path)
+        !self.out_of_reach(path, false)
+            && (self.files.borrow().contains_key(path)
+                || self.dirs.borrow().contains(path)
+                || self.images.borrow().contains_key(path))
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>> {
+        if self.out_of_reach(path, true) {
+            return Ok(Vec::new());
+        }
         let files = self.files.borrow();
         let dirs = self.dirs.borrow();
         let images = self.images.borrow();
@@ -1322,6 +1348,27 @@ impl Host for FakeHost {
 
     fn is_mount_point(&self, path: &Path) -> bool {
         self.mounted.borrow().contains(path)
+    }
+
+    fn is_immutable(&self, path: &Path) -> bool {
+        self.immutable.borrow().contains(path)
+    }
+
+    fn filesystem_of(&self, image: &Path) -> Result<Option<String>> {
+        if !self.images.borrow().contains_key(image) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: no such file", image.display()),
+            ));
+        }
+        if let Some(kind) = self.foreign.borrow().get(image) {
+            return Ok(Some(kind.clone()));
+        }
+        Ok(self
+            .formatted
+            .borrow()
+            .contains(image)
+            .then(|| "btrfs".to_owned()))
     }
 
     fn run(&self, program: &str, args: &[&str]) -> Result<String> {
@@ -1362,7 +1409,7 @@ impl Host for FakeHost {
                 }
                 self.formatted.borrow_mut().insert(p(image));
             }
-            ("systemctl", ["enable", "--now", unit]) => {
+            ("systemctl", ["enable", "--now", unit] | ["start", unit]) => {
                 let text = self
                     .files
                     .borrow()
@@ -1373,7 +1420,10 @@ impl Host for FakeHost {
                     self.mounted.borrow_mut().insert(at);
                 }
             }
-            ("systemctl", ["disable", "--now", unit]) => {
+            ("umount", [at]) => {
+                self.mounted.borrow_mut().remove(Path::new(at));
+            }
+            ("systemctl", ["disable", "--now", unit] | ["stop", unit]) => {
                 let text = self
                     .files
                     .borrow()
@@ -1470,6 +1520,9 @@ impl Host for FakeHost {
         self.guard(path, true)?;
         self.files.borrow_mut().remove(path);
         self.images.borrow_mut().remove(path);
+        // A new file at that path starts blank.
+        self.formatted.borrow_mut().remove(path);
+        self.foreign.borrow_mut().remove(path);
         Ok(())
     }
 
@@ -1482,7 +1535,11 @@ impl Host for FakeHost {
                 format!("{}: Directory not empty or busy", path.display()),
             ));
         }
-        self.dirs.borrow_mut().remove(path);
+        // What was below lived on the filesystem the directory hid: gone with its image.
+        self.files.borrow_mut().retain(|f, _| !f.starts_with(path));
+        self.dirs
+            .borrow_mut()
+            .retain(|d| d != path && !d.starts_with(path));
         Ok(())
     }
 }
