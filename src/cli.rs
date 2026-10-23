@@ -92,14 +92,31 @@ created is removed, and a worktree that was already published is repaired, not r
 through a systemd mount unit, so `add` can create worktrees from sources on filesystems \
 without copy-on-write, such as ext4. The worktree lives in the store and the requested \
 destination becomes a symlink to it. Needs root (run it with sudo); the store belongs \
-to the user who ran sudo, or to --user.
+to the user who ran sudo, or to --user (root is never inferred).
 
-Safe to re-run: a healthy store is left as it is. With --remove the store is taken down \
-(refused while worktrees live in it).",
+It creates, in order: /var/lib/parhel (root, mode 0700); the image \
+/var/lib/parhel/<user>.img (sparse and 100G unless --size, fully allocated with \
+--preallocate), formatted with mkfs.btrfs; the mount unit parhel-<user>.mount in \
+/etc/systemd/system, enabled and started, so the store comes back after a reboot; and, \
+inside the mount, the user's directories and the .parhel-store marker. Last, it sets the \
+immutable attribute (chattr +i) on /var/lib/parhel, so that not even root can delete or \
+rename an image by accident, and checks that it works. If it does not, the store stays \
+usable and the command fails saying the image is not protected.
+
+Safe to re-run: a healthy store is left as it is, a stopped one is started, a missing \
+protection is added. An image that holds a filesystem is never formatted. With --remove \
+the store is taken down: refused (store-in-use) while worktrees live in it, otherwise \
+the unit, the image and the mount point are deleted.
+
+The image is one file. Commits are safe in each repository's own .git, but uncommitted \
+work in a store worktree is not: push what you cannot lose.",
         after_help = "Examples:
   sudo git parhel setup
   sudo git parhel setup --size 200G --user alice
-  sudo git parhel setup --remove"
+  sudo git parhel setup --remove
+
+Needs: mkfs.btrfs (btrfs-progs), chattr (e2fsprogs), a kernel with btrfs, systemd.
+Errors: not-root, missing-tool, unsupported-platform, store-in-use, usage."
     )]
     Setup(SetupArgs),
 }
@@ -162,8 +179,9 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Args)]
 pub struct SetupArgs {
-    /// Size of the store image: a number with an optional K, M, G or T suffix.
-    /// The image is sparse, so it takes disk space only as it fills.
+    /// Size of the store image: a number with an optional K, M, G or T suffix
+    /// (default 100G, at least 256M). The image is sparse, so it takes disk space
+    /// only as it fills.
     #[arg(long, value_name = "size")]
     pub size: Option<String>,
     /// Allocate the whole image now instead of letting it grow.
@@ -172,7 +190,8 @@ pub struct SetupArgs {
     /// Whose store to create (default: the user who ran sudo).
     #[arg(long, value_name = "name")]
     pub user: Option<String>,
-    /// Take the store down: unmount, remove the unit and the image.
+    /// Take the store down: unmount, remove the unit and the image (refused while
+    /// worktrees live in it).
     #[arg(long)]
     pub remove: bool,
 }

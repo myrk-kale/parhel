@@ -16,8 +16,9 @@ tests (U-TXN-80…90, U-LFS-*, `add_copy.rs`, `add_linux.rs`) were committed fir
 The store (phase 2: worktrees of sources without copy-on-write, `git parhel setup`) was
 built the same way, and the section [Store](#store--worktrees-without-copy-on-write) lists
 its tests. They were red on purpose against stubs (`not-implemented`, `todo!()`) until the
-store was implemented; what is still red is `git parhel setup` (U-SET-* and the gated
-`tests/setup.rs`), which is the next step.
+store was implemented. `git parhel setup` (U-SET-* and the gated `tests/setup.rs`) was last
+and is implemented too; the notes under [Store](#store--worktrees-without-copy-on-write)
+list the two changes it made to the test support.
 
 Spec changes made while implementing (each one a wrong assumption in the test, not a
 weakened guarantee):
@@ -364,12 +365,22 @@ requested destination becomes a symlink to the real worktree. `git worktree remo
 registration, and leaves the symlink dangling (I-S16; `doctor` finds and removes it).
 
 Status: the store route, discovery, the baseline sync, the journal link and the `doctor`
-findings are implemented and green (U-STO-*, U-FS-24…32, `tests/add_store.rs`); `git parhel
-setup` is not (U-SET-02…37 and `tests/setup.rs` are red on purpose until it is). Fixes to
+findings are implemented and green (U-STO-*, U-FS-24…32, `tests/add_store.rs`), and so is `git
+parhel setup` (U-SET-*, U-SYS-*, and `tests/setup.rs` in the CI job `setup (Linux)`). Fixes to
 the tests of the first step, each a wrong assumption in the test: the fixture of U-STO-30
 had an empty baseline tree that is, correctly, "unchanged" (a first sync finds no tree and
 creates it, root included); the helper behind U-STO-54 expected a staging directory to
 remove after the injected failure of its own creation.
+
+Changes to the test support when `setup` was implemented (no assertion was weakened):
+`FakeHost` let `rmdir` see through an unmounted mount point, so the removal of the mount
+point (U-SET-32, U-SET-36) could not pass for any implementation; what lives on the store's
+filesystem (everything at or below the directory that holds the marker) now disappears when
+it is not mounted and when its mount point is removed, which is what the kernel does. A
+removed image starts blank when it is created again. The fake also starts and stops units
+(`systemctl start`/`stop`, `umount`) and answers the two new reads of the `Host` port,
+`is_immutable` and `filesystem_of` (`blkid -p`): an image with no signature is what an
+interrupted setup leaves, one that holds another filesystem is data.
 
 ### Unit tests with fakes
 `World` (recording fake of git and the filesystem) gained `with_store()`, `stat_within`,
@@ -420,9 +431,18 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-SET-01 | Off Linux: `unsupported-platform`, no mutation (real) | `src/app/setup.rs` |
 | U-SET-02…09 | Preconditions: root (`not-root` naming `sudo git parhel setup [--remove]`), `mkfs.btrfs` (`missing-tool` naming `btrfs-progs`), btrfs loadable or not, systemd, unknown user, user from `$SUDO_USER`, inferred root refused and explicit `--user root` honored | `src/app/setup.rs` |
 | U-SET-10…14 | The steps in order (image, mkfs, mount point, unit, enable, ownership, layout, marker, `chattr +i`, verify), modes and owners, unit content, unit name from `systemd-escape`, marker | `src/app/setup.rs` |
+| U-SET-02b | The `sudo` command in the `not-root` message carries the options that were given | `src/app/setup.rs` |
 | U-SET-15…18 | Size, `--preallocate`; re-run is a no-op (`AlreadySetUp`); a stopped store is started again; an existing image is never reformatted | `src/app/setup.rs` |
 | U-SET-19…21 | Missing `chattr` or an unprotected image fails loudly leaving a usable store; summary | `src/app/setup.rs` |
+| U-SET-22 / 22b | A second user's image: the directory protecting the first is lifted, the image created, the protection put back; also when the run fails half way | `src/app/setup.rs` |
+| U-SET-23 | An image with no signature (interrupted setup) is formatted, not recreated; one that holds another filesystem is refused untouched | `src/app/setup.rs` |
+| U-SET-24 | A re-run adds back a lost protection and does nothing else (`Restored`) | `src/app/setup.rs` |
+| U-SET-25 | Not this store's: a mount whose image is gone, a unit of that name for another image, a marker of another user: `store-unavailable`, nothing overwritten | `src/app/setup.rs` |
+| U-SET-26 | Setup again after `--remove` builds the same store from scratch | `src/app/setup.rs` |
+| U-SET-38 | `--remove` of a stopped store mounts it to look for worktrees (they cannot be seen otherwise) and puts it back down when it refuses | `src/app/setup.rs` |
+| U-SET-39 / 40 | `--remove` unmounts a mount no unit owns; staging directories of an `add` are not worktrees | `src/app/setup.rs` |
 | U-SET-30…37 | `--remove`: refuses with worktrees (`store-in-use`, listing them), ignores baselines and empty directories, the order (disable, remove unit, reload, `chattr -i`, delete image, remove mount point), re-protects the directory while other images remain, idempotent, same user rules, partial stores, touches only parhel's paths | `src/app/setup.rs` |
+| U-SYS-01…09 | The real `Host` (`src/sys`): mountinfo with the kernel's octal escapes; programs only from absolute `PATH` directories; `run` reports stderr, a missing program is `missing-tool`; directories get their mode and owner through a descriptor and a link is not a directory; files are replaced whole and a link at their place is replaced, never followed; a marker that is a link is refused without reading its target; listing does not look through a link; sparse and fully allocated images, never over an existing one, a failed one removed; **verifying the protection of an unprotected directory reports it and keeps the image** | `src/sys/mod.rs` |
 | U-CLI-20…24 | `setup` command line: defaults, flags, `--remove` conflicts, invalid usage, help mentions sudo and `/parhel/<user>` (real) | `src/cli.rs` |
 | U-CLI-25 / 26 | `--size`: `K/M/G/T` suffixes, bare bytes; rejects malformed, overflowing, below 256M (real) | `src/domain/request.rs` |
 
@@ -487,7 +507,23 @@ protected image (see the comment on the CI job for why).
 | I-SET12 | Unknown `--user`: usage error, nothing created |
 | I-SET13 | `doctor` reports `store-image-deleted` when the image was deleted under a mounted store |
 | I-SET14 | Off Linux (macOS): `setup` is `unsupported-platform` (the only test here that runs unguarded) |
+| I-SET15 | A second (real) user's store goes into the directory that protects the first image: both images exist, both stores are mounted and the new one is that user's, `lsattr` shows the attribute, `rm` of either image as root fails with `Operation not permitted`; removing one store leaves the other image protected |
 
+Found by the first runs of the job on the CI runner (ubuntu-24.04, systemd as PID 1):
+
+- The kernel accepts `rename(image, image)` before it looks at the directory, so a
+  rename onto itself proves nothing about an immutable directory (the first version of
+  `verify_immutable` reported a protected image as unprotected). The check now probes
+  with `rmdir` on the image (refused with `EPERM` by an immutable directory, `ENOTDIR`
+  by a writable one, and it can never delete the image) and with the creation of a
+  symlink beside it (`EPERM`, removed again when it is accepted); renaming goes through
+  the same two checks. I-SET03 and I-SET15 are the ones that really `rm` and `mv` the
+  image as root.
+- `/var/lib/parhel` is root's and mode 0700 (U-SET-11), so the ordinary user the tests
+  run as cannot stat an image. The tests that did (`fs::metadata`, `Path::exists`)
+  failed with `EACCES`, and the "image is gone" assertions of I-SET07, 09, 10, 11 and 12
+  passed for the wrong reason (`exists` is `false` for a permission error). The images
+  are now inspected through `sudo stat` / `sudo test -e`; no assertion was weakened.
 ## Not covered (needs infrastructure)
 
 - A matrix of real git versions (only the installed one runs; the minimum is checked with a fake `git`).
