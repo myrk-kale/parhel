@@ -28,6 +28,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Agent skill is discoverable
+        shell: bash
         run: |
           npx -y skills@1 add . --list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > skills.txt
           cat skills.txt
@@ -70,6 +71,8 @@ jobs:
         # The same script scripts/linux-test.sh runs in its container: it prints
         # PARHEL_TEST_BTRFS/XFS/EXT4, PARHEL_REQUIRE_FS and TMPDIR (on btrfs) for
         # the steps below.
+        # bash with pipefail: a failing mount script must fail the step, not tee.
+        shell: bash
         run: |
           sudo modprobe loop btrfs xfs || true
           sudo scripts/mount-test-filesystems.sh "$USER" | tee -a "$GITHUB_ENV"
@@ -82,14 +85,23 @@ jobs:
         run: cargo test --features failpoints --no-fail-fast
 
   linux-musl:
-    name: build linux musl
+    name: build linux musl (${{ matrix.target }})
     needs: lint
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners, as in the release workflow: the binary is run.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install the musl toolchain
         run: |
@@ -97,10 +109,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build the release binary (as the release workflow does)
         run: |
-          cargo build --release --locked --target x86_64-unknown-linux-musl --bin git-parhel
-          cp target/x86_64-unknown-linux-musl/release/git-parhel .
+          cargo build --release --locked --target "${{ matrix.target }}" --bin git-parhel
+          cp "target/${{ matrix.target }}/release/git-parhel" git-parhel
           file git-parhel
-          if readelf -l git-parhel | grep -q INTERP; then echo "git-parhel is dynamically linked"; exit 1; fi
+          # (Not piped: with pipefail, grep -q closing the pipe would fail readelf.)
+          readelf -l git-parhel > program-headers.txt
+          if grep -q INTERP program-headers.txt; then echo "git-parhel is dynamically linked"; exit 1; fi
       - name: Smoke test
         run: scripts/smoke-test.sh ./git-parhel
 
@@ -165,6 +179,7 @@ jobs:
           key: git-${{ matrix.git }}-${{ runner.os }}-${{ runner.arch }}-v1
       - name: Build git ${{ matrix.git }} from the official tarball
         if: steps.git-cache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           curl -fsSL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${{ matrix.git }}.tar.xz" | tar xJ
           make -C "git-${{ matrix.git }}" -j"$(sysctl -n hw.ncpu)" prefix="$GIT_PREFIX_DIR" \
