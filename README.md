@@ -76,39 +76,50 @@ You need git 2.29 or newer and one of these:
   On any other filesystem, `--copy` and `--fallback` still work; see
   [Platform support](#platform-support).
 
-Prebuilt Linux binaries come in a later release. Until then, on Linux, build
-it with Cargo (below).
-
-With Homebrew:
+With Homebrew (macOS, and Linux with [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux)):
 
 ```sh
 brew install myrk-kale/tap/parhel
 ```
 
-Without Homebrew, the install script puts the binary in `~/.local/bin` and
+Without Homebrew, the install script picks the release archive for your system
+(macOS, or Linux on x86_64 or aarch64), puts the binary in `~/.local/bin` and
 checks its SHA-256 before installing:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
 ```
 
-Set `PARHEL_VERSION=0.2.0` to install a specific version, or
+Set `PARHEL_VERSION=0.3.0` to install a specific version, or
 `PARHEL_INSTALL_DIR` to put the binary somewhere else.
 
-With Cargo (Rust 1.85 or newer; this is the way to install on Linux today), from
-crates.io or straight from the repository:
+With Cargo (Rust 1.85 or newer), from crates.io or straight from the repository:
 
 ```sh
 cargo install parhel
 cargo install --git https://github.com/myrk-kale/parhel
 ```
 
+Or download an archive from the
+[releases page](https://github.com/myrk-kale/parhel/releases), check it against
+its `.sha256` file and unpack it. Each archive holds `git-parhel`, the man pages,
+the license and the changelog:
+
+| System | Archive |
+| --- | --- |
+| macOS, Apple silicon and Intel | `parhel-v<version>-universal-apple-darwin.tar.gz` |
+| Linux, x86_64 | `parhel-v<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux, aarch64 | `parhel-v<version>-aarch64-unknown-linux-musl.tar.gz` |
+
+The Linux binaries are statically linked (musl): they run on any distribution,
+glibc or not, and need nothing but `git`.
+
 Release binaries carry a signed build provenance attestation, so you can check
 that a download was built by this repository's release workflow from a given
 commit:
 
 ```sh
-gh attestation verify parhel-v0.2.0-universal-apple-darwin.tar.gz -R myrk-kale/parhel
+gh attestation verify parhel-v0.3.0-x86_64-unknown-linux-musl.tar.gz -R myrk-kale/parhel
 ```
 
 Then check that git can find it:
