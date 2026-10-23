@@ -36,16 +36,20 @@ jobs:
           repository: myrk-kale/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
-      - name: Render formula from the release checksum
+      - name: Render formula from the release checksums
         run: |
           version="${TAG#v}"
-          archive="parhel-${TAG}-universal-apple-darwin.tar.gz"
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "${archive}.sha256" -D dist
-          sha="$(cut -d' ' -f1 "dist/${archive}.sha256")"
-          test "${#sha}" = 64
+          sha() {
+            archive="parhel-${TAG}-$1.tar.gz"
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "${archive}.sha256" -D dist --clobber
+            cut -d' ' -f1 "dist/${archive}.sha256"
+          }
           mkdir -p tap/Formula
-          sed -e "s/@VERSION@/${version}/g" -e "s/@SHA256@/${sha}/g" \
-            packaging/parhel.rb.in > tap/Formula/parhel.rb
+          packaging/render-formula.sh "$version" \
+            "$(sha universal-apple-darwin)" \
+            "$(sha x86_64-unknown-linux-musl)" \
+            "$(sha aarch64-unknown-linux-musl)" > tap/Formula/parhel.rb
+          cat tap/Formula/parhel.rb
       - name: Audit, install and test
         run: |
           brew tap-new --no-git local/verify >/dev/null

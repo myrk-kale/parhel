@@ -81,6 +81,29 @@ jobs:
       - name: Test suite (with failpoints)
         run: cargo test --features failpoints --no-fail-fast
 
+  linux-musl:
+    name: build linux musl
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build the release binary (as the release workflow does)
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl --bin git-parhel
+          cp target/x86_64-unknown-linux-musl/release/git-parhel .
+          file git-parhel
+          if readelf -l git-parhel | grep -q INTERP; then echo "git-parhel is dynamically linked"; exit 1; fi
+      - name: Smoke test
+        run: scripts/smoke-test.sh ./git-parhel
+
   msrv:
     name: MSRV (shipped binary)
     needs: lint
@@ -109,12 +132,14 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Audit the formula template (style only; checksum is a placeholder)
+      - name: Audit the formula template (style only; checksums are placeholders)
         run: |
           version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          # Distinct placeholders: the audit rejects identical checksums in branches.
+          sha() { printf "%0*d" 64 "$1"; }
           brew tap-new --no-git local/verify >/dev/null
-          sed -e "s/@VERSION@/${version}/g" -e "s/@SHA256@/$(printf '0%.0s' $(seq 64))/g" \
-            packaging/parhel.rb.in > "$(brew --repository local/verify)/Formula/parhel.rb"
+          packaging/render-formula.sh "$version" "$(sha 1)" "$(sha 2)" "$(sha 3)" \
+            > "$(brew --repository local/verify)/Formula/parhel.rb"
           brew audit --strict local/verify/parhel
 
   git-versions:
