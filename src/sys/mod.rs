@@ -449,11 +449,13 @@ impl Host for SystemHost {
                 format!("`{}` contains a NUL byte", image.display()),
             )
         })?;
-        // Removing and renaming go through the same check on the directory, which an
-        // immutable one fails with EPERM before it looks at the entry. The probes are
-        // chosen so that a directory that is NOT protected loses nothing: `rmdir` of a
-        // regular file is refused (ENOTDIR) and a rename onto itself changes nothing,
-        // where an `unlink` would delete the image.
+        // Removing, renaming and creating an entry all go through the same check on the
+        // directory, which an immutable one fails with EPERM before it looks at any
+        // entry. The probes are chosen so that a directory that is NOT protected loses
+        // nothing: `rmdir` of a regular file is refused (ENOTDIR) where an `unlink` would
+        // delete the image, a rename of the image onto itself is accepted by the kernel
+        // before it checks anything (so it proves nothing), and a symlink that did get
+        // created is removed again.
         // SAFETY: `image_c` is a valid C string.
         let removal = unsafe { libc::rmdir(image_c.as_ptr()) };
         match (removal != 0).then(io::Error::last_os_error) {
@@ -461,10 +463,14 @@ impl Host for SystemHost {
             Some(e) => return unprotected(format!("removal was refused with `{e}`, not EPERM")),
             None => return unprotected("removal was accepted".to_owned()),
         }
-        match fs::rename(image, image) {
-            Err(e) if errno_of(&e) == Some(libc::EPERM) => {}
-            Err(e) => return unprotected(format!("renaming was refused with `{e}`, not EPERM")),
-            Ok(()) => return unprotected("renaming was accepted".to_owned()),
+        match creation_is_refused(dir) {
+            Ok(true) => {}
+            Ok(false) => return unprotected("creating an entry was accepted".to_owned()),
+            Err(e) => {
+                return unprotected(format!(
+                    "creating an entry was refused with `{e}`, not EPERM"
+                ));
+            }
         }
         // The loop device opens the image for writing: that must keep working.
         OpenOptions::new()
@@ -488,6 +494,20 @@ impl Host for SystemHost {
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
         fs::remove_dir(path).map_err(|e| io_error(path, &e))
+    }
+}
+
+/// Whether the kernel refuses (EPERM) to create an entry in `dir`: the probe is a
+/// symlink, and one that did get created is removed again.
+fn creation_is_refused(dir: &Path) -> io::Result<bool> {
+    let probe = dir.join(format!(".parhel-probe-{}", std::process::id()));
+    match std::os::unix::fs::symlink(".", &probe) {
+        Err(e) if errno_of(&e) == Some(libc::EPERM) => Ok(true),
+        Err(e) => Err(e),
+        Ok(()) => {
+            fs::remove_file(&probe)?;
+            Ok(false)
+        }
     }
 }
 
@@ -704,6 +724,17 @@ mod tests {
         assert!(err.message.contains("a.img"), "{}", err.message);
         assert_eq!(fs::read_to_string(&image).unwrap(), "data", "image intact");
         assert!(!host.is_immutable(dir.path()));
+    }
+
+    // U-SYS-09b: the creation probe says "accepted" for a plain directory and leaves
+    // nothing behind.
+    #[test]
+    fn the_creation_probe_cleans_up_after_itself() {
+        let dir = tmp();
+        assert!(!creation_is_refused(dir.path()).unwrap());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        let err = creation_is_refused(&dir.path().join("missing")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
