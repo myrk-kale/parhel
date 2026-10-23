@@ -401,13 +401,12 @@ fn project_with_read_only_dir(sb: &Sandbox) -> TestRepo {
 
 // I-L15: read-only directories are filled and then locked, in both modes.
 #[rstest]
-fn il15_read_only_directories_are_reproduced(
-    #[values(MountedFs::Btrfs, MountedFs::Xfs, MountedFs::Ext4)] fs: MountedFs,
-    #[values(false, true)] copy: bool,
-) {
-    if fs == MountedFs::Ext4 && !copy {
-        return;
-    }
+#[case::reflink_btrfs(MountedFs::Btrfs, false)]
+#[case::reflink_xfs(MountedFs::Xfs, false)]
+#[case::copy_btrfs(MountedFs::Btrfs, true)]
+#[case::copy_xfs(MountedFs::Xfs, true)]
+#[case::copy_ext4(MountedFs::Ext4, true)]
+fn il15_read_only_directories_are_reproduced(#[case] fs: MountedFs, #[case] copy: bool) {
     let Some(sb) = sandbox_on(fs) else {
         return;
     };
