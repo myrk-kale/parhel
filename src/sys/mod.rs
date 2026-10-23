@@ -10,14 +10,14 @@ use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::domain::{Error, ErrorCode, Result};
+use crate::domain::{Error, ErrorCode, Result, mounts};
 use crate::fs::unix::io_error;
-use crate::ports::{Host, ImageUsage, Owner, UserInfo};
+use crate::ports::{Host, ImageUsage, MountBacking, Owner, UserInfo};
 
 /// The real [`Host`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -51,35 +51,13 @@ fn is_executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
 }
 
-/// The mount points listed in `/proc/self/mountinfo` (fifth field, octal-escaped).
-fn mount_points(mountinfo: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    mountinfo
-        .lines()
-        .filter_map(|line| line.split(' ').nth(4))
-        .map(|field| PathBuf::from(OsString::from_vec(unescape_octal(field))))
-}
-
-/// `\040` (space), `\011`, `\012` and `\134` as the kernel writes them.
-fn unescape_octal(field: &str) -> Vec<u8> {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let octal = bytes.get(at + 1..at + 4).filter(|digits| {
-            bytes[at] == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d))
-        });
-        if let Some(digits) = octal {
-            let value = digits
-                .iter()
-                .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
-            out.push(u8::try_from(value & 0xff).unwrap_or(b'?'));
-            at += 4;
-        } else {
-            out.push(bytes[at]);
-            at += 1;
-        }
+/// Whether two paths are one file (the same device and inode), for paths that reach it
+/// through different names (a symbolic link in a parent directory).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
-    out
 }
 
 /// Give `file` its owner (`None`: root). Nothing is asked of the kernel when the file
@@ -263,13 +241,55 @@ impl Host for SystemHost {
 
     fn is_mount_point(&self, path: &Path) -> bool {
         if let Ok(text) = fs::read_to_string("/proc/self/mountinfo") {
-            return mount_points(&text).any(|mount| mount == path);
+            return mounts::mount_at(&mounts::parse(&text), path).is_some();
         }
         // No procfs: a mount point is where the device changes.
         let (Ok(here), Some(parent)) = (fs::symlink_metadata(path), path.parent()) else {
             return false;
         };
         fs::symlink_metadata(parent).is_ok_and(|up| up.dev() != here.dev())
+    }
+
+    fn mount_backing(&self, mount_point: &Path, image: &Path) -> Result<MountBacking> {
+        let info = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|e| io_error(Path::new("/proc/self/mountinfo"), &e))?;
+        let entries = mounts::parse(&info);
+        let Some(entry) = mounts::mount_at(&entries, mount_point) else {
+            return Ok(MountBacking::NotMounted);
+        };
+        let loop_device = Path::new(&entry.source)
+            .strip_prefix("/dev")
+            .ok()
+            .and_then(Path::to_str)
+            .filter(|name| name.starts_with("loop") && !name.contains('/'));
+        let Some(device) = loop_device else {
+            return Ok(MountBacking::Other(format!(
+                "{} ({})",
+                entry.source, entry.fstype
+            )));
+        };
+        let file = format!("/sys/block/{device}/loop/backing_file");
+        let Ok(backing) = fs::read_to_string(&file) else {
+            return Ok(MountBacking::Other(format!(
+                "the loop device {} (its backing file cannot be read)",
+                entry.source
+            )));
+        };
+        let backing = backing.trim_end_matches('\n');
+        // A deleted image still backs the mount: the kernel adds ` (deleted)` to the name.
+        let (named, deleted) = match backing.strip_suffix(" (deleted)") {
+            Some(named) => (named, true),
+            None => (backing, false),
+        };
+        let named = Path::new(named);
+        if named == image || (!deleted && same_file(named, image)) {
+            Ok(MountBacking::Image)
+        } else {
+            Ok(MountBacking::Other(format!(
+                "a loop device backed by {}",
+                named.display()
+            )))
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -568,20 +588,6 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
-    // U-SYS-01: the kernel's escapes in /proc/self/mountinfo.
-    #[test]
-    fn mountinfo_fields_are_unescaped() {
-        let text = "36 35 98:0 /mnt1 /mnt/with\\040space rw,noatime master:1 - ext3 /dev/root rw\n\
-                    37 35 0:3 / /proc rw - proc proc rw\n\
-                    garbage\n";
-        let points: Vec<PathBuf> = mount_points(text).collect();
-        assert_eq!(
-            points,
-            vec![PathBuf::from("/mnt/with space"), PathBuf::from("/proc"),]
-        );
-        assert_eq!(unescape_octal("a\\134b\\012c\\9"), b"a\\b\nc\\9");
-    }
-
     // U-SYS-02: only absolute PATH entries are searched.
     #[test]
     fn programs_are_looked_up_in_absolute_directories_only() {
@@ -673,6 +679,59 @@ mod tests {
         host.write_file(&file, b"newer", 0o600, owner).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "newer");
         assert!(!dir.path().join(".unit.parhel-tmp").exists());
+    }
+
+    // U-SYS-10: the store is the store only if it is mounted from its image. Against the
+    // real mount table: nothing at a path that is not a mount point; a kernel filesystem
+    // (/proc) is "something else"; and a loop mount - the test filesystems are some - is
+    // the image its loop device is backed by, and not any other path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_backing_tells_the_stores_image_from_anything_else() {
+        let host = SystemHost;
+        let dir = tmp();
+        assert_eq!(
+            host.mount_backing(dir.path(), Path::new("/x.img")).unwrap(),
+            MountBacking::NotMounted
+        );
+        let proc = host
+            .mount_backing(Path::new("/proc"), Path::new("/x.img"))
+            .unwrap();
+        assert!(
+            matches!(&proc, MountBacking::Other(what) if what.contains("proc")),
+            "{proc:?}"
+        );
+
+        let info = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let entries = mounts::parse(&info);
+        let looped = entries.iter().find_map(|e| {
+            let device = e.source.strip_prefix("/dev/loop")?;
+            let backing =
+                fs::read_to_string(format!("/sys/block/loop{device}/loop/backing_file")).ok()?;
+            Some((e.point.clone(), PathBuf::from(backing.trim_end())))
+        });
+        let Some((point, image)) = looped else {
+            eprintln!("SKIPPED: no loop mount on this machine");
+            return;
+        };
+        assert_eq!(
+            host.mount_backing(&point, &image).unwrap(),
+            MountBacking::Image
+        );
+        // The same file under another name.
+        let alias = dir.path().join("alias.img");
+        symlink(&image, &alias).unwrap();
+        assert_eq!(
+            host.mount_backing(&point, &alias).unwrap(),
+            MountBacking::Image
+        );
+        let other = host
+            .mount_backing(&point, Path::new("/some/other.img"))
+            .unwrap();
+        assert!(
+            matches!(&other, MountBacking::Other(what) if what.contains(image.to_str().unwrap())),
+            "{other:?}"
+        );
     }
 
     // U-SYS-06: reading as root does not follow a planted link.

@@ -240,6 +240,18 @@ pub struct ImageUsage {
     pub allocated: u64,
 }
 
+/// What is mounted at a store's mount point, judged against the image it should be from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountBacking {
+    /// Nothing is mounted there.
+    NotMounted,
+    /// A loop device whose backing file is the image (also when that file was deleted).
+    Image,
+    /// Anything else, described for the message: a `tmpfs`, another disk, a loop device
+    /// backed by a different file.
+    Other(String),
+}
+
 /// Everything `git parhel setup` asks of the machine: privileged system calls,
 /// programs, systemd. Reads are separate from mutations so a fake can log only the
 /// latter.
@@ -261,6 +273,10 @@ pub trait Host {
     /// Names in a directory; empty when it does not exist.
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>>;
     fn is_mount_point(&self, path: &Path) -> bool;
+    /// What backs the filesystem mounted at `mount_point`, against `image`: only a loop
+    /// device whose backing file is the image is the store's own. Anything else mounted
+    /// there is somebody's, and `setup` must not lay out, protect or unmount it.
+    fn mount_backing(&self, mount_point: &Path, image: &Path) -> Result<MountBacking>;
     /// Whether the immutable attribute (`chattr +i`) is set on `path`. A filesystem
     /// that cannot say answers `false`.
     fn is_immutable(&self, path: &Path) -> bool;
