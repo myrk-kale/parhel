@@ -170,7 +170,7 @@ base="https://github.com/myrk-kale/parhel/releases/download/v${version}"
 **Debian, Ubuntu and derivatives** (`.deb`), for amd64 and arm64:
 
 ```sh
-deb="parhel_${version}_$(dpkg --print-architecture).deb"
+deb="parhel_${version}-1_$(dpkg --print-architecture).deb"
 curl -fsSLO "${base}/${deb}"
 sudo apt install "./${deb}"
 ```
@@ -256,7 +256,7 @@ release workflow from a given commit:
 
 ```sh
 gh attestation verify parhel-v0.3.0-x86_64-unknown-linux-musl.tar.gz -R myrk-kale/parhel
-gh attestation verify parhel_0.3.0_amd64.deb -R myrk-kale/parhel
+gh attestation verify parhel_0.3.0-1_amd64.deb -R myrk-kale/parhel
 ```
 
 Every file on the release page also has a `.sha256` file: `sha256sum -c

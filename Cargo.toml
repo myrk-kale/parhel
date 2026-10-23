@@ -74,12 +74,12 @@ Creates Git worktrees with filesystem copy-on-write cloning, so ignored build \
 output such as node_modules/ and target/ is in place immediately and takes no \
 extra disk space until a file changes. Runs on Btrfs and XFS (reflink); \
 --copy and --fallback cover other filesystems."""
+# Written by scripts/build-packages.sh for each release.
+changelog = "target/debian/changelog"
 assets = [
     ["target/release/git-parhel", "usr/bin/git-parhel", "755"],
     ["man/*.1", "usr/share/man/man1/", "644"],
     ["README.md", "usr/share/doc/parhel/README.md", "644"],
-    # The file name has no Debian revision, so Debian tools take the package for a
-    # native one and expect its changelog here (see packaging/debian/lintian-overrides).
     ["CHANGELOG.md", "usr/share/doc/parhel/changelog", "644"],
     ["packaging/debian/lintian-overrides", "usr/share/lintian/overrides/parhel", "644"],
 ]

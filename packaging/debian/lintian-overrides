@@ -3,8 +3,3 @@
 # linking for packages in the distribution; this one is installed from the
 # project's releases, not from the archive.
 parhel: statically-linked-binary [usr/bin/git-parhel]
-
-# The package has no Debian revision (parhel_<version>_<arch>.deb), so lintian
-# takes it for a native package and reads the changelog as a Debian one. It is
-# the project's CHANGELOG.md, in Keep a Changelog format.
-parhel: syntax-error-in-debian-changelog *
