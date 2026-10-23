@@ -1,16 +1,26 @@
 class Parhel < Formula
   desc "Copy-on-write Git worktrees with ignored build output included"
   homepage "https://github.com/myrk-kale/parhel"
-  url "https://github.com/myrk-kale/parhel/releases/download/v@VERSION@/parhel-v@VERSION@-universal-apple-darwin.tar.gz"
-  sha256 "@SHA256@"
   license "MIT"
+
+  # Release archives: a universal binary on macOS, static musl binaries on Linux.
+  if OS.mac?
+    url "https://github.com/myrk-kale/parhel/releases/download/v@VERSION@/parhel-v@VERSION@-universal-apple-darwin.tar.gz"
+    sha256 "@SHA256_MACOS@"
+  elsif Hardware::CPU.arm?
+    url "https://github.com/myrk-kale/parhel/releases/download/v@VERSION@/parhel-v@VERSION@-aarch64-unknown-linux-musl.tar.gz"
+    sha256 "@SHA256_LINUX_AARCH64@"
+  else
+    url "https://github.com/myrk-kale/parhel/releases/download/v@VERSION@/parhel-v@VERSION@-x86_64-unknown-linux-musl.tar.gz"
+    sha256 "@SHA256_LINUX_X86_64@"
+  end
 
   head do
     url "https://github.com/myrk-kale/parhel.git", branch: "main"
     depends_on "rust" => :build
   end
 
-  depends_on :macos
+  uses_from_macos "git"
 
   def install
     if build.head?
@@ -31,8 +41,10 @@ class Parhel < Formula
     system "git", "-C", "src", "add", ".gitignore"
     system "git", "-C", "src", "-c", "user.name=brew", "-c", "user.email=brew@example.com",
            "commit", "-q", "-m", "init"
+    # APFS clones; the test directory on Linux is usually ext4, which cannot reflink.
+    flags = OS.mac? ? [] : ["--copy"]
     cd "src" do
-      system bin/"git-parhel", "add", "../wt", "--new-branch", "brew-test"
+      system bin/"git-parhel", "add", "../wt", "--new-branch", "brew-test", *flags
     end
     assert_equal "built", (testpath/"wt/target/artifact").read
     assert_empty shell_output("git -C #{testpath}/wt status --porcelain")
