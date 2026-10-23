@@ -569,6 +569,7 @@ protected image (see the comment on the CI job for why).
 | I-SET18 | The unit deleted by hand, nothing in the store: `--remove` looks, then removes image and mount point |
 | I-SET19 | Another file in the store root: `--remove` refuses naming it; `--discard-contents` removes |
 | I-SET20 | A tmpfs mounted at the store's place: `setup` and `--remove` say `store-unavailable` naming it and touch nothing |
+| I-SET22 | The unit stopped (mount down): a published worktree is locked; `doctor` names it (`store-worktrees-unreachable`); `git worktree prune` and `gc` keep its registration; with the store back the worktree and its uncommitted file are intact and `doctor` is quiet |
 | I-SET21 | `--user` names that systemd would expand or that are not account names: usage error naming the rule, nothing created |
 | I-SET15 | A second (real) user's store goes into the directory that protects the first image: both images exist, both stores are mounted and the new one is that user's, `lsattr` shows the attribute, `rm` of either image as root fails with `Operation not permitted`; removing one store leaves the other image protected |
 

@@ -1,4 +1,4 @@
-//! I-SET01..I-SET21: `git parhel setup`, the store at its real place.
+//! I-SET01..I-SET22: `git parhel setup`, the store at its real place.
 //!
 //! These tests change the machine: they create `/var/lib/parhel`, a loop-mounted btrfs
 //! image, a systemd unit and `/parhel/<user>`, and they need `sudo`, systemd and the
@@ -922,6 +922,78 @@ fn iset21_user_names_systemd_would_expand_are_refused() {
     }
     assert!(!root_exists("/var/lib/parhel/a%b.img"));
     assert!(!root_exists(image()) && !unit_file().exists());
+}
+
+// I-SET22: the real thing behind I-S39: the unit is stopped (the mount is down, as after a
+// boot where the image did not come up) and git cleans up. `git worktree prune` and the `gc`
+// that runs it keep the registration of the store's worktree - it is locked - and `doctor`
+// says what is at stake; when the store is back the worktree is as it was.
+#[test]
+#[serial(setup)]
+fn iset22_prune_while_the_unit_is_stopped_keeps_the_registration() {
+    if !enabled() {
+        return;
+    }
+    let Some((sb, src)) = ext4_source() else {
+        return;
+    };
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    let dest = sb.path("wt");
+    assert_success(&add_default(&sb, &src, &dest, "f1"));
+    let real = fs::read_link(&dest).unwrap();
+    fs::write(real.join("uncommitted.txt"), "do not lose me").unwrap();
+    let listed = src.git(&["worktree", "list", "--porcelain"]);
+    assert!(
+        listed
+            .lines()
+            .any(|l| l == format!("locked parhel store: {}", store_root().display())),
+        "{listed}"
+    );
+
+    assert!(shell_ok(&format!("systemctl stop {}", unit())));
+    assert!(!is_mounted(&store_root()));
+    let out = parhel_cmd(&sb.env, &src.root, &["doctor"])
+        .env_remove("PARHEL_STORE")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("store-worktrees-unreachable"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("git worktree prune"),
+        "{}",
+        stdout(&out)
+    );
+
+    src.git(&["worktree", "prune", "--expire", "now"]);
+    src.git(&["-c", "gc.worktreePruneExpire=now", "gc", "--quiet"]);
+    assert!(
+        src.worktree_paths().contains(&real),
+        "prune forgot the worktree: {:?}",
+        src.worktree_paths()
+    );
+
+    assert!(shell_ok(&format!("systemctl start {}", unit())));
+    assert_eq!(
+        fs::read_to_string(real.join("uncommitted.txt")).unwrap(),
+        "do not lose me"
+    );
+    TestRepo::open(&sb.env, &dest).git(&["status", "--short"]);
+    let out = parhel_cmd(&sb.env, &src.root, &["doctor"])
+        .env_remove("PARHEL_STORE")
+        .output()
+        .unwrap();
+    // Quiet but for the room on the machine's own disk, which is not the test's to decide.
+    let said = stdout(&out);
+    let others: Vec<&str> = said
+        .lines()
+        .filter(|l| !l.starts_with("store-low-space:") && *l != "no issues found")
+        .collect();
+    assert!(others.is_empty(), "{said}");
 }
 
 // I-SET16: these tests remove the store of the user who runs them, and `PARHEL_TEST_SETUP=1`
