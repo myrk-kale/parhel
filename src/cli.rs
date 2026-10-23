@@ -108,6 +108,10 @@ pub struct AddArgs {
     /// (no copy-on-write on the volume, different volumes).
     #[arg(long)]
     pub fallback: bool,
+    /// Copy every file in full instead of cloning it copy-on-write: uses disk space,
+    /// works on any filesystem and across volumes. Cannot be combined with --fallback.
+    #[arg(long)]
+    pub copy: bool,
     /// Leave copied files that mention the source's path as they are (by default
     /// such paths are rewritten to the new worktree's).
     #[arg(long)]
@@ -205,6 +209,12 @@ impl AddArgs {
                 "--branch, --new-branch and --detach are mutually exclusive",
             ));
         }
+        if self.copy && self.fallback {
+            return Err(usage(
+                "--copy and --fallback are mutually exclusive: --copy copies the files \
+                 in full, --fallback creates a plain worktree without them",
+            ));
+        }
         if self.branch.is_some() && self.reference.is_some() {
             return Err(usage(
                 "--branch already names what to check out; drop [ref]",
@@ -232,6 +242,7 @@ impl AddArgs {
             branch,
             allow_dirty: self.allow_dirty,
             fallback: self.fallback,
+            copy: self.copy,
             relocate: !self.no_relocate,
             submodules: match self.submodules {
                 SubmodulesArg::Refuse => SubmodulePolicy::Refuse,
@@ -274,6 +285,7 @@ mod tests {
                 branch: BranchMode::Default,
                 allow_dirty: false,
                 fallback: false,
+                copy: false,
                 submodules: SubmodulePolicy::Refuse,
                 relocate: true,
             }
@@ -332,6 +344,7 @@ mod tests {
     #[case::branch_and_detach(&["--branch", "a", "--detach", "d"])]
     #[case::new_and_detach(&["--new-branch", "a", "--detach", "d"])]
     #[case::branch_and_ref(&["--branch", "a", "d", "v1"])]
+    #[case::copy_and_fallback(&["--copy", "--fallback", "d"])]
     fn rejects_conflicts(#[case] args: &[&str]) {
         usage(args);
     }
@@ -455,5 +468,45 @@ mod tests {
     #[test]
     fn no_relocate_flag() {
         assert!(!add(&["--no-relocate", "d"]).unwrap().relocate);
+    }
+
+    // U-CLI-17: `--copy` asks for a full copy; off by default.
+    #[test]
+    fn copy_flag() {
+        assert!(!add(&["d"]).unwrap().copy);
+        let req = add(&["--copy", "d"]).unwrap();
+        assert!(req.copy && !req.fallback);
+    }
+
+    // U-CLI-18: the two escape hatches are alternatives, so combining them is a usage
+    // error that names both flags.
+    #[test]
+    fn copy_with_fallback_names_both_flags() {
+        let err = add(&["--fallback", "--copy", "d"]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage);
+        assert!(
+            err.message.contains("--copy") && err.message.contains("--fallback"),
+            "{}",
+            err.message
+        );
+    }
+
+    // U-CLI-19: the help says what `--copy` costs and what it allows.
+    #[test]
+    fn copy_help_mentions_disk_space_and_cross_filesystem_use() {
+        let Invocation::Help(text) = parse(["git-parhel", "add", "--help"]).unwrap() else {
+            panic!("expected help");
+        };
+        assert!(text.contains("--copy"), "{text}");
+        // The help wraps lines: compare words.
+        let copy = text
+            .split("--copy")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(copy.contains("disk space"), "{text}");
+        assert!(copy.contains("across volumes"), "{text}");
     }
 }

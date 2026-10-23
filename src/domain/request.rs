@@ -28,6 +28,8 @@ pub enum SubmodulePolicy {
 }
 
 /// `git parhel add` after argument validation.
+// Each bool is an independent command-line switch.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddRequest {
     /// `--from`: any path inside the source worktree (default `.`), as typed.
@@ -41,6 +43,9 @@ pub struct AddRequest {
     pub allow_dirty: bool,
     /// `--fallback`: use a plain `git worktree add` when copy-on-write is impossible.
     pub fallback: bool,
+    /// `--copy`: copy every file in full (no copy-on-write, uses disk space). Works on
+    /// any filesystem and across volumes. Never combined with `fallback`.
+    pub copy: bool,
     pub submodules: SubmodulePolicy,
     /// Rewrite the source's absolute path in copied untracked files (`--no-relocate`
     /// turns it off).

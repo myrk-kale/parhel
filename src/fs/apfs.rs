@@ -121,6 +121,11 @@ impl CowFs for ApfsFs {
         ))
     }
 
+    /// Not written yet: `--copy` must copy, never `clonefile`.
+    fn copy_entry(&self, _: &Path, _: &Path) -> Result<()> {
+        Err(Error::not_implemented("`--copy` on macOS"))
+    }
+
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()> {
         let (cf, ct) = (c_path(from)?, c_path(to)?);
         // SAFETY: valid C strings.
@@ -373,5 +378,46 @@ mod tests {
             .rename_exclusive(&d.path().join("s"), &d.path().join("caf\u{e9}"))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::DestExists);
+    }
+
+    // U-FS-21: the copy flavour reproduces a tree like a clone: contents, modes,
+    // symlinks (never followed), empty directories.
+    #[test]
+    fn copy_entry_reproduces_a_tree() {
+        let d = tmp();
+        let src = d.path().join("src");
+        fs::create_dir_all(src.join("sub/empty")).unwrap();
+        fs::write(src.join("sub/run.sh"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(src.join("ro.txt"), b"ro").unwrap();
+        fs::set_permissions(src.join("ro.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+        symlink("sub", src.join("dir-link")).unwrap();
+        symlink("nowhere", src.join("dangling")).unwrap();
+        ApfsFs.copy_entry(&src, &d.path().join("dst")).unwrap();
+        let dst = d.path().join("dst");
+        assert_eq!(fs::read(dst.join("sub/run.sh")).unwrap(), b"#!/bin/sh\n");
+        let mode = |p: &str| fs::metadata(dst.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode("sub/run.sh"), mode("ro.txt")), (0o755, 0o444));
+        assert!(dst.join("sub/empty").is_dir());
+        for (link, target) in [("dir-link", "sub"), ("dangling", "nowhere")] {
+            assert!(fs::symlink_metadata(dst.join(link)).unwrap().is_symlink());
+            assert_eq!(
+                fs::read_link(dst.join(link)).unwrap(),
+                PathBuf::from(target)
+            );
+        }
+    }
+
+    // U-FS-22: ... and fails like it: onto an existing path, nothing is touched.
+    #[test]
+    fn copy_entry_onto_existing_path_fails_without_touching_it() {
+        let d = tmp();
+        fs::write(d.path().join("a"), b"new").unwrap();
+        fs::write(d.path().join("b"), b"keep").unwrap();
+        let err = ApfsFs
+            .copy_entry(&d.path().join("a"), &d.path().join("b"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::CloneFailed);
+        assert_eq!(fs::read(d.path().join("b")).unwrap(), b"keep");
     }
 }

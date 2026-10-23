@@ -46,6 +46,8 @@ pub enum Strategy {
     CopyOnWrite,
     /// Plain `git worktree add` (only with `--fallback`).
     Fallback,
+    /// Every file copied in full (`--copy`): same transaction, no copy-on-write.
+    Copy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,14 @@ pub fn add(env: &Env<'_>, request: &AddRequest) -> Result<AddOutcome> {
 }
 
 fn validate(env: &Env<'_>, request: &AddRequest) -> Result<Plan> {
+    // The CLI refuses the pair already; callers building a request by hand get the same.
+    if request.copy && request.fallback {
+        return Err(Error::new(
+            ErrorCode::Usage,
+            "--copy and --fallback are mutually exclusive: --copy copies the files in \
+             full, --fallback creates a plain worktree without them",
+        ));
+    }
     let raw = paths::resolve_destination(env.cwd, &request.destination);
     if raw.to_str().is_none() {
         return Err(Error::new(
@@ -756,6 +766,7 @@ mod tests {
             branch,
             allow_dirty: false,
             fallback: false,
+            copy: false,
             submodules: SubmodulePolicy::Refuse,
             relocate: true,
         }
@@ -2108,5 +2119,311 @@ mod tests {
             "{:#?}",
             w.calls()
         );
+    }
+
+    // ---------------------------------------------------------------- --copy
+
+    fn copy_request() -> AddRequest {
+        AddRequest {
+            copy: true,
+            ..new_branch()
+        }
+    }
+
+    fn volume(fs_type: &str, cow: bool, device: u64) -> VolumeInfo {
+        VolumeInfo {
+            fs_type: fs_type.into(),
+            cow,
+            device,
+        }
+    }
+
+    fn copies(w: &World) -> Vec<Call> {
+        w.calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Copy { .. }))
+            .collect()
+    }
+
+    // U-TXN-80: `--copy` has no copy-on-write requirement: a source on ext4 is fine.
+    #[test]
+    fn copy_needs_no_cow_volume() {
+        let w = World {
+            volumes: vec![(p("/"), volume("ext4", false, 1))],
+            ..World::default()
+        };
+        let out = run(&w, &copy_request()).unwrap();
+        assert_eq!(
+            out,
+            AddOutcome {
+                destination: p(DEST),
+                head: SHA_A.into(),
+                strategy: Strategy::Copy,
+                warnings: vec![],
+                relocated: 0,
+            }
+        );
+        assert_eq!(w.count(|c| matches!(c, Call::Rename { .. })), 1);
+    }
+
+    // U-TXN-81: ... nor the same volume: only the staging dir (always next to the
+    // destination) has to be on the destination's volume.
+    #[test]
+    fn copy_allows_cross_volume_and_mixed_filesystems() {
+        let w = World {
+            volumes: vec![
+                (p("/"), volume("xfs", true, 1)),
+                (p("/w/repo"), volume("ext4", false, 7)),
+            ],
+            ..World::default()
+        };
+        let out = run(&w, &copy_request()).unwrap();
+        assert_eq!(out.strategy, Strategy::Copy);
+        assert_eq!(
+            w.count(|c| *c == Call::CreateStaging { parent: p("/w") }),
+            1,
+            "staging next to the destination"
+        );
+    }
+
+    // U-TXN-82: `--copy` means copy, even where cloning would work.
+    #[test]
+    fn copy_copies_where_cloning_would_work() {
+        let w = World::default();
+        let out = run(&w, &copy_request()).unwrap();
+        assert_eq!(out.strategy, Strategy::Copy);
+        assert_eq!(w.count(|c| matches!(c, Call::Clone { .. })), 0);
+        assert_eq!(
+            copies(&w),
+            vec![
+                Call::Copy {
+                    src: p("/w/repo/node_modules"),
+                    dst: p(&format!("{STAGED_WT}/node_modules"))
+                },
+                Call::Copy {
+                    src: p("/w/repo/src"),
+                    dst: p(&format!("{STAGED_WT}/src"))
+                },
+            ]
+        );
+    }
+
+    /// Worlds that exercise the plan: exclusions, relocation, nested layouts.
+    fn rich_world(scenario: &str) -> (World, AddRequest) {
+        let mut w = world_with_references();
+        let mut req = new_branch();
+        match scenario {
+            "nested-worktree" => {
+                w.worktrees.push(WorktreeEntry {
+                    path: p("/w/repo/wt/other"),
+                    head: Some(SHA_A.into()),
+                    branch: Some("refs/heads/other".into()),
+                    ..WorktreeEntry::default()
+                });
+                w.tree
+                    .borrow_mut()
+                    .get_mut(&p("/w/repo"))
+                    .unwrap()
+                    .push(OsString::from("wt"));
+                w.tree.borrow_mut().insert(
+                    p("/w/repo/wt"),
+                    vec![OsString::from("other"), OsString::from("notes")],
+                );
+            }
+            "nested-destination" => {
+                w.tree
+                    .borrow_mut()
+                    .get_mut(&p("/w/repo"))
+                    .unwrap()
+                    .push(OsString::from(".worktrees"));
+                w.tree.borrow_mut().insert(p("/w/repo/.worktrees"), vec![]);
+                req.destination = p("/w/repo/.worktrees/feat");
+            }
+            "parhelignore" => w.parhelignored = vec![p("node_modules")],
+            "submodule-reinit" => {
+                w.submodules = vec![p("src")];
+                req.submodules = SubmodulePolicy::Reinit;
+            }
+            "symlink-ancestor" => {
+                w.worktrees.push(WorktreeEntry {
+                    path: p("/w/repo/lnk/wt"),
+                    ..WorktreeEntry::default()
+                });
+                w.tree
+                    .borrow_mut()
+                    .get_mut(&p("/w/repo"))
+                    .unwrap()
+                    .push(OsString::from("lnk"));
+                w.tree.borrow_mut().insert(
+                    p("/w/repo/lnk"),
+                    vec![OsString::from("wt"), OsString::from("f")],
+                );
+                w.symlinks.borrow_mut().insert(p("/w/repo/lnk"));
+            }
+            "no-relocate" => req.relocate = false,
+            "plain" => {}
+            other => panic!("unknown scenario {other}"),
+        }
+        (w, req)
+    }
+
+    // U-TXN-83: `--copy` is the same transaction with a different leaf operation:
+    // the very same calls in the very same order (same exclusions, same journal,
+    // same relocation, same publication) with every `Clone` replaced by a `Copy`.
+    #[rstest]
+    #[case::plain("plain")]
+    #[case::nested_worktree("nested-worktree")]
+    #[case::nested_destination("nested-destination")]
+    #[case::parhelignore("parhelignore")]
+    #[case::submodule_reinit("submodule-reinit")]
+    #[case::symlink_ancestor("symlink-ancestor")]
+    #[case::no_relocate("no-relocate")]
+    fn copy_runs_the_clone_transaction_with_copies(#[case] scenario: &str) {
+        let (cloning, req) = rich_world(scenario);
+        let cloned = run(&cloning, &req).unwrap();
+        let (copying, req) = rich_world(scenario);
+        let copied = run(&copying, &AddRequest { copy: true, ..req }).unwrap();
+
+        let as_copies: Vec<Call> = cloning
+            .calls()
+            .into_iter()
+            .map(|c| match c {
+                Call::Clone { src, dst } => Call::Copy { src, dst },
+                other => other,
+            })
+            .collect();
+        assert!(
+            as_copies.iter().any(|c| matches!(c, Call::Copy { .. })),
+            "scenario copies something"
+        );
+        assert_eq!(copying.calls(), as_copies);
+        assert_eq!(
+            copying.files.borrow().clone(),
+            cloning.files.borrow().clone(),
+            "same relocation"
+        );
+        assert_eq!(copied.relocated, cloned.relocated);
+        assert_eq!(copied.warnings, cloned.warnings);
+        assert_eq!(copied.strategy, Strategy::Copy);
+        assert_eq!(cloned.strategy, Strategy::CopyOnWrite);
+    }
+
+    // U-TXN-84: a failure at each pre-publish step rolls back exactly as with clones.
+    #[rstest]
+    #[case::worktree_add(Step::WorktreeAdd, ErrorCode::GitFailed, None)]
+    #[case::copy(Step::Clone, ErrorCode::CloneFailed, Some("feat"))]
+    #[case::reset_index(Step::ResetIndex, ErrorCode::GitFailed, Some("feat"))]
+    #[case::rename_io(Step::Rename, ErrorCode::Io, Some("feat"))]
+    fn copy_rolls_back_on_failure(
+        #[case] step: Step,
+        #[case] code: ErrorCode,
+        #[case] branch: Option<&str>,
+    ) {
+        let w = World::default().failing(step, code);
+        assert_eq!(
+            run(&w, &copy_request()).unwrap_err().code,
+            code,
+            "original error surfaces"
+        );
+        if step != Step::WorktreeAdd {
+            assert!(!copies(&w).is_empty(), "the files are copied, not cloned");
+            assert_eq!(w.count(|c| matches!(c, Call::Clone { .. })), 0);
+        }
+        assert_rolled_back(&w, branch);
+    }
+
+    // U-TXN-85: the failure that matters: the copy itself fails midway (disk full,
+    // unreadable file). The error is the copy's, the copy attempted is not a clone,
+    // and nothing outlives the run.
+    #[test]
+    fn copy_failing_midway_rolls_back_completely() {
+        let w = World::default().failing(Step::Clone, ErrorCode::CloneFailed);
+        let err = run(&w, &copy_request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::CloneFailed);
+        assert_eq!(copies(&w).len(), 1, "stopped at the first failing copy");
+        assert_eq!(w.count(|c| matches!(c, Call::Clone { .. })), 0);
+        assert_eq!(w.count(|c| matches!(c, Call::Rename { .. })), 0);
+        assert_rolled_back(&w, Some("feat"));
+    }
+
+    // U-TXN-86: SIGINT during a long copy -> interrupted + full rollback.
+    #[test]
+    fn copy_interrupt_rolls_back() {
+        let w = World::default();
+        w.interrupt_after.set(Some(Step::Clone));
+        assert_eq!(
+            run(&w, &copy_request()).unwrap_err().code,
+            ErrorCode::Interrupted
+        );
+        assert_eq!(copies(&w).len(), 1, "interrupted after the first copy");
+        assert_rolled_back(&w, Some("feat"));
+        assert_eq!(w.count(|c| matches!(c, Call::Rename { .. })), 0);
+    }
+
+    // U-TXN-87: the two escape hatches are alternatives, whoever builds the request.
+    #[test]
+    fn copy_with_fallback_is_a_usage_error_before_any_mutation() {
+        let w = World::default();
+        let mut req = copy_request();
+        req.fallback = true;
+        let err = run(&w, &req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage);
+        assert!(
+            err.message.contains("--copy") && err.message.contains("--fallback"),
+            "{}",
+            err.message
+        );
+        assert_no_mutation(&w);
+    }
+
+    // U-TXN-88: `--copy` does not weaken any other refusal.
+    #[rstest]
+    #[case::dirty(World { dirty: true, ..World::default() }, ErrorCode::DirtySource)]
+    #[case::sparse(World { sparse: true, ..World::default() }, ErrorCode::SparseCheckout)]
+    #[case::submodules(
+        World { submodules: vec![p("libs/a")], ..World::default() },
+        ErrorCode::SubmodulesPresent
+    )]
+    fn copy_does_not_bypass_safety_refusals(#[case] w: World, #[case] code: ErrorCode) {
+        assert_eq!(run(&w, &copy_request()).unwrap_err().code, code);
+        assert_no_mutation(&w);
+    }
+
+    // U-TXN-89: refusing for lack of copy-on-write offers both ways out, and says
+    // what each costs. Platform-neutral wording: no mention of APFS.
+    #[rstest]
+    #[case::source_not_cow(
+        vec![(p("/"), apfs(1)), (p("/w/repo"), volume("ext4", false, 1))],
+        ErrorCode::NotCow
+    )]
+    #[case::destination_not_cow(
+        vec![(p("/"), volume("ext4", false, 2)), (p("/w/repo"), apfs(1))],
+        ErrorCode::NotCow
+    )]
+    #[case::cross_volume(vec![(p("/"), apfs(1)), (p("/w/repo"), apfs(7))], ErrorCode::CrossVolume)]
+    fn refusal_offers_copy_and_fallback(
+        #[case] volumes: Vec<(PathBuf, VolumeInfo)>,
+        #[case] code: ErrorCode,
+    ) {
+        let w = World {
+            volumes,
+            ..World::default()
+        };
+        let err = run(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, code);
+        assert!(err.message.contains("--copy"), "{}", err.message);
+        assert!(err.message.contains("--fallback"), "{}", err.message);
+        assert!(!err.message.contains("APFS"), "{}", err.message);
+        assert_no_mutation(&w);
+    }
+
+    // U-TXN-90: without --copy nothing changes: still clones, still reports
+    // copy-on-write.
+    #[test]
+    fn without_copy_flag_nothing_is_copied() {
+        let w = World::default();
+        let out = run(&w, &new_branch()).unwrap();
+        assert_eq!(out.strategy, Strategy::CopyOnWrite);
+        assert_eq!(w.count(|c| matches!(c, Call::Copy { .. })), 0);
     }
 }

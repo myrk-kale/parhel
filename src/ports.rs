@@ -126,6 +126,11 @@ pub trait CowFs {
     fn create_dir(&self, path: &Path) -> Result<()>;
     /// `clonefile(src, dst, CLONE_NOFOLLOW)`. Errors: `clone-failed`, `cross-volume`.
     fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()>;
+    /// The `--copy` flavour of [`clone_entry`](Self::clone_entry): same contract (one
+    /// entry, file or directory tree, symlinks never followed, metadata preserved) but
+    /// every file's data is copied in full, never shared, and the volumes need not
+    /// support copy-on-write nor be the same. Errors: `clone-failed`.
+    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()>;
     /// `renamex_np(from, to, RENAME_EXCL)`. Errors: `dest-exists` when `to` exists
     /// (even as an empty dir), `io` otherwise.
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()>;

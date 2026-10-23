@@ -65,6 +65,11 @@ pub enum Call {
         src: PathBuf,
         dst: PathBuf,
     },
+    /// `copy_entry`: a full copy, as opposed to [`Call::Clone`].
+    Copy {
+        src: PathBuf,
+        dst: PathBuf,
+    },
     Rename {
         from: PathBuf,
         to: PathBuf,
@@ -94,7 +99,7 @@ impl Call {
             | Call::WriteFile(path)
             | Call::Lock(path) => vec![path],
             Call::CreateStaging { parent } => vec![parent],
-            Call::Clone { dst, .. } => vec![dst],
+            Call::Clone { dst, .. } | Call::Copy { dst, .. } => vec![dst],
             Call::Rename { from, to } => vec![from, to],
             Call::BranchDelete(_) => vec![],
         }
@@ -330,7 +335,7 @@ impl World {
         self.log
             .borrow()
             .iter()
-            .any(|c| matches!(c, Call::Clone { .. }))
+            .any(|c| matches!(c, Call::Clone { .. } | Call::Copy { .. }))
     }
 
     fn is_dir_path(&self, path: &Path) -> bool {
@@ -561,6 +566,18 @@ impl CowFs for World {
     fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()> {
         self.record(
             Call::Clone {
+                src: src.into(),
+                dst: dst.into(),
+            },
+            Step::Clone,
+        )
+    }
+
+    /// Shares `Step::Clone` with `clone_entry`: a failure injected there hits whichever
+    /// flavour the run uses.
+    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.record(
+            Call::Copy {
                 src: src.into(),
                 dst: dst.into(),
             },
