@@ -1,4 +1,4 @@
-//! I-L01..I-L43: Linux filesystems (btrfs and XFS reflink, ext4 without).
+//! I-L01..I-L48: Linux filesystems (btrfs and XFS reflink, ext4 without).
 //!
 //! The filesystems come from the environment (`PARHEL_TEST_BTRFS`, `PARHEL_TEST_XFS`,
 //! `PARHEL_TEST_EXT4`, set up by `scripts/linux-test.sh` and CI). A missing variable
