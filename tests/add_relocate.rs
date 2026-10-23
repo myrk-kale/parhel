@@ -385,3 +385,57 @@ fn i150b_references_into_excluded_paths_are_kept() {
     );
     assert!(!alternates.contains(dest.to_str().unwrap()), "{alternates}");
 }
+
+// I-160: a symlink to rewrite, or a foreign gitfile to detach, in a read-only
+// directory: the directory is made writable for that and gets its mode back.
+#[test]
+fn i160_relocation_works_in_read_only_directories() {
+    let sb = Sandbox::new();
+    let src = project(&sb);
+    with_environment(&src);
+    let other = sb.repo("other");
+    let nested = src.path("node_modules/vendored");
+    other.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "vend",
+        nested.to_str().unwrap(),
+    ]);
+    let readonly = ["env", "node_modules/vendored"];
+    let _restore: Vec<_> = readonly
+        .iter()
+        .map(|d| RestoreMode(src.path(d), 0o755))
+        .collect();
+    for dir in readonly {
+        src.chmod(dir, 0o555);
+    }
+    let dest = sb.path("dest");
+    let out = add_ok(&sb, &src, &dest, &[]);
+    let _restore_copy: Vec<_> = readonly
+        .iter()
+        .map(|d| RestoreMode(dest.join(d), 0o755))
+        .collect();
+    assert_eq!(
+        fs::read_link(dest.join("env/current")).unwrap(),
+        dest.join("env/data"),
+        "the symlink follows the copy"
+    );
+    assert!(
+        !dest.join("node_modules/vendored/.git").exists(),
+        "foreign gitfile removed"
+    );
+    assert!(
+        stderr(&out).contains("node_modules/vendored"),
+        "{}",
+        stderr(&out)
+    );
+    for dir in readonly {
+        assert_eq!(
+            fs::metadata(dest.join(dir)).unwrap().permissions().mode() & 0o777,
+            0o555,
+            "{dir} is read-only again"
+        );
+    }
+}
