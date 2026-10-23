@@ -13,13 +13,14 @@
 //! links                         append-only registry of the symlinks created
 //! ```
 //!
-//! TDD state: the types and constants are real; every function that decides something
-//! still answers `todo!()` (they are the next step of the store work).
-
 use std::ffi::OsStr;
+use std::fmt::Write as _;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::domain::Result;
+use sha2::{Digest, Sha256};
+
+use crate::domain::{Error, ErrorCode, Result};
 
 /// Marker file at the root of a store.
 pub const MARKER_FILE: &str = ".parhel-store";
@@ -44,12 +45,60 @@ impl Marker {
     /// The text written by `setup`.
     #[must_use]
     pub fn render(&self) -> String {
-        todo!("render the marker")
+        format!(
+            "format={MARKER_FORMAT}\nuser={}\nimage={}\nunit={}\n",
+            self.user,
+            self.image.display(),
+            self.unit
+        )
     }
 
     /// Errors: `store-unavailable` for an unknown format, a missing key or garbage.
-    pub fn parse(_text: &str) -> Result<Self> {
-        todo!("parse the marker")
+    pub fn parse(text: &str) -> Result<Self> {
+        let unusable = |why: String| Error::new(ErrorCode::StoreUnavailable, why);
+        let (mut format, mut user, mut image, mut unit) = (None, None, None, None);
+        for line in text.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+            // Anything that is not `key=value` is not ours: unknown keys are skipped
+            // (a later version may add some), a line without `=` is not a marker.
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                unusable(format!(
+                    "`{MARKER_FILE}` is not a parhel store marker (found `{line}`)"
+                ))
+            })?;
+            match key {
+                "format" => format = Some(value),
+                "user" => user = Some(value),
+                "image" => image = Some(value),
+                "unit" => unit = Some(value),
+                _ => {}
+            }
+        }
+        match format {
+            Some(f) if f.trim() == MARKER_FORMAT.to_string() => {}
+            Some(other) => {
+                return Err(unusable(format!(
+                    "`{MARKER_FILE}` has format {other}, but this parhel understands format \
+                     {MARKER_FORMAT}: update parhel (or run `sudo git parhel setup` with the \
+                     version that made the store)"
+                )));
+            }
+            None => {
+                return Err(unusable(format!(
+                    "`{MARKER_FILE}` is not a parhel store marker (no format)"
+                )));
+            }
+        }
+        let key = |name: &str, value: Option<&str>| match value {
+            Some(v) if !v.is_empty() => Ok(v.to_owned()),
+            _ => Err(unusable(format!(
+                "`{MARKER_FILE}` lacks `{name}`: the store was not set up by `git parhel setup`"
+            ))),
+        };
+        Ok(Self {
+            user: key("user", user)?,
+            image: PathBuf::from(key("image", image)?),
+            unit: key("unit", unit)?,
+        })
     }
 }
 
@@ -76,15 +125,32 @@ pub enum StoreState {
 
 /// The store path: `PARHEL_STORE` when set and non-empty, else `/parhel/<user>`.
 #[must_use]
-pub fn store_path(_env_override: Option<&OsStr>, _user: &str) -> PathBuf {
-    todo!("resolve the store path")
+pub fn store_path(env_override: Option<&OsStr>, user: &str) -> PathBuf {
+    match env_override {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => Path::new("/parhel").join(user),
+    }
 }
 
 /// Identity of a repository inside the store: the first 16 bytes of the SHA-256 of
 /// the canonical source toplevel (as bytes), in lowercase hex (32 characters).
 #[must_use]
-pub fn repo_id(_toplevel: &Path) -> String {
-    todo!("hash the source path")
+pub fn repo_id(toplevel: &Path) -> String {
+    let digest = Sha256::digest(toplevel.as_os_str().as_bytes());
+    digest
+        .iter()
+        .take(16)
+        .fold(String::with_capacity(32), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+/// Whether `name` looks like a [`repo_id`]: 32 lowercase hexadecimal characters.
+#[must_use]
+pub fn is_repo_id(name: &OsStr) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 32 && bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// What a directory entry is, as far as syncing the baseline cares.
@@ -126,8 +192,29 @@ pub enum SyncAction {
 /// Compare a source entry with the baseline's, by kind, size, mtime (ns), mode and
 /// symlink target.
 #[must_use]
-pub fn sync_action(_source: &EntryMeta, _baseline: Option<&EntryMeta>) -> SyncAction {
-    todo!("decide what to do with one entry")
+pub fn sync_action(source: &EntryMeta, baseline: Option<&EntryMeta>) -> SyncAction {
+    let Some(baseline) = baseline else {
+        return SyncAction::Create;
+    };
+    if source.kind != baseline.kind {
+        return SyncAction::Replace;
+    }
+    let same = match source.kind {
+        // A directory's mtime moves whenever a child does; it is set last anyway.
+        EntryKind::Dir => source.mode == baseline.mode,
+        // A symlink is its target; its own mode and times mean nothing.
+        EntryKind::Symlink => source.link_target == baseline.link_target,
+        EntryKind::File | EntryKind::Fifo => {
+            source.size == baseline.size
+                && source.mtime_ns == baseline.mtime_ns
+                && source.mode == baseline.mode
+        }
+    };
+    if same {
+        SyncAction::Keep
+    } else {
+        SyncAction::Update
+    }
 }
 
 #[cfg(test)]
