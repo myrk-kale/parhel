@@ -49,6 +49,8 @@ something looks wrong, please
 ## Contents
 
 - [Quick start](#quick-start)
+  - [On macOS](#on-macos)
+  - [On Linux](#on-linux)
 - [Install](#install)
   - [macOS](#macos)
   - [Linux](#linux)
@@ -72,52 +74,98 @@ something looks wrong, please
 
 ## Quick start
 
-Install it:
+Pick your system. Every path ends with the same `git parhel add`; only the
+installation and, on some Linux filesystems, a one-time setup differ.
+
+### On macOS
 
 ```sh
-# macOS
 brew install myrk-kale/tap/parhel
 
-# Linux, any distribution
-curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
-```
-
-On Debian, Ubuntu, Fedora and similar distributions you can install a `.deb` or
-`.rpm` package instead; see [Linux](#linux).
-
-On Linux, copy-on-write needs btrfs, XFS (with reflink) or a similar
-filesystem. Most distributions put your home on ext4, which has none. There,
-run this once; it creates a copy-on-write area that `add` then uses on its own
-(see [Filesystems without copy-on-write](#filesystems-without-copy-on-write)):
-
-```sh
-sudo git parhel setup
-```
-
-Then create your first worktree:
-
-```sh
 cd ~/code/my-app                       # any path inside your worktree
-
-# New branch, new worktree, dependencies and build output included:
 git parhel add ../my-app-login --new-branch feature/login
-
-cd ../my-app-login
-npm test                               # no `npm install` needed
+cd ../my-app-login && npm test         # no `npm install` needed
 ```
 
-When you are done with it, remove the worktree with git itself:
+When you are done with it:
 
 ```sh
 git worktree remove ../my-app-login
 ```
 
-A worktree created through the setup area is locked, so it takes
-`git worktree unlock` first; see
-[Removing a store worktree](#removing-a-store-worktree).
+Copy-on-write comes from APFS, the default on every Mac since 2017. Nothing
+else to set up.
 
-Before you rely on parhel, read
-[Read this before you rely on it](#read-this-before-you-rely-on-it): a copy
+### On Linux
+
+Install it. On Debian, Ubuntu, Fedora and similar distributions you can use a
+`.deb` or `.rpm` package instead; see [Linux](#linux) under Install.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | sh
+```
+
+Then check which filesystem your projects live on:
+
+```sh
+stat -f -c %T ~/code                   # btrfs, xfs, or ext2/ext3 (which is how ext4 shows up)
+```
+
+#### On btrfs or XFS
+
+Nothing to set up. Copy-on-write is built into the filesystem (XFS needs
+`reflink=1`, the default since xfsprogs 5.1; bcachefs and ZFS 2.2+ should work
+too, untested).
+
+```sh
+cd ~/code/my-app
+git parhel add ../my-app-login --new-branch feature/login
+cd ../my-app-login && npm test         # no `npm install` needed
+```
+
+When you are done with it:
+
+```sh
+git worktree remove ../my-app-login
+```
+
+#### On ext4 and other filesystems
+
+ext4, the default on most distributions, cannot share data between files. Run
+this once: it creates a copy-on-write area for your user (a btrfs image mounted
+at `/parhel/<user>`, protected against deletion) that `add` then uses on its own.
+See [Filesystems without copy-on-write](#filesystems-without-copy-on-write) for
+what it creates and how to remove it.
+
+```sh
+sudo git parhel setup
+```
+
+Then, as on btrfs:
+
+```sh
+cd ~/code/my-app
+git parhel add ../my-app-login --new-branch feature/login
+cd ../my-app-login && npm test
+```
+
+`../my-app-login` is a symlink to the worktree, which lives in the
+copy-on-write area. That worktree is locked in git, so removing it takes one
+more step ([why](#removing-a-store-worktree)):
+
+```sh
+git worktree unlock ../my-app-login
+git worktree remove ../my-app-login
+git parhel doctor --fix                # removes the leftover symlink
+```
+
+Without the setup, `add` refuses with `not-cow`. `--copy` (a full copy, using
+the disk space of one) and `--fallback` (a plain `git worktree add`, without
+dependencies or build output) work anywhere, but they give up what parhel is for.
+
+### Before you rely on it
+
+Read [Read this before you rely on it](#read-this-before-you-rely-on-it): a copy
 shares your `.env` files with the original, and removing a worktree deletes its
 ignored files without asking. The other forms of `add` (existing branch,
 detached, another start commit) are under [Commands](#commands).
