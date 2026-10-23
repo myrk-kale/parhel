@@ -743,6 +743,15 @@ fn delete_the_unit_by_hand() {
     )));
     assert!(!unit_file().exists());
     assert!(!is_mounted(&store_root()));
+    // The loop device lets go of the image asynchronously after the unmount, with a
+    // last write into it; wait for that so later snapshots of the image are stable.
+    assert!(
+        shell_ok(&format!(
+            "for i in $(seq 1 50); do [ -z \"$(losetup -j '{img}')\" ] && sync && exit 0; sleep 0.1; done; exit 1",
+            img = image().display()
+        )),
+        "the loop device still holds the image"
+    );
 }
 
 fn is_mounted(path: &Path) -> bool {
@@ -780,8 +789,10 @@ fn iset17_remove_looks_inside_when_the_unit_is_gone_and_finds_the_worktree() {
     assert_success(&add_default(&sb, &src, &dest, "f1"));
     let real = fs::read_link(&dest).unwrap();
     fs::write(real.join("uncommitted.txt"), "do not lose me").unwrap();
-    let before = root_stat(image());
     delete_the_unit_by_hand();
+    // After the unmount: it flushes the store's last writes into the image, which
+    // moves its mtime; only what `--remove` does from here on must leave it alone.
+    let before = root_stat(image());
 
     let out = setup(&["--remove"]);
     assert_error(&out, "store-in-use");
