@@ -8,6 +8,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+use super::anchor;
 use super::tree::{self, Data};
 use super::unix::{self, c_path, io_error};
 use crate::domain::{Error, ErrorCode, Result};
@@ -19,16 +20,6 @@ pub const CLONE_NOFOLLOW: u32 = 0x0001;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApfsFs;
-
-/// Clear BSD flags (`uchg`, `uappnd`) and make directories writable, recursively.
-fn make_removable(path: &Path) {
-    unix::make_dirs_writable(path, &|entry| {
-        if let Ok(c) = c_path(entry) {
-            // SAFETY: valid C string; lchflags never follows symlinks.
-            unsafe { libc::lchflags(c.as_ptr(), 0) };
-        }
-    });
-}
 
 /// On macOS only `F_FULLFSYNC` flushes the drive's cache.
 fn full_sync(file: &File) -> io::Result<()> {
@@ -96,26 +87,47 @@ impl CowFs for ApfsFs {
     }
 
     fn clone_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
-        let src = &root.join(rel);
-        let (cs, cd) = (c_path(src)?, c_path(dst)?);
-        // SAFETY: valid C strings.
-        if unsafe { libc::clonefile(cs.as_ptr(), cd.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        let src = root.join(rel);
+        let failed = |e: &io::Error, culprit: PathBuf| {
+            let code = match e.raw_os_error() {
+                Some(libc::EXDEV) => ErrorCode::CrossVolume,
+                _ => ErrorCode::CloneFailed,
+            };
+            Error::new(code, format!("cannot clone `{}`: {e}", culprit.display()))
+        };
+        // The entry's parent is reached from the root without following symlinks, and
+        // cloned from there: a directory swapped for a symlink meanwhile is an error.
+        let opened = anchor::open_root(root)
+            .and_then(|root_fd| anchor::open_parent(root_fd.as_raw_fd(), rel));
+        let (parent, name) = opened.map_err(|e| {
+            let e = if anchor::changed(&e) {
+                io::Error::other("changed while it was being cloned")
+            } else {
+                e
+            };
+            failed(&e, src.clone())
+        })?;
+        let cd = c_path(dst)?;
+        // SAFETY: valid descriptor and C strings.
+        let rc = unsafe {
+            libc::clonefileat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_FDCWD,
+                cd.as_ptr(),
+                CLONE_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
             return Ok(());
         }
         let e = io::Error::last_os_error();
-        let code = match e.raw_os_error() {
-            Some(libc::EXDEV) => ErrorCode::CrossVolume,
-            _ => ErrorCode::CloneFailed,
-        };
         let culprit = match e.raw_os_error() {
-            Some(libc::EACCES | libc::EPERM) => unix::find_unreadable(src),
+            Some(libc::EACCES | libc::EPERM) => unix::find_unreadable(&src),
             _ => None,
         }
-        .unwrap_or_else(|| src.to_path_buf());
-        Err(Error::new(
-            code,
-            format!("cannot clone `{}`: {e}", culprit.display()),
-        ))
+        .unwrap_or(src);
+        Err(failed(&e, culprit))
     }
 
     /// A plain recursive copy: `--copy` must copy, never `clonefile`.
@@ -140,7 +152,7 @@ impl CowFs for ApfsFs {
     }
 
     fn remove_dir_all(&self, path: &Path) -> Result<()> {
-        unix::remove_dir_all(path, make_removable)
+        unix::remove_dir_all(path, unix::make_removable)
     }
 
     /// Durable write: the journal must reach the disk before the step it

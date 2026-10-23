@@ -1,5 +1,8 @@
 //! Filesystem adapters.
 
+/// Directory-descriptor access to the source tree, shared by the walk and `clonefileat`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod anchor;
 #[cfg(target_os = "macos")]
 pub mod apfs;
 #[cfg(target_os = "linux")]

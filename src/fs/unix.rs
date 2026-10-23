@@ -13,6 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use super::anchor;
 use crate::domain::paths::STAGING_PREFIX;
 use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::{FileLock, Scan};
@@ -214,11 +215,8 @@ pub(crate) fn list_dir(path: &Path) -> Result<Vec<OsString>> {
 /// Entries of the directory `root/rel`; `None` when it is not a directory (symlinks
 /// are not followed) or does not exist.
 pub(crate) fn list_dir_within(root: &Path, rel: &Path) -> Result<Option<Vec<OsString>>> {
-    let path = root.join(rel);
-    if !is_dir_no_follow(&path) {
-        return Ok(None);
-    }
-    list_dir(&path).map(Some)
+    let fd = anchor::open_root(root).map_err(|e| io_error(root, &e))?;
+    anchor::list_names(fd.as_raw_fd(), rel).map_err(|e| io_error(&root.join(rel), &e))
 }
 
 pub(crate) fn create_dir(path: &Path) -> Result<()> {
@@ -254,6 +252,20 @@ pub(crate) fn make_dirs_writable(path: &Path, each: &dyn Fn(&Path)) {
             }
         }
     }
+}
+
+/// What removing a tree may need first: directories writable and, on macOS, the
+/// BSD flags (`uchg`, `uappnd`) a clone or copy carried over cleared.
+pub(crate) fn make_removable(path: &Path) {
+    make_dirs_writable(path, &|entry| {
+        #[cfg(target_os = "macos")]
+        if let Ok(c) = c_path(entry) {
+            // SAFETY: valid C string; lchflags never follows symlinks.
+            unsafe { libc::lchflags(c.as_ptr(), 0) };
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = entry;
+    });
 }
 
 /// Write `contents` to `path`, then make them durable with `sync` (the

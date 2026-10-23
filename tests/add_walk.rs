@@ -52,6 +52,8 @@ fn outside_with_secret(sb: &Sandbox) -> std::path::PathBuf {
     let outside = sb.path("outside");
     fs::create_dir_all(outside.join("gen")).unwrap();
     fs::write(outside.join("secret.txt"), "not yours").unwrap();
+    // The same names as the source directory it replaces.
+    fs::write(outside.join("main.rs"), "fn evil() {}\n").unwrap();
     fs::write(outside.join("gen/out.txt"), "not yours either").unwrap();
     outside
 }
@@ -87,16 +89,20 @@ fn iw01_directory_swapped_for_a_symlink_during_the_walk_is_not_followed() {
     }
 }
 
-// I-W02: the same swap one level up, in an ancestor of what is cloned: the plan
-// clones `src/gen` after creating `src`, and `src` becomes a symlink in between.
+// I-W02: the same swap one level up, in an ancestor of what is cloned: `src` holds
+// an entry of `.parhelignore`, so the plan creates `src` and clones its other entries
+// one by one (`src/gen`); `src` becomes a symlink between the plan and that clone.
 #[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
 #[test]
 fn iw02_ancestor_directory_swapped_between_plan_and_clone_is_not_followed() {
     for mode in all_modes() {
         let sb = Sandbox::new();
         let src = project(&sb);
-        src.ignore(&["src/gen/"]);
+        src.ignore(&["src/gen/", "src/skipped/"]);
+        src.write(".parhelignore", "src/skipped/\n");
+        src.commit_all("parhelignore");
         src.write("src/gen/out.txt", "generated");
+        src.write("src/skipped/log.txt", "left out");
         let outside = outside_with_secret(&sb);
         let barrier = Barrier::new(&sb.root, "plan");
         let dest = sb.path("dest");
