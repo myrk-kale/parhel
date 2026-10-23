@@ -10,17 +10,22 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::app::rollback::{JOURNAL_FILE, Journal, rollback};
+use crate::app::rollback::{JOURNAL_FILE, Journal, StoreLink, rollback};
+use crate::app::store::{discover, first_sync_notice, first_sync_size, sync_baseline};
 use crate::domain::clone_plan::{self, CloneOp, DirLister};
 use crate::domain::exclusions::{ExclusionInput, Exclusions};
 use crate::domain::paths::{self, Placement};
 use crate::domain::relocate::{MAX_RELOCATE_BYTES, Relocation, Rewrite};
+use crate::domain::store::{
+    BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, Store, StoreState, WORKTREES_DIR, repo_id,
+};
 use crate::domain::{AddRequest, BranchMode, Error, ErrorCode, Result, SubmodulePolicy};
 use crate::git::parse::ensure_supported;
-use crate::ports::{CowFs, Git, RepoInfo, WorktreeAddSpec};
+use crate::ports::{CowFs, FileLock, Git, RepoInfo, WorktreeAddSpec};
 
 /// Side-effect providers and process context.
 #[derive(Clone, Copy)]
@@ -98,14 +103,17 @@ pub fn add(env: &Env<'_>, request: &AddRequest) -> Result<AddOutcome> {
     // directory, the only thing that must share the destination's volume, always does.
     if !request.copy {
         if let Some(problem) = cow_problem(env, &plan)? {
-            if !request.fallback {
-                return Err(problem);
+            if request.fallback {
+                return fallback(env, request, &plan, &problem);
             }
-            return fallback(env, request, &plan, &problem);
+            // The only way out of the problem that keeps the worktree copy-on-write.
+            let store = usable_store(env, &plan, problem)?;
+            crate::failpoint!("after_validate");
+            return store_transaction(env, request, &plan, &store);
         }
     }
     crate::failpoint!("after_validate");
-    transaction(env, request, &plan)
+    transaction(env, request, &plan, None)
 }
 
 fn validate(env: &Env<'_>, request: &AddRequest) -> Result<Plan> {
@@ -327,6 +335,61 @@ fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
     })
 }
 
+/// What stands between a refusal (`problem`) and the store: the store of the user when it
+/// can serve this run, else the refusal itself, with the way to get a store when there
+/// is none, or `store-unavailable` when there is one that cannot be used (never a silent
+/// fallback to something that is not copy-on-write).
+fn usable_store(env: &Env<'_>, plan: &Plan, problem: Error) -> Result<Store> {
+    let Some(path) = env.store else {
+        return Err(problem);
+    };
+    match discover(env.fs, path)? {
+        StoreState::NotConfigured => Err(Error::new(
+            problem.code,
+            format!(
+                "{}; or run `sudo git parhel setup` once to create a copy-on-write store that \
+                 `git parhel add` then uses on its own",
+                problem.message
+            ),
+        )),
+        StoreState::Unavailable { root, reason } => {
+            let unit = env
+                .fs
+                .read_file(&root.join(MARKER_FILE))
+                .ok()
+                .and_then(|bytes| Marker::parse(&String::from_utf8_lossy(&bytes)).ok())
+                .map(|marker| format!(" `{}`", marker.unit));
+            Err(Error::new(
+                ErrorCode::StoreUnavailable,
+                format!(
+                    "the store at `{}` cannot be used: {reason}. Run `git parhel doctor` to see \
+                     what is wrong; `systemctl status`{} shows whether its mount is up. \
+                     --copy and --fallback work without the store",
+                    root.display(),
+                    unit.map_or_else(
+                        || " of its mount unit".to_owned(),
+                        |unit| format!(" of the mount unit{unit}")
+                    )
+                ),
+            ))
+        }
+        StoreState::Available(store) => {
+            // A store on the source's own filesystem would not help: the normal answer.
+            let source = env.fs.volume(&plan.repo.toplevel)?;
+            let held = env.fs.volume(&store.root)?;
+            if held.filesystem == source.filesystem {
+                Err(problem)
+            } else {
+                // Git registers canonical paths: so does the store route.
+                Ok(Store {
+                    root: env.fs.canonicalize(&store.root)?,
+                    ..store
+                })
+            }
+        }
+    }
+}
+
 fn fallback(
     env: &Env<'_>,
     request: &AddRequest,
@@ -365,8 +428,217 @@ fn check_interrupt(env: &Env<'_>) -> Result<()> {
     Ok(())
 }
 
-fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOutcome> {
-    let staging = env.fs.create_staging_dir(&plan.parent)?;
+/// The store route: mirror the source into the store's baseline, clone the worktree
+/// from the baseline (a reflink inside the store, so it costs almost nothing) and leave
+/// a symlink at the requested destination.
+///
+/// Everything up to the sync only reads (and the sync only writes the baseline, a
+/// cache that any later run repairs). The baseline lock is held from the sync to the
+/// end of the clone, so no clone sees a half-synced baseline, and released before the
+/// worktree is published.
+fn store_transaction(
+    env: &Env<'_>,
+    request: &AddRequest,
+    plan: &Plan,
+    store: &Store,
+) -> Result<AddOutcome> {
+    let (fs, repo) = (env.fs, &plan.repo);
+    let id = repo_id(&repo.toplevel);
+    let baseline_dir = store.root.join(BASELINES_DIR).join(&id);
+    let worktrees_dir = store.root.join(WORKTREES_DIR);
+    let real_dir = worktrees_dir.join(&id);
+    let name = paths::destination_basename(&plan.destination)?;
+    refuse_registry_hostile(&plan.destination, &real_dir.join(name))?;
+
+    let exclusions = Exclusions::compute(&ExclusionInput {
+        source_root: repo.toplevel.clone(),
+        staging_dir: None,
+        other_worktrees: env
+            .git
+            .worktrees(&repo.toplevel)?
+            .into_iter()
+            .map(|w| w.path)
+            .collect(),
+        submodule_paths: plan.submodules.clone(),
+        exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
+        user_excluded: [
+            env.git.parhelignored(&repo.toplevel)?,
+            links_inside(env, store, &repo.toplevel),
+        ]
+        .concat(),
+    });
+
+    for dir in [
+        &store.root.join(BASELINES_DIR),
+        &baseline_dir,
+        &worktrees_dir,
+    ] {
+        if !fs.is_dir(dir)? {
+            fs.create_dir(dir)?;
+        }
+    }
+    let baseline_lock = lock_baseline(env, &baseline_dir.join("lock"))?;
+    // Names the repository the baseline mirrors, for `doctor`, before the first write
+    // into it. A newline cannot be in the path of a source worktree line-by-line, but
+    // the value is the rest of its line: nothing to escape.
+    fs.write_file(
+        &baseline_dir.join("meta"),
+        format!(
+            "source={}\nsynced={}\n",
+            repo.toplevel.display(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        )
+        .as_bytes(),
+    )?;
+    let baseline = baseline_dir.join("tree");
+    if let Some(bytes) = first_sync_size(env.fs, &repo.toplevel, &baseline, &exclusions)? {
+        if let Some(notice) = first_sync_notice(bytes) {
+            eprintln!("parhel: {notice}");
+        }
+    }
+    sync_baseline(
+        env.fs,
+        &repo.toplevel,
+        &baseline,
+        &exclusions,
+        env.interrupted,
+    )?;
+    crate::failpoint!("after_sync");
+    check_interrupt(env)?;
+
+    let real = free_name(fs, &real_dir, name)?;
+    let route = StoreRun {
+        baseline,
+        worktrees_dir,
+        real,
+        links: store.root.join(LINKS_FILE),
+        exclusions,
+    };
+    transaction(env, request, plan, Some((&route, baseline_lock)))
+}
+
+/// The registry of links is `path TAB target NEWLINE`: refuse (before anything is
+/// created) the paths it could not hold.
+fn refuse_registry_hostile(destination: &Path, real: &Path) -> Result<()> {
+    for path in [destination, real] {
+        if path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|&b| b == b'\t' || b == b'\n')
+        {
+            return Err(Error::new(
+                ErrorCode::Usage,
+                format!(
+                    "`{}` contains a tab or a newline, which the store's registry of links \
+                     cannot hold; choose another destination",
+                    path.display().to_string().escape_debug()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Symlinks the store's registry knows that live inside `source` and still point where
+/// they were created, as paths relative to it: a worktree requested inside the source
+/// leaves its link there, and the baseline (so every later worktree) must not mirror it.
+fn links_inside(env: &Env<'_>, store: &Store, source: &Path) -> Vec<PathBuf> {
+    let Ok(registry) = env.fs.read_file(&store.root.join(LINKS_FILE)) else {
+        return Vec::new();
+    };
+    let mut inside = Vec::new();
+    for line in registry.split(|&b| b == b'\n') {
+        let Some(tab) = line.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let link = Path::new(std::ffi::OsStr::from_bytes(&line[..tab]));
+        let target = Path::new(std::ffi::OsStr::from_bytes(&line[tab + 1..]));
+        if let Ok(rel) = link.strip_prefix(source) {
+            let ours = matches!(env.fs.read_link(link), Ok(Some(t)) if t == target);
+            if ours && !rel.as_os_str().is_empty() && !inside.iter().any(|p: &PathBuf| p == rel) {
+                inside.push(rel.to_path_buf());
+            }
+        }
+    }
+    inside
+}
+
+/// `dir/name`, or the first of `dir/name-2`, `dir/name-3`... that is free.
+fn free_name(fs: &dyn CowFs, dir: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
+    let mut candidate = dir.join(name);
+    let mut n = 2u32;
+    while fs.exists_no_follow(&candidate)? {
+        let mut suffixed = name.to_os_string();
+        suffixed.push(format!("-{n}"));
+        candidate = dir.join(suffixed);
+        n += 1;
+    }
+    Ok(candidate)
+}
+
+/// The exclusive lock of a baseline. Another run of the same repository holds it while
+/// it syncs and clones: wait for it (a minute of waiting is one sync of a big tree) and
+/// say so, instead of failing a second `add` that is perfectly legitimate.
+fn lock_baseline(env: &Env<'_>, path: &Path) -> Result<FileLock> {
+    let mut announced = false;
+    loop {
+        check_interrupt(env)?;
+        match env.fs.lock_exclusive(path) {
+            Ok(lock) => return Ok(lock),
+            Err(e) => {
+                if !env.fs.is_locked(path).unwrap_or(false) {
+                    return Err(e);
+                }
+                if !announced {
+                    eprintln!(
+                        "parhel: waiting for another run on this repository to finish with the \
+                         store"
+                    );
+                    announced = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// What a store run adds to the transaction: where the worktree is cloned from and where
+/// it ends up.
+struct StoreRun {
+    /// `<store>/baselines/<id>/tree`: the clone source instead of the live source.
+    baseline: PathBuf,
+    /// `<store>/worktrees`: where the staging directory lives.
+    worktrees_dir: PathBuf,
+    /// The real path of the worktree, `<store>/worktrees/<id>/<name>`.
+    real: PathBuf,
+    /// `<store>/links`: the registry of the symlinks created.
+    links: PathBuf,
+    /// What neither the baseline nor the clone contain (the same set for both).
+    exclusions: Exclusions,
+}
+
+impl StoreRun {
+    /// Where the finished worktree is: its real path.
+    fn final_path<'a>(route: Option<&'a Self>, plan: &'a Plan) -> &'a Path {
+        route.map_or(plan.destination.as_path(), |r| r.real.as_path())
+    }
+}
+
+fn transaction(
+    env: &Env<'_>,
+    request: &AddRequest,
+    plan: &Plan,
+    route: Option<(&StoreRun, FileLock)>,
+) -> Result<AddOutcome> {
+    let (route, mut baseline_lock) = match route {
+        Some((route, lock)) => (Some(route), Some(lock)),
+        None => (None, None),
+    };
+    let staging_parent = route.map_or(plan.parent.as_path(), |r| r.worktrees_dir.as_path());
+    let staging = env.fs.create_staging_dir(staging_parent)?;
     let mut journal = Journal {
         repo: plan.repo.toplevel.clone(),
         ..Journal::default()
@@ -374,7 +646,16 @@ fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOu
     let mut lock = None;
     // A panic (bug) must not skip the rollback: catch it and undo like any error.
     let assembled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assemble(env, request, plan, &staging, &mut journal, &mut lock)
+        assemble(
+            env,
+            request,
+            plan,
+            route,
+            &staging,
+            &mut journal,
+            &mut lock,
+            &mut baseline_lock,
+        )
     }))
     .unwrap_or_else(|_| {
         Err(Error::new(
@@ -383,12 +664,17 @@ fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOu
         ))
     });
     match assembled {
-        Ok(report) => publish(env, request, plan, &staging, &report),
+        Ok(report) => {
+            // Only the clone needs the baseline to hold still.
+            drop(baseline_lock);
+            publish(env, request, plan, route, &staging, &report)
+        }
         Err(cause) => {
             #[cfg(feature = "failpoints")]
             let _ = crate::failpoint::eval(crate::failpoint::ROLLBACK_FAILPOINT);
             let undone = rollback(env.git, env.fs, &staging, &journal);
             drop(lock);
+            drop(baseline_lock);
             match undone {
                 Ok(()) => Err(cause),
                 Err(rb) => Err(Error::new(
@@ -401,13 +687,16 @@ fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOu
 }
 
 /// Build the worktree inside `staging`; returns its path.
+#[allow(clippy::too_many_arguments)]
 fn assemble(
     env: &Env<'_>,
     request: &AddRequest,
     plan: &Plan,
+    route: Option<&StoreRun>,
     staging: &Path,
     journal: &mut Journal,
-    lock: &mut Option<crate::ports::FileLock>,
+    lock: &mut Option<FileLock>,
+    baseline_lock: &mut Option<FileLock>,
 ) -> Result<RelocationReport> {
     let (git, fs, repo) = (env.git, env.fs, &plan.repo);
     let journal_path = staging.join(JOURNAL_FILE);
@@ -422,19 +711,25 @@ fn assemble(
     crate::failpoint!("after_worktree_add");
     check_interrupt(env)?;
 
-    let exclusions = Exclusions::compute(&ExclusionInput {
-        source_root: repo.toplevel.clone(),
-        staging_dir: Some(staging.to_path_buf()),
-        other_worktrees: git
-            .worktrees(&repo.toplevel)?
-            .into_iter()
-            .map(|w| w.path)
-            .collect(),
-        submodule_paths: plan.submodules.clone(),
-        exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
-        user_excluded: git.parhelignored(&repo.toplevel)?,
-    });
-    clone_tree(env, &repo.toplevel, &staged, &exclusions, request.copy)?;
+    let exclusions = match route {
+        Some(route) => route.exclusions.clone(),
+        None => Exclusions::compute(&ExclusionInput {
+            source_root: repo.toplevel.clone(),
+            staging_dir: Some(staging.to_path_buf()),
+            other_worktrees: git
+                .worktrees(&repo.toplevel)?
+                .into_iter()
+                .map(|w| w.path)
+                .collect(),
+            submodule_paths: plan.submodules.clone(),
+            exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
+            user_excluded: git.parhelignored(&repo.toplevel)?,
+        }),
+    };
+    // A store run clones the baseline, which the sync just made equal to the source.
+    let cloned_from = route.map_or(repo.toplevel.as_path(), |r| r.baseline.as_path());
+    clone_tree(env, cloned_from, &staged, &exclusions, request.copy)?;
+    drop(baseline_lock.take());
     crate::failpoint!("after_clone");
     check_interrupt(env)?;
 
@@ -461,8 +756,12 @@ fn assemble(
     crate::failpoint!("after_index");
     check_interrupt(env)?;
 
+    // Paths written into the worktree (links, reinitialized submodules, rewritten
+    // references) name where it will really be: its real path in the store, which is
+    // valid however the user reaches it.
+    let final_path = StoreRun::final_path(route, plan);
     if request.submodules == SubmodulePolicy::Reinit && !plan.submodules.is_empty() {
-        git.submodules_reinit(&staged, &repo.toplevel, &plan.destination)?;
+        git.submodules_reinit(&staged, &repo.toplevel, final_path)?;
         check_interrupt(env)?;
     }
     let report = relocate_tree(
@@ -470,19 +769,56 @@ fn assemble(
         &staged,
         &repo.toplevel,
         &exclusions,
-        request.relocate.then(|| {
-            Relocation::new(&repo.toplevel, &plan.destination).excluding(exclusions.iter())
-        }),
+        request
+            .relocate
+            .then(|| Relocation::new(&repo.toplevel, final_path).excluding(exclusions.iter())),
     )?;
     check_interrupt(env)?;
     crate::failpoint!("before_rename");
     check_interrupt(env)?;
     // Record where the worktree is going *before* moving it: if the process dies right
     // after the rename, `doctor --fix` must repair the destination, not undo it.
-    journal.publish_to = Some(plan.destination.clone());
-    fs.write_file(&journal_path, &journal.encode())?;
-    fs.rename_exclusive(&staged, &plan.destination)?;
+    journal.publish_to = Some(final_path.to_path_buf());
+    if let Some(route) = route {
+        claim_link(env, plan, route, journal, &journal_path)?;
+    } else {
+        fs.write_file(&journal_path, &journal.encode())?;
+    }
+    fs.rename_exclusive(&staged, final_path)?;
     Ok(report)
+}
+
+/// Store runs, right before the publishing rename: the real directory exists, and the
+/// requested path becomes a symlink to the real worktree. The link and its target are
+/// journaled (so a crash is undone, and only this symlink is) and registered in the
+/// store (so `doctor` can find it when the worktree is removed) *before* the symlink is
+/// created; `symlink` fails on anything that exists, which is what makes the claim safe.
+fn claim_link(
+    env: &Env<'_>,
+    plan: &Plan,
+    route: &StoreRun,
+    journal: &mut Journal,
+    journal_path: &Path,
+) -> Result<()> {
+    let fs = env.fs;
+    if let Some(dir) = route.real.parent() {
+        if !fs.is_dir(dir)? {
+            fs.create_dir(dir)?;
+        }
+    }
+    journal.store_link = Some(StoreLink {
+        path: plan.destination.clone(),
+        target: route.real.clone(),
+    });
+    fs.write_file(journal_path, &journal.encode())?;
+    let mut line = plan.destination.as_os_str().as_encoded_bytes().to_vec();
+    line.push(b'\t');
+    line.extend_from_slice(route.real.as_os_str().as_encoded_bytes());
+    line.push(b'\n');
+    fs.append_file(&route.links, &line)?;
+    fs.symlink_exclusive(&route.real, &plan.destination)?;
+    crate::failpoint!("after_link");
+    check_interrupt(env)
 }
 
 /// `git worktree add --no-checkout` at `staged`, journaling the branch git is
@@ -694,14 +1030,17 @@ fn publish(
     env: &Env<'_>,
     request: &AddRequest,
     plan: &Plan,
+    route: Option<&StoreRun>,
     staging: &Path,
     report: &RelocationReport,
 ) -> Result<AddOutcome> {
     crate::failpoint!("after_rename");
     let mut warnings = Vec::new();
+    // Where the worktree really is: the destination, or its real path in the store.
+    let at = StoreRun::final_path(route, plan);
     let staged = paths::staging_worktree_path(staging, &plan.destination);
     env.git
-        .repoint_worktree(&plan.repo.toplevel, &staged, &plan.destination)
+        .repoint_worktree(&plan.repo.toplevel, &staged, at)
         .map_err(|e| {
             Error::new(
                 e.code,
@@ -709,17 +1048,17 @@ fn publish(
                     "{}; the worktree exists at `{}` but its registration is stale: run \
                  `git worktree repair {}`",
                     e.message,
-                    plan.destination.display(),
-                    plan.destination.display()
+                    at.display(),
+                    at.display()
                 ),
             )
         })?;
     // Last, because the root may be read-only: it could not be renamed (Linux wants
     // write access to a directory moved into another one) nor repaired before.
-    if let Err(e) = env.fs.copy_mode(&plan.repo.toplevel, &plan.destination) {
+    if let Err(e) = env.fs.copy_mode(&plan.repo.toplevel, at) {
         warnings.push(format!(
             "could not give `{}` the permissions of the source's root: {}",
-            plan.destination.display(),
+            at.display(),
             e.message
         ));
     }
@@ -773,15 +1112,15 @@ fn publish(
     }
     Ok(AddOutcome {
         destination: plan.destination.clone(),
-        head: env.git.head(&plan.destination)?,
-        strategy: if request.copy {
-            Strategy::Copy
-        } else {
-            Strategy::CopyOnWrite
+        head: env.git.head(at)?,
+        strategy: match (route, request.copy) {
+            (Some(_), _) => Strategy::Store,
+            (None, true) => Strategy::Copy,
+            (None, false) => Strategy::CopyOnWrite,
         },
         warnings,
         relocated: report.rewritten + report.relinked,
-        real_path: None,
+        real_path: route.map(|r| r.real.clone()),
     })
 }
 
@@ -3204,9 +3543,11 @@ mod tests {
                 "{calls:#?}"
             ),
         }
+        // (A staging directory that could not be created is nothing to remove.)
         if calls
             .iter()
             .any(|c| matches!(c, Call::CreateStaging { .. }))
+            && !w.fail.borrow().contains_key(&Step::CreateStaging)
         {
             assert_eq!(
                 calls.last(),

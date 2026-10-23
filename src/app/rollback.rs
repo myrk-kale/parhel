@@ -173,6 +173,7 @@ impl Journal {
 
 /// Undo everything recorded in `journal`, then delete `staging_dir`:
 ///
+/// 0. the store symlink, only while it still points where this run put it;
 /// 1. `git worktree remove --force <worktree>`; if that fails, delete the directory
 ///    and remove only its registration (never a repository-wide `worktree prune`,
 ///    which would also drop worktrees that are merely unreachable);
@@ -189,6 +190,18 @@ pub fn rollback(
 ) -> Result<()> {
     let mut failures: Vec<(String, Error)> = Vec::new();
     let repo = &journal.repo;
+    // The symlink first: nobody should be pointed at a worktree that is going away.
+    // Only a symlink that still points where this run put it is ours to remove; a
+    // retargeted link, a file or a directory at that path belongs to somebody else.
+    if let Some(link) = &journal.store_link {
+        if let Ok(Some(target)) = fs.read_link(&link.path) {
+            if target == link.target {
+                if let Err(e) = fs.remove_file(&link.path) {
+                    failures.push((format!("rm '{}'", link.path.display()), e));
+                }
+            }
+        }
+    }
     if let Some(worktree) = &journal.worktree {
         if git.worktree_remove_force(repo, worktree).is_err() {
             if let Err(e) = fs.remove_dir_all(worktree) {
