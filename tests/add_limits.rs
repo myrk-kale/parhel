@@ -2,24 +2,31 @@
 
 mod common;
 
+#[cfg(target_os = "macos")]
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::cow::write_blob;
+#[cfg(target_os = "macos")]
 use common::volume::{DiskImage, ImageFs};
 use common::*;
+#[cfg(target_os = "macos")]
 use serial_test::serial;
 
+#[cfg(target_os = "macos")]
 fn is_immutable(p: &Path) -> bool {
     let out = Command::new("ls").arg("-lO").arg(p).output().unwrap();
     String::from_utf8_lossy(&out.stdout).contains("uchg")
 }
 
+#[cfg(target_os = "macos")]
 fn chflags(p: &Path, flag: &str) {
     assert!(
         Command::new("chflags")
@@ -56,6 +63,9 @@ fn i130_unwritable_destination_parent() {
 }
 
 // I-131: volume full — whatever step fails, nothing is left behind.
+// macOS only (APFS image). Linux: I-L18 in `add_linux.rs`, where a write-size
+// limit stands in for a full disk.
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i131_disk_full_leaves_no_trace() {
@@ -134,6 +144,8 @@ fn i132_paths_near_path_max() {
 }
 
 // I-133: APFS cannot store non-UTF-8 names -> refused before anything happens.
+// macOS only: Linux stores any byte but `/` and NUL.
+#[cfg(target_os = "macos")]
 #[test]
 fn i133_non_utf8_destination_is_refused() {
     let sb = Sandbox::new();
@@ -151,6 +163,8 @@ fn i133_non_utf8_destination_is_refused() {
 }
 
 // I-134: APFS is normalization-insensitive: NFC request vs existing NFD dir.
+// macOS only: Linux filesystems compare names byte for byte.
+#[cfg(target_os = "macos")]
 #[test]
 fn i134_normalization_equivalent_destination_exists() {
     let sb = Sandbox::new();
@@ -170,6 +184,8 @@ fn i134_normalization_equivalent_destination_exists() {
 }
 
 // I-135: immutable (uchg) ignored file is cloned with its flag.
+// macOS only (BSD flags); the Linux counterpart is I-L15 (read-only directories).
+#[cfg(target_os = "macos")]
 #[test]
 fn i135_immutable_file_is_cloned() {
     let sb = Sandbox::new();
@@ -190,6 +206,8 @@ fn i135_immutable_file_is_cloned() {
 }
 
 // I-136: rollback removes staging even when it contains immutable files.
+// macOS only (BSD flags); the Linux counterpart is I-L16 (read-only directories).
+#[cfg(target_os = "macos")]
 #[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
 #[test]
 fn i136_rollback_with_immutable_file() {

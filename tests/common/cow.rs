@@ -1,4 +1,5 @@
-//! Evidence that two files share physical storage (copy-on-write) on APFS.
+//! Evidence that two files share physical storage (copy-on-write): `F_LOG2PHYS_EXT`
+//! on APFS, `FIEMAP` (see [`fiemap`]) on Linux.
 
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -7,6 +8,9 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+#[cfg(target_os = "linux")]
+use super::fiemap;
 
 /// Device offset of the first byte of `path` (`fcntl(F_LOG2PHYS_EXT)`).
 #[cfg(target_os = "macos")]
@@ -25,15 +29,39 @@ pub fn physical_offset(path: &Path) -> io::Result<i64> {
     Ok(l2p.l2p_devoffset)
 }
 
-/// Linux: no proof of sharing yet (a `FIEMAP` implementation will replace this).
-#[cfg(not(target_os = "macos"))]
-pub fn physical_offset(_: &Path) -> io::Result<i64> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+/// Device offset of the first extent of `path` (`FIEMAP`).
+#[cfg(target_os = "linux")]
+pub fn physical_offset(path: &Path) -> io::Result<i64> {
+    let extent = fiemap::first_extent(path)?
+        .ok_or_else(|| io::Error::other(format!("{} has no extent", path.display())))?;
+    Ok(i64::try_from(extent.physical).unwrap())
 }
 
 /// Whether both files start at the same physical block (i.e. they are clones).
+#[cfg(target_os = "macos")]
 pub fn shares_storage(a: &Path, b: &Path) -> bool {
     physical_offset(a).unwrap() == physical_offset(b).unwrap()
+}
+
+/// Whether `clone` is a reflink of `original`: same first physical extent, flagged
+/// shared.
+#[cfg(target_os = "linux")]
+pub fn shares_storage(original: &Path, clone: &Path) -> bool {
+    fiemap::share_first_extent(original, clone)
+}
+
+/// Whether both files own their data: different blocks, nothing shared. The
+/// counterpart of [`shares_storage`] for `--copy`. Needs files big enough to have an
+/// extent (a few KiB: tiny files are stored inline on btrfs).
+pub fn is_independent_copy(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        physical_offset(a).unwrap() != physical_offset(b).unwrap()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fiemap::are_independent_copies(a, b)
+    }
 }
 
 fn statfs(path: &Path) -> libc::statfs {
@@ -65,10 +93,22 @@ pub fn fs_type(path: &Path) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-/// `f_type` magic of the volume holding `path`, in hex (Linux).
+/// Name of the filesystem holding `path` from its `f_type` magic (`"btrfs"`,
+/// `"xfs"`, `"ext4"`, `"tmpfs"`, ...), or the magic in hex when unknown.
 #[cfg(not(target_os = "macos"))]
 pub fn fs_type(path: &Path) -> String {
-    format!("{:#x}", statfs(path).f_type)
+    let magic = u64::try_from(statfs(path).f_type).unwrap();
+    match magic {
+        0x9123_683e => "btrfs",
+        0x5846_5342 => "xfs",
+        0xef53 => "ext4",
+        0x0102_1994 => "tmpfs",
+        0x794c_7630 => "overlay",
+        0x2fc1_2fc1 => "zfs",
+        0xca45_1a4e => "bcachefs",
+        _ => return format!("{magic:#x}"),
+    }
+    .to_owned()
 }
 
 #[cfg(target_os = "macos")]

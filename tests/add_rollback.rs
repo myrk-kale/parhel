@@ -376,14 +376,21 @@ fn i46_rollback_keeps_unreachable_worktrees_registered() {
     let sb = Sandbox::new();
     let src = project(&sb);
     let external = unreachable_worktree(&sb, &src);
-    // An immutable file makes `git worktree remove` fail, forcing the fallback path.
+    // Something git cannot delete makes `git worktree remove` fail, forcing the
+    // fallback path: an immutable file (macOS), a read-only directory with a file in
+    // it (Linux, where `chattr +i` needs root).
     src.write("target/frozen.bin", "frozen");
-    let st = std::process::Command::new("chflags")
-        .arg("uchg")
-        .arg(src.path("target/frozen.bin"))
-        .status()
-        .unwrap();
-    assert!(st.success());
+    #[cfg(target_os = "macos")]
+    {
+        let st = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(src.path("target/frozen.bin"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    #[cfg(target_os = "linux")]
+    src.chmod("target", 0o555);
     let before = src.snapshot();
     let out = parhel_with_failpoints(
         &sb.env,

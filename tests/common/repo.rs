@@ -100,6 +100,17 @@ impl Sandbox {
         Self::with_root(dir, root)
     }
 
+    /// A sandbox whose directory lives in `base` (e.g. a mount of a specific
+    /// filesystem on Linux) instead of `$TMPDIR`.
+    pub fn new_in(base: &Path) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("parhel-it-")
+            .tempdir_in(base)
+            .unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        Self::with_root(dir, root)
+    }
+
     fn with_root(dir: TempDir, root: PathBuf) -> Self {
         let home = root.join("home");
         fs::create_dir_all(&home).unwrap();
@@ -149,9 +160,10 @@ impl Sandbox {
 }
 
 impl Drop for Sandbox {
-    /// Tests create immutable (`uchg`) and unreadable fixtures; make everything
+    /// Tests create immutable (`uchg`, macOS) and unreadable fixtures; make everything
     /// deletable before `TempDir` cleans up.
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
         let _ = Command::new("chflags")
             .args(["-R", "nouchg"])
             .arg(&self.root)

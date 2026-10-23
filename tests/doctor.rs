@@ -4,8 +4,10 @@ mod common;
 
 use std::fs;
 
+#[cfg(target_os = "macos")]
 use common::volume::{DiskImage, ImageFs};
 use common::*;
+#[cfg(target_os = "macos")]
 use serial_test::serial;
 
 // I-80a
@@ -18,7 +20,8 @@ fn i80a_healthy_repo() {
     assert!(stdout(&out).contains("no issues"), "{}", stdout(&out));
 }
 
-// I-80b
+// I-80b (macOS, HFS+ image; the Linux counterpart is I-L14 in `add_linux.rs`)
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i80b_reports_volume_without_cow() {

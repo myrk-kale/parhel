@@ -9,9 +9,16 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
-use common::cow::{deep_copy, fs_type, physical_offset, shares_storage, write_blob};
+use common::cow::{
+    deep_copy, fs_type, is_independent_copy, physical_offset, shares_storage, write_blob,
+};
+#[cfg(target_os = "linux")]
+use common::volume::test_mount;
+#[cfg(target_os = "macos")]
 use common::volume::{DiskImage, ImageFs};
+use common::volume::{MountedFs, resolve_mount};
 use common::*;
+#[cfg(target_os = "macos")]
 use serial_test::serial;
 
 #[test]
@@ -22,6 +29,9 @@ fn sandbox_creates_committed_repo_with_hermetic_identity() {
     assert_eq!(repo.current_branch().as_deref(), Some("main"));
     assert_eq!(repo.git(&["config", "user.email"]), "test@parhel.invalid");
     repo.assert_clean();
+    // Canonical: no symlink left in the path (macOS: /var -> /private/var).
+    assert_eq!(repo.root, fs::canonicalize(&repo.root).unwrap());
+    #[cfg(target_os = "macos")]
     assert!(
         repo.root.starts_with("/private"),
         "canonical tmp path: {}",
@@ -72,6 +82,7 @@ fn staging_leftover_scan_finds_only_staging_dirs() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn cow_evidence_distinguishes_clone_from_copy() {
     let sb = Sandbox::new();
@@ -96,8 +107,11 @@ fn cow_evidence_distinguishes_clone_from_copy() {
         !shares_storage(&a, &copied),
         "deep copy must not share blocks"
     );
+    assert!(is_independent_copy(&a, &copied));
+    assert!(!is_independent_copy(&a, &cloned));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn sandbox_tmp_is_apfs() {
     let sb = Sandbox::new();
@@ -108,6 +122,7 @@ fn sandbox_tmp_is_apfs() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn disk_images_mount_with_requested_filesystem() {
@@ -131,6 +146,7 @@ fn disk_images_mount_with_requested_filesystem() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn disk_image_detaches_on_drop() {
@@ -210,6 +226,7 @@ fn rollback_tests_cover_every_failpoint() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn sandbox_cleans_up_immutable_and_unreadable_fixtures() {
     let root = {
@@ -264,4 +281,216 @@ fn publish_failpoint_is_exercised() {
 fn publish_failpoint_variants_are_exercised() {
     let src = include_str!("add_rollback.rs");
     assert!(src.contains("i45c_publication_detected_even_with_lost_journal"));
+}
+
+// ---------------------------------------------------------------- Linux evidence
+
+/// Copy-on-write evidence on Linux (`FIEMAP`): a reflink is detected as shared, an
+/// ordinary copy is not, and one file compared with itself is not "shared" either.
+#[cfg(target_os = "linux")]
+fn reflink_evidence_on(fs_kind: MountedFs) {
+    let Some(dir) = test_mount(fs_kind) else {
+        return;
+    };
+    let sb = Sandbox::new_in(&dir);
+    let a = sb.path("a.bin");
+    write_blob(&a, 1 << 20, 42);
+    let reflinked = sb.path("reflinked.bin");
+    let st = Command::new("cp")
+        .args(["--reflink=always"])
+        .arg(&a)
+        .arg(&reflinked)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp --reflink=always on {fs_kind:?}");
+    let copied = sb.path("copied.bin");
+    deep_copy(&a, &copied);
+    let forced_copy = sb.path("forced-copy.bin");
+    let st = Command::new("cp")
+        .args(["--reflink=never"])
+        .arg(&a)
+        .arg(&forced_copy)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    assert!(physical_offset(&a).unwrap() > 0);
+    assert!(
+        shares_storage(&a, &reflinked),
+        "a reflink must be detected as shared"
+    );
+    assert!(
+        !is_independent_copy(&a, &reflinked),
+        "a reflink does not own its data"
+    );
+    for copy in [&copied, &forced_copy] {
+        assert!(
+            !shares_storage(&a, copy),
+            "{} is a plain copy, not shared",
+            copy.display()
+        );
+        assert!(
+            is_independent_copy(&a, copy),
+            "{} owns its data",
+            copy.display()
+        );
+    }
+    // Same physical block but nothing shared: the SHARED flag matters, too.
+    assert!(!shares_storage(&a, &a), "one file is not a clone of itself");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reflink_evidence_distinguishes_clone_from_copy_on_btrfs() {
+    reflink_evidence_on(MountedFs::Btrfs);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reflink_evidence_distinguishes_clone_from_copy_on_xfs() {
+    reflink_evidence_on(MountedFs::Xfs);
+}
+
+// ext4 cannot reflink: the evidence must never report sharing there.
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_evidence_on_ext4_never_reports_sharing() {
+    let Some(dir) = test_mount(MountedFs::Ext4) else {
+        return;
+    };
+    let sb = Sandbox::new_in(&dir);
+    let a = sb.path("a.bin");
+    write_blob(&a, 1 << 20, 7);
+    let refused = Command::new("cp")
+        .args(["--reflink=always"])
+        .arg(&a)
+        .arg(sb.path("nope.bin"))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "ext4 has no reflink");
+    let copied = sb.path("copied.bin");
+    deep_copy(&a, &copied);
+    assert!(!shares_storage(&a, &copied));
+    assert!(is_independent_copy(&a, &copied));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_tmp_is_on_a_reflink_filesystem() {
+    let sb = Sandbox::new();
+    let fs = fs_type(&sb.root);
+    assert!(
+        ["btrfs", "xfs", "bcachefs", "zfs"].contains(&fs.as_str()),
+        "integration tests assume $TMPDIR on a reflink filesystem, found {fs} \
+         (scripts/linux-test.sh sets it up)"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_mounts_have_the_announced_filesystem_and_distinct_devices() {
+    let mut devices = Vec::new();
+    for kind in [MountedFs::Btrfs, MountedFs::Xfs, MountedFs::Ext4] {
+        let Some(dir) = test_mount(kind) else {
+            continue;
+        };
+        assert_eq!(fs_type(&dir), kind.fs_type());
+        // Writable by the (unprivileged) test user.
+        let probe = dir.join(format!("probe-{}", std::process::id()));
+        fs::write(&probe, "x").unwrap();
+        fs::remove_file(&probe).unwrap();
+        devices.push(fs::metadata(&dir).unwrap().dev());
+    }
+    let mut unique = devices.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), devices.len(), "different mounts: {devices:?}");
+}
+
+// ---------------------------------------------------------------- mount helper
+
+#[test]
+fn missing_mount_variable_skips_when_not_required() {
+    let notice = resolve_mount(MountedFs::Xfs, None, false).unwrap_err();
+    assert!(
+        notice.contains("PARHEL_TEST_XFS") && notice.contains("SKIPPED"),
+        "{notice}"
+    );
+    // An empty value is a missing value.
+    assert!(resolve_mount(MountedFs::Xfs, Some("".into()), false).is_err());
+}
+
+#[test]
+fn missing_mount_variable_fails_when_required() {
+    for kind in [MountedFs::Btrfs, MountedFs::Xfs, MountedFs::Ext4] {
+        let caught = std::panic::catch_unwind(|| resolve_mount(kind, None, true));
+        let panic = caught.expect_err("required mounts must not skip");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains(kind.var()), "{message}");
+        let empty = std::panic::catch_unwind(|| resolve_mount(kind, Some("".into()), true));
+        assert!(empty.is_err(), "empty value is missing");
+    }
+}
+
+#[test]
+fn mount_variable_must_name_an_existing_directory() {
+    let sb = Sandbox::new();
+    let dir = resolve_mount(MountedFs::Btrfs, Some(sb.root.clone().into()), false).unwrap();
+    assert_eq!(dir, sb.root);
+    for required in [false, true] {
+        let file = sb.path("file");
+        fs::write(&file, "x").unwrap();
+        for bad in [sb.path("missing"), file] {
+            let caught = std::panic::catch_unwind(|| {
+                resolve_mount(MountedFs::Btrfs, Some(bad.clone().into()), required)
+            });
+            assert!(caught.is_err(), "{} (required={required})", bad.display());
+        }
+    }
+}
+
+#[test]
+fn mounted_fs_names_match_fs_type_output() {
+    assert_eq!(MountedFs::Btrfs.var(), "PARHEL_TEST_BTRFS");
+    assert_eq!(MountedFs::Xfs.var(), "PARHEL_TEST_XFS");
+    assert_eq!(MountedFs::Ext4.var(), "PARHEL_TEST_EXT4");
+    assert_eq!(
+        [MountedFs::Btrfs, MountedFs::Xfs, MountedFs::Ext4].map(MountedFs::fs_type),
+        ["btrfs", "xfs", "ext4"]
+    );
+}
+
+// ---------------------------------------------------------------- other helpers
+
+#[test]
+fn sandbox_cleans_up_unreadable_and_read_only_fixtures() {
+    let root = {
+        let sb = Sandbox::new();
+        fs::create_dir_all(sb.path("x/locked")).unwrap();
+        fs::create_dir_all(sb.path("x/readonly")).unwrap();
+        fs::write(sb.path("x/readonly/f"), "f").unwrap();
+        for (dir, mode) in [("x/locked", 0o000), ("x/readonly", 0o555)] {
+            fs::set_permissions(
+                sb.path(dir),
+                std::os::unix::fs::PermissionsExt::from_mode(mode),
+            )
+            .unwrap();
+        }
+        sb.root.clone()
+    };
+    assert!(!root.exists(), "sandbox left {}", root.display());
+}
+
+#[test]
+fn xattr_helper_round_trips_and_reports_absence() {
+    use common::xattr;
+    let sb = Sandbox::new();
+    let f = sb.path("f");
+    fs::write(&f, "x").unwrap();
+    assert_eq!(xattr::get(&f, xattr::TEST_ATTR).unwrap(), None);
+    xattr::set(&f, xattr::TEST_ATTR, b"value").unwrap();
+    assert_eq!(
+        xattr::get(&f, xattr::TEST_ATTR).unwrap(),
+        Some(b"value".to_vec())
+    );
 }

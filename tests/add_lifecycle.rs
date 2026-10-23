@@ -6,8 +6,10 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
 use common::volume::{DiskImage, ImageFs};
 use common::*;
+#[cfg(target_os = "macos")]
 use serial_test::serial;
 
 fn add_ok(sb: &Sandbox, from: &TestRepo, dest: &Path, extra: &[&str]) -> TestRepo {
@@ -187,6 +189,8 @@ fn i95_post_checkout_hook_not_run() {
 }
 
 // I-95b: the fallback is a plain `git worktree add`, so git runs the hook.
+// macOS only (HFS+ image); the Linux counterpart is I-L07 in `add_linux.rs`.
+#[cfg(target_os = "macos")]
 #[test]
 #[serial(hdiutil)]
 fn i95b_post_checkout_hook_runs_on_fallback() {
