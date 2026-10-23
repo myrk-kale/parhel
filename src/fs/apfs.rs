@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use super::anchor;
 use super::tree::{self, Data};
 use super::unix::{self, c_path, io_error};
+use crate::domain::store::EntryMeta;
 use crate::domain::{Error, ErrorCode, Result};
-use crate::ports::{CowFs, FileLock, Scan, VolumeInfo};
+use crate::ports::{CowFs, FileLock, Scan, Space, VolumeInfo};
 
 /// `CLONE_NOFOLLOW` from `<sys/clonefile.h>` (not exported by `libc`): clone a
 /// symlink itself instead of its target.
@@ -202,6 +203,38 @@ impl CowFs for ApfsFs {
 
     fn is_locked(&self, path: &Path) -> Result<bool> {
         unix::is_locked(path)
+    }
+
+    fn stat_within(&self, root: &Path, rel: &Path) -> Result<Option<EntryMeta>> {
+        tree::stat_entry(root, rel)
+    }
+
+    fn mirror_entry(&self, root: &Path, rel: &Path, dst: &Path) -> Result<u64> {
+        tree::mirror(root, rel, dst)
+    }
+
+    fn mirror_dir_meta(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+        tree::mirror_dir_meta(root, rel, dst)
+    }
+
+    fn symlink_exclusive(&self, target: &Path, link: &Path) -> Result<()> {
+        unix::symlink_exclusive(target, link)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        unix::read_link(path)
+    }
+
+    fn append_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        unix::append_file(path, bytes, full_sync)
+    }
+
+    fn is_writable(&self, path: &Path) -> Result<bool> {
+        unix::is_writable(path)
+    }
+
+    fn space(&self, path: &Path) -> Result<Space> {
+        unix::space(path)
     }
 }
 

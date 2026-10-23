@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use super::anchor;
 use crate::domain::paths::STAGING_PREFIX;
 use crate::domain::{Error, ErrorCode, Result};
-use crate::ports::{FileLock, Scan};
+use crate::ports::{FileLock, Scan, Space};
 
 pub(crate) fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| {
@@ -233,7 +233,9 @@ pub(crate) fn remove_dir_all(path: &Path, make_removable: fn(&Path)) -> Result<(
         return Ok(());
     }
     make_removable(path);
-    fs::remove_dir_all(path).map_err(|e| io_error(path, &e))
+    // The parent may be read-only too (a mirror of a source with read-only
+    // directories): it only needs to be writable while the entry goes.
+    in_writable_dir(path, || fs::remove_dir_all(path))
 }
 
 /// Make `path` and every directory below it readable and writable by its owner
@@ -336,6 +338,110 @@ pub(crate) fn replace_symlink(path: &Path, target: &Path) -> Result<()> {
         fs::remove_file(path)?;
         std::os::unix::fs::symlink(target, path)
     })
+}
+
+/// Name of the account running the process (`getpwuid(geteuid())`: the environment can
+/// be wrong about who this is).
+#[must_use]
+pub fn current_user_name() -> Option<String> {
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    // SAFETY: `getpwuid` returns null or a pointer to a static record, read at once
+    // by this thread only (the program is single-threaded here).
+    let record = unsafe { libc::getpwuid(uid) };
+    if record.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null record has a NUL-terminated name.
+    let name = unsafe { std::ffi::CStr::from_ptr((*record).pw_name) };
+    Some(name.to_string_lossy().into_owned())
+}
+
+/// `symlink(target, link)`, never replacing anything.
+pub(crate) fn symlink_exclusive(target: &Path, link: &Path) -> Result<()> {
+    match std::os::unix::fs::symlink(target, link) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::new(
+            ErrorCode::DestExists,
+            format!("destination `{}` already exists", link.display()),
+        )),
+        Err(e) => Err(io_error(link, &e)),
+    }
+}
+
+/// Target of the symlink `path`; `None` when it is not a symlink or does not exist.
+pub(crate) fn read_link(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::read_link(path) {
+        Ok(target) => Ok(Some(target)),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOENT | libc::ENOTDIR)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(io_error(path, &e)),
+    }
+}
+
+/// Append `bytes` to `path` (created when missing) and make them durable. One `write`
+/// on an `O_APPEND` file: concurrent appenders do not interleave their lines.
+pub(crate) fn append_file(
+    path: &Path,
+    bytes: &[u8],
+    sync: fn(&File) -> io::Result<()>,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| io_error(path, &e))?;
+    io::Write::write_all(&mut file, bytes).map_err(|e| io_error(path, &e))?;
+    sync(&file).map_err(|e| io_error(path, &e))
+}
+
+/// Whether the current user can create entries in the directory `path`.
+pub(crate) fn is_writable(path: &Path) -> Result<bool> {
+    let c = c_path(path)?;
+    // SAFETY: valid C string.
+    Ok(unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
+}
+
+/// Free (to an unprivileged user) and total bytes of the filesystem holding `path`.
+/// A directory the user cannot search (`/var/lib/parhel` is root's) is answered by the
+/// nearest ancestor they can: the same filesystem except where the directory is a
+/// mount point of its own.
+// The statvfs fields are 32 or 64 bits wide depending on the target.
+#[allow(clippy::useless_conversion)]
+pub(crate) fn space(path: &Path) -> Result<Space> {
+    let mut last = None;
+    for candidate in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        let c = c_path(candidate)?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: valid C string and out-pointer.
+        if unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) } == 0 {
+            // SAFETY: statvfs succeeded.
+            let st = unsafe { st.assume_init() };
+            let unit = u64::from(st.f_frsize);
+            return Ok(Space {
+                total: u64::from(st.f_blocks).saturating_mul(unit),
+                free: u64::from(st.f_bavail).saturating_mul(unit),
+            });
+        }
+        let e = io::Error::last_os_error();
+        if !matches!(
+            e.raw_os_error(),
+            Some(libc::EACCES | libc::ENOENT | libc::ENOTDIR)
+        ) {
+            return Err(io_error(candidate, &e));
+        }
+        last = Some((candidate, e));
+    }
+    Err(last.map_or_else(
+        || Error::new(ErrorCode::Io, "no path to measure"),
+        |(p, e)| io_error(p, &e),
+    ))
 }
 
 pub(crate) fn lock_exclusive(path: &Path) -> Result<FileLock> {
