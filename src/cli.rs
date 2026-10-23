@@ -74,8 +74,8 @@ Errors are printed as `error[<code>]: <message>` with a stable <code>."
     Add(AddArgs),
     /// Diagnose the environment and clean up after crashed runs.
     #[command(
-        long_about = "Report what would make `add` refuse or misbehave: a source that is \
-not on APFS, staging directories and worktree registrations left by a crashed run, and \
+        long_about = "Report what would make `add` refuse or misbehave: a source on a volume \
+without copy-on-write, staging directories and worktree registrations left by a crashed run, and \
 .git files of other repositories nested in the source. Runs still in progress are \
 detected and never touched.
 
@@ -105,7 +105,7 @@ pub struct AddArgs {
     #[arg(long)]
     pub allow_dirty: bool,
     /// Use a plain `git worktree add` when copy-on-write is impossible
-    /// (not APFS, different volumes).
+    /// (no copy-on-write on the volume, different volumes).
     #[arg(long)]
     pub fallback: bool,
     /// Leave copied files that mention the source's path as they are (by default

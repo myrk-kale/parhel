@@ -32,7 +32,7 @@ fn i51a_source_on_hfs_is_refused() {
     let before = src.snapshot();
     let dest = hfs.mount.join("dest");
     let out = parhel(&sb.env, &src.root, &add_args(&dest, &["--new-branch", "x"]));
-    assert_error(&out, "not-apfs");
+    assert_error(&out, "not-cow");
     assert!(
         stderr(&out).contains("hfs"),
         "names the filesystem: {}",
@@ -50,14 +50,14 @@ fn i51a_source_on_hfs_is_refused() {
 // I-51b
 #[test]
 #[serial(hdiutil)]
-fn i51b_destination_on_hfs_is_refused_as_not_apfs() {
+fn i51b_destination_on_hfs_is_refused_as_not_cow() {
     let sb = Sandbox::new();
     let src = project(&sb);
     let hfs = DiskImage::new(ImageFs::Hfs, 128);
     let before = src.snapshot();
     let dest = hfs.mount.join("dest");
     let out = parhel(&sb.env, &src.root, &add_args(&dest, &["--new-branch", "x"]));
-    assert_error(&out, "not-apfs");
+    assert_error(&out, "not-cow");
     before.assert_same(&src.snapshot());
     assert_no_staging(&[&hfs.mount]);
 }

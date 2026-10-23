@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the error code and the `doctor` finding `not-apfs` are now
+  `not-cow`, and their messages no longer mention APFS ("copy-on-write is not
+  available on <fs> at `<path>`"). Scripts that match `not-apfs` must match
+  `not-cow`. Whether a volume supports copy-on-write is now decided by the
+  filesystem adapter, not by comparing the filesystem's name.
+
 ### Added
 
 - An agent skill (`npx skills add myrk-kale/parhel`) that teaches coding agents

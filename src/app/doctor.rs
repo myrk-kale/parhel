@@ -13,8 +13,8 @@ use crate::ports::RepoInfo;
 /// Something worth reporting. `code()` is printed and is a stable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
-    /// The source worktree is not on APFS: `add` would refuse (or need `--fallback`).
-    NotApfs { path: PathBuf, fs_type: String },
+    /// The source worktree's volume has no copy-on-write: `add` would refuse (or need `--fallback`).
+    NotCow { path: PathBuf, fs_type: String },
     /// A `.parhel-staging-*` dir left by a crashed `add`.
     OrphanStaging { path: PathBuf },
     /// A worktree registration whose path is inside a staging dir.
@@ -30,7 +30,7 @@ impl Finding {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::NotApfs { .. } => "not-apfs",
+            Self::NotCow { .. } => "not-cow",
             Self::OrphanStaging { .. } => "orphan-staging",
             Self::OrphanRegistration { .. } => "orphan-registration",
             Self::ForeignGitfile { .. } => "foreign-gitfile",
@@ -79,8 +79,8 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
 
     let volume = env.fs.volume(&repo.toplevel)?;
-    if volume.fs_type != "apfs" {
-        report.findings.push(Finding::NotApfs {
+    if !volume.cow {
+        report.findings.push(Finding::NotCow {
             path: repo.toplevel.clone(),
             fs_type: volume.fs_type,
         });
@@ -440,12 +440,13 @@ mod tests {
 
     // U-DOC-02
     #[test]
-    fn reports_non_apfs_source() {
+    fn reports_source_without_cow() {
         let w = World {
             volumes: vec![(
                 p("/"),
                 VolumeInfo {
                     fs_type: "hfs".into(),
+                    cow: false,
                     device: 1,
                 },
             )],
@@ -454,7 +455,7 @@ mod tests {
         let report = run(&w, false);
         assert_eq!(
             report.findings,
-            vec![Finding::NotApfs {
+            vec![Finding::NotCow {
                 path: p("/w/repo"),
                 fs_type: "hfs".into()
             }]

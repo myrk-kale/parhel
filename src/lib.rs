@@ -124,7 +124,7 @@ fn print_doctor(report: &DoctorReport) -> ExitCode {
     }
     for finding in &report.findings {
         let detail = match finding {
-            Finding::NotApfs { path, fs_type } => format!("{} is on {fs_type}", describe(path)),
+            Finding::NotCow { path, fs_type } => format!("{} is on {fs_type}", describe(path)),
             Finding::OrphanStaging { path }
             | Finding::OrphanRegistration { path }
             | Finding::ForeignGitfile { path }

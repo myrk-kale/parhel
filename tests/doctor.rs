@@ -21,14 +21,14 @@ fn i80a_healthy_repo() {
 // I-80b
 #[test]
 #[serial(hdiutil)]
-fn i80b_reports_non_apfs_volume() {
+fn i80b_reports_volume_without_cow() {
     let sb = Sandbox::new();
     let hfs = DiskImage::new(ImageFs::Hfs, 64);
     let src = TestRepo::init_at(&sb.env, &hfs.mount.join("src"));
     let out = parhel(&sb.env, &src.root, &["doctor"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stdout(&out).contains("not-apfs") && stdout(&out).contains("hfs"),
+        stdout(&out).contains("not-cow") && stdout(&out).contains("hfs"),
         "{}",
         stdout(&out)
     );

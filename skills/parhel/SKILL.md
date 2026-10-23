@@ -88,7 +88,7 @@ git parhel add ../<project>-<task> --new-branch <branch>
 ```
 
 - Put the destination next to the project (same volume). `cross-volume` or
-  `not-apfs` means copy-on-write is impossible there. Ask the user before
+  `not-cow` means copy-on-write is impossible there. Ask the user before
   using `--fallback`, which creates a regular worktree without the copied
   files.
 - Other forms: `--branch <existing>`, `--detach <ref>`, a start commit as the
@@ -109,7 +109,7 @@ git parhel add ../<project>-<task> --new-branch <branch>
 | `operation-in-progress` | A merge, rebase or cherry-pick is open in the source: ask the user |
 | `source-changed` | Something wrote to the source during the copy; wait for it and retry |
 | `submodules-present` | Retry with `--submodules=reinit` |
-| `not-apfs`, `cross-volume` | Different location, or ask about `--fallback` |
+| `not-cow`, `cross-volume` | Different location, or ask about `--fallback` |
 | `git-failed` | Git's message follows, for example a branch name already in use |
 | `rollback-failed` | Run `git parhel doctor`, show the user, then `--fix` (step 6) |
 

@@ -51,7 +51,7 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
 | U-ENV-01…05 | Child `git` env sanitization, locale, cwd/args, error mapping, `GIT_OPTIONAL_LOCKS=0` | `src/git/runner.rs` |
-| U-FS-01…20 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check, parallel relocation scan | `src/fs/apfs.rs` |
+| U-FS-01…20 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check, parallel relocation scan | `src/fs/apfs.rs` (macOS-only: U-FS-01…08, 12, 13, 17, 18) and `src/fs/unix.rs` (shared by Unix adapters: U-FS-09…11, 14…16, 19, 20) |
 | U-RB-01…12, P1 (U-RB-10…12: a branch is deleted only while it still points at its start commit; U-RB-06: fallback removes only its own registration, never `worktree prune`) | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
 | U-TXN-01…79 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs, dirty submodules with reinit | `src/app/add.rs` |
 | U-DOC-01…19 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
@@ -138,7 +138,7 @@ or untouched.
 | ID | Behavior |
 |---|---|
 | I-50 | Destination on another APFS volume → `cross-volume` |
-| I-51a/b | Source or destination on HFS+ → `not-apfs` with `--fallback` hint |
+| I-51a/b | Source or destination on HFS+ (no copy-on-write) → `not-cow` with `--fallback` hint |
 | I-52a/b | `--fallback` → plain worktree + warning; inert on APFS |
 | I-53 | Case-sensitive APFS |
 
@@ -168,7 +168,7 @@ or untouched.
 ### Doctor — `tests/doctor.rs`
 | ID | Behavior |
 |---|---|
-| I-80a…f | Healthy, non-APFS, orphan staging, orphan registration (branch kept without journal), foreign gitfile (never touched), outside repo |
+| I-80a…f | Healthy, volume without copy-on-write (`not-cow`), orphan staging, orphan registration (branch kept without journal), foreign gitfile (never touched), outside repo |
 | I-80g | `doctor --fix` during a live `add` reports `in-progress` and touches nothing; the run then succeeds |
 | I-80h | `doctor --fix` cleaning an orphan registration keeps unrelated, unreachable worktrees registered |
 | I-80k | Legitimate worktrees whose names look like staging (`.parhel-staging-feature`, `.parhel-staging-x/feat`) survive `doctor --fix` |
