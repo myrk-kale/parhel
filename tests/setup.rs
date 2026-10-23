@@ -91,6 +91,48 @@ fn shell_ok(script: &str) -> bool {
     sudo("sh", &["-c", script]).status.success()
 }
 
+/// `/var/lib/parhel` is root's and mode 0700 (the images are nobody else's business),
+/// so the ordinary user cannot even see whether an image is there: `Path::exists`
+/// answers `false` for a permission error, which would make every "is gone" assertion
+/// pass for the wrong reason. Whatever is asked about the images is asked as root.
+fn root_exists(path: impl AsRef<Path>) -> bool {
+    sudo("test", &["-e", path.as_ref().to_str().unwrap()])
+        .status
+        .success()
+}
+
+/// What `stat` says about a file, read as root.
+struct RootStat {
+    len: u64,
+    allocated: u64,
+    mode: u32,
+    uid: u32,
+    inode: u64,
+    mtime: i64,
+}
+
+fn root_stat(path: impl AsRef<Path>) -> RootStat {
+    let out = sudo(
+        "stat",
+        &[
+            "-c",
+            "%s %b %B %a %u %i %Y",
+            path.as_ref().to_str().unwrap(),
+        ],
+    );
+    assert_success(&out);
+    let text = stdout(&out);
+    let f: Vec<&str> = text.split_whitespace().collect();
+    RootStat {
+        len: f[0].parse().unwrap(),
+        allocated: f[1].parse::<u64>().unwrap() * f[2].parse::<u64>().unwrap(),
+        mode: u32::from_str_radix(f[3], 8).unwrap(),
+        uid: f[4].parse().unwrap(),
+        inode: f[5].parse().unwrap(),
+        mtime: f[6].parse().unwrap(),
+    }
+}
+
 /// Starts from a machine without a store and puts it back on drop, whatever happened.
 struct Machine;
 
@@ -153,15 +195,11 @@ fn iset01_setup_creates_image_unit_mount_and_marker() {
     assert!(said.contains(image().to_str().unwrap()), "{said}");
 
     // The image: sparse (a 512M claim, almost nothing allocated), private to root.
-    let md = fs::metadata(image()).unwrap();
-    assert_eq!(md.len(), 512 << 20);
-    assert!(
-        md.blocks() * 512 < 64 << 20,
-        "allocated {} bytes",
-        md.blocks() * 512
-    );
-    assert_eq!(md.mode() & 0o777, 0o600);
-    assert_eq!(md.uid(), 0);
+    let md = root_stat(image());
+    assert_eq!(md.len, 512 << 20);
+    assert!(md.allocated < 64 << 20, "allocated {} bytes", md.allocated);
+    assert_eq!(md.mode, 0o600);
+    assert_eq!(md.uid, 0);
 
     // The unit exists, is enabled and active; the store is mounted as btrfs.
     let text = fs::read_to_string(unit_file()).unwrap();
@@ -205,17 +243,17 @@ fn iset02_rerun_changes_nothing() {
     }
     let _machine = Machine::clean();
     assert_success(&setup(&["--size", "512M"]));
-    let image_before = fs::metadata(image()).unwrap();
+    let image_before = root_stat(image());
     let unit_before = fs::read_to_string(unit_file()).unwrap();
     fs::write(store_root().join("worktrees/keep"), "x").unwrap();
 
     let out = setup(&["--size", "512M"]);
     assert_success(&out);
     assert!(stdout(&out).contains("already"), "{}", stdout(&out));
-    let image_after = fs::metadata(image()).unwrap();
+    let image_after = root_stat(image());
     assert_eq!(
-        (image_after.ino(), image_after.mtime()),
-        (image_before.ino(), image_before.mtime())
+        (image_after.inode, image_after.mtime),
+        (image_before.inode, image_before.mtime)
     );
     assert_eq!(fs::read_to_string(unit_file()).unwrap(), unit_before);
     assert!(
@@ -262,7 +300,7 @@ fn iset03_the_image_cannot_be_deleted_or_renamed_but_stays_writable() {
     );
     // Opening it for writing (what the loop device does) still works.
     assert!(shell_ok(&format!(": >> '{image}'")));
-    assert!(Path::new(image).exists());
+    assert!(root_exists(image));
     // And the store keeps working.
     fs::write(store_root().join("worktrees/probe"), "x").unwrap();
 }
@@ -369,7 +407,7 @@ fn iset06_remove_refuses_with_a_worktree_and_succeeds_without() {
         stderr(&refused)
     );
     assert!(
-        image().exists() && unit_file().exists(),
+        root_exists(image()) && unit_file().exists(),
         "nothing was removed"
     );
 
@@ -390,7 +428,7 @@ fn iset07_remove_leaves_nothing_behind() {
     assert_success(&setup(&["--size", "512M"]));
     assert_success(&setup(&["--remove"]));
     assert!(!unit_file().exists(), "unit left");
-    assert!(!image().exists(), "image left");
+    assert!(!root_exists(image()), "image left");
     assert!(!store_root().exists(), "mount point left");
     assert!(
         !shell_ok(&format!("systemctl cat {}", unit())),
@@ -417,12 +455,12 @@ fn iset08_preallocate_allocates_the_whole_image() {
     }
     let _machine = Machine::clean();
     assert_success(&setup(&["--size", "256M", "--preallocate"]));
-    let md = fs::metadata(image()).unwrap();
-    assert_eq!(md.len(), 256 << 20);
+    let md = root_stat(image());
+    assert_eq!(md.len, 256 << 20);
     assert!(
-        md.blocks() * 512 >= 256 << 20,
+        md.allocated >= 256 << 20,
         "allocated only {} bytes",
-        md.blocks() * 512
+        md.allocated
     );
 }
 
@@ -445,7 +483,7 @@ fn iset09_without_root_it_asks_for_sudo() {
         assert_error(&out, "not-root");
         assert!(stderr(&out).contains(command), "{}", stderr(&out));
     }
-    assert!(!image().exists() && !unit_file().exists());
+    assert!(!root_exists(image()) && !unit_file().exists());
 }
 
 // I-SET10: a root shell does not make root the owner of the store; an explicit
@@ -471,8 +509,8 @@ fn iset10_root_is_never_inferred() {
     );
     assert_error(&out, "usage");
     assert!(stderr(&out).contains("--user"), "{}", stderr(&out));
-    assert!(!image().exists());
-    assert!(!Path::new("/var/lib/parhel/root.img").exists());
+    assert!(!root_exists(image()));
+    assert!(!root_exists("/var/lib/parhel/root.img"));
 }
 
 // I-SET11: a missing mkfs.btrfs is reported with the package that provides it.
@@ -495,7 +533,7 @@ fn iset11_missing_btrfs_progs_names_the_package() {
     );
     assert_error(&out, "missing-tool");
     assert!(stderr(&out).contains("btrfs-progs"), "{}", stderr(&out));
-    assert!(!image().exists() && !unit_file().exists());
+    assert!(!root_exists(image()) && !unit_file().exists());
 }
 
 // I-SET12: an unknown user is a usage error and nothing is created.
@@ -513,7 +551,7 @@ fn iset12_unknown_user() {
         "{}",
         stderr(&out)
     );
-    assert!(!Path::new("/var/lib/parhel/no-such-user-parhel.img").exists());
+    assert!(!root_exists("/var/lib/parhel/no-such-user-parhel.img"));
 }
 
 // I-SET13: `doctor` reports a deleted backing image while the store is still mounted.
@@ -589,7 +627,7 @@ fn iset15_a_second_users_store_keeps_every_image_protected() {
     let bob_image = format!("/var/lib/parhel/{SECOND}.img");
     let bob_store = format!("/parhel/{SECOND}");
     assert!(
-        image().exists() && Path::new(&bob_image).exists(),
+        root_exists(image()) && root_exists(&bob_image),
         "both images exist"
     );
     assert!(shell_ok(&format!("mountpoint -q {bob_store}")));
@@ -625,7 +663,7 @@ fn iset15_a_second_users_store_keeps_every_image_protected() {
 
     // Removing one user's store leaves the other's image where it is, still protected.
     assert_success(&setup(&["--remove", "--user", SECOND]));
-    assert!(!Path::new(&bob_image).exists() && image().exists());
+    assert!(!root_exists(&bob_image) && root_exists(image()));
     let rm = sudo("rm", &["-f", image().to_str().unwrap()]);
     assert!(
         !rm.status.success(),
