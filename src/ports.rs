@@ -273,9 +273,10 @@ pub trait Host {
     /// the whole size with `preallocate`.
     fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()>;
     fn image_usage(&self, path: &Path) -> Result<ImageUsage>;
-    /// After `chattr +i` on `dir`: removing and renaming `image` fail with `EPERM`
-    /// while opening it for writing still works. The probes never change the image,
-    /// so a directory that turns out not to be protected loses nothing.
+    /// After `chattr +i` on `dir`: removing `image` and creating entries beside it fail
+    /// with `EPERM` (renaming goes through the same two checks) while opening the image
+    /// for writing still works. The probes never change the image, so a directory that
+    /// turns out not to be protected loses nothing.
     fn verify_immutable(&self, dir: &Path, image: &Path) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
     /// Remove an empty directory.

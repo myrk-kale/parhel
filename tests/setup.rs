@@ -1,4 +1,4 @@
-//! I-SET01..I-SET14: `git parhel setup`, the store at its real place.
+//! I-SET01..I-SET15: `git parhel setup`, the store at its real place.
 //!
 //! These tests change the machine: they create `/var/lib/parhel`, a loop-mounted btrfs
 //! image, a systemd unit and `/parhel/<user>`, and they need `sudo`, systemd and the
@@ -546,6 +546,91 @@ fn iset13_doctor_reports_a_deleted_backing_image() {
         stdout(&out)
     );
     assert!(shell_ok("chattr +i /var/lib/parhel"));
+}
+
+/// A second account for I-SET15, and its store, gone on drop whatever happened.
+struct SecondUser;
+
+const SECOND: &str = "parhelbob";
+
+impl SecondUser {
+    fn create() -> Self {
+        let _ = sudo("userdel", &[SECOND]);
+        let made = sudo(
+            "useradd",
+            &["--no-create-home", "--shell", "/usr/sbin/nologin", SECOND],
+        );
+        assert!(made.status.success(), "useradd: {}", stderr(&made));
+        Self
+    }
+}
+
+impl Drop for SecondUser {
+    fn drop(&mut self) {
+        let _ = setup(&["--remove", "--user", SECOND]);
+        let _ = sudo("userdel", &[SECOND]);
+    }
+}
+
+// I-SET15: a second user's store goes into the directory that protects the first one's
+// image: the protection is lifted for the new image and is back afterwards, for both.
+#[test]
+#[serial(setup)]
+fn iset15_a_second_users_store_keeps_every_image_protected() {
+    if !enabled() {
+        return;
+    }
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "256M"]));
+    let _bob = SecondUser::create();
+    let out = setup(&["--size", "256M", "--user", SECOND]);
+    assert_success(&out);
+
+    let bob_image = format!("/var/lib/parhel/{SECOND}.img");
+    let bob_store = format!("/parhel/{SECOND}");
+    assert!(
+        image().exists() && Path::new(&bob_image).exists(),
+        "both images exist"
+    );
+    assert!(shell_ok(&format!("mountpoint -q {bob_store}")));
+    assert!(shell_ok(&format!(
+        "mountpoint -q {}",
+        store_root().display()
+    )));
+    let bob_uid = String::from_utf8(sudo("id", &["-u", SECOND]).stdout)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert_eq!(fs::metadata(&bob_store).unwrap().uid(), bob_uid);
+
+    let lsattr = sudo("lsattr", &["-d", "/var/lib/parhel"]);
+    assert!(
+        stdout(&lsattr)
+            .split_whitespace()
+            .next()
+            .is_some_and(|f| f.contains('i')),
+        "{}",
+        stdout(&lsattr)
+    );
+    for victim in [image().to_str().unwrap().to_owned(), bob_image.clone()] {
+        let rm = sudo("rm", &["-f", &victim]);
+        assert!(!rm.status.success(), "root deleted {victim}");
+        assert!(
+            stderr(&rm).contains("Operation not permitted"),
+            "{}",
+            stderr(&rm)
+        );
+    }
+
+    // Removing one user's store leaves the other's image where it is, still protected.
+    assert_success(&setup(&["--remove", "--user", SECOND]));
+    assert!(!Path::new(&bob_image).exists() && image().exists());
+    let rm = sudo("rm", &["-f", image().to_str().unwrap()]);
+    assert!(
+        !rm.status.success(),
+        "the remaining image lost its protection"
+    );
 }
 
 // I-SET14: off Linux `setup` is an `unsupported-platform` error and touches nothing.
