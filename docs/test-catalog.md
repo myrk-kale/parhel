@@ -9,6 +9,10 @@ binary that answers `error[not-implemented]`) and every product test failed; onl
 harness self-tests (`tests/harness.rs`, `failpoint::tests`) passed. The implementation
 now passes the whole suite (I-124 is ignored unless `git-lfs` is installed).
 
+The Linux backend (btrfs/XFS reflink) and `--copy` were developed the same way: the
+tests (U-TXN-80…90, U-LFS-*, `add_copy.rs`, `add_linux.rs`) were committed first, against a
+`LinuxFs` skeleton and a `copy_entry` stub that fail with `not-implemented`.
+
 Spec changes made while implementing (each one a wrong assumption in the test, not a
 weakened guarantee):
 - I-10c: carried-over ignored files show as untracked when the target branch does not
@@ -27,8 +31,20 @@ cargo test                            # failpoint-driven tests show as `ignored`
 cargo test --test harness             # harness self-tests only
 ```
 
-Requirements: macOS with `$TMPDIR` on APFS, `git` ≥ 2.29, `hdiutil` (disk-image tests,
-no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Tests that mount images are serialized with `#[serial(hdiutil)]`.
+Requirements, macOS: `$TMPDIR` on APFS, `git` ≥ 2.29, `hdiutil` (disk-image tests,
+no root needed), `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Tests that mount images are serialized with `#[serial(hdiutil)]`.
+
+Requirements, Linux: `git` ≥ 2.29, `python3` with `venv`, `mkfifo`, `$TMPDIR` on a reflink
+filesystem (btrfs or XFS with `reflink=1`) and three mounts announced by
+`PARHEL_TEST_BTRFS`, `PARHEL_TEST_XFS` and `PARHEL_TEST_EXT4`, writable by the (non-root)
+user running the tests. `scripts/linux-test.sh` builds all of that in a privileged Docker
+container (`scripts/mount-test-filesystems.sh` is the part CI shares); extra arguments go to
+`cargo test`. A test that needs a mount whose variable is unset prints `SKIPPED: ...` and
+passes, unless `CI` or `PARHEL_REQUIRE_FS=1` is set: then it fails, so a misconfigured
+runner cannot turn the filesystem tests into silent passes. A variable that points at the
+wrong filesystem always fails. Tests that only exist on one platform are gated with
+`#[cfg(target_os = ...)]` (hdiutil images, `chflags`, `F_LOG2PHYS_EXT` on macOS; everything
+in `add_linux.rs` and the FIEMAP proof on Linux).
 
 ## Known bugs of the original (`dannolan/git-worktree-apfs`) and the tests that cover them
 
@@ -42,7 +58,7 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 
 | ID | Area | File |
 |---|---|---|
-| U-CLI-01…16 | Flag parsing, conflicts, defaults, help/version, non-UTF-8 paths, option-like names | `src/cli.rs` |
+| U-CLI-01…19 | Flag parsing, conflicts, defaults, help/version, non-UTF-8 paths, option-like names; U-CLI-17…19: `--copy` (off by default, conflicts with `--fallback`, help says it uses disk space and works across volumes) | `src/cli.rs` |
 | U-ARGS-01…03 | `git worktree add` argv: every mode, values always after `--end-of-options` | `src/git/cli.rs` |
 | U-PATH-01…19, P1…P3 | Lexical destination resolution, placement (`dest-is-source`, `dest-inside-git-dir`, nested), staging naming | `src/domain/paths.rs` |
 | U-EXCL-01…10, P1…P2 | Exclusion set: root `.git`, nested staging, nested worktrees, submodules, component-wise matching | `src/domain/exclusions.rs` |
@@ -51,12 +67,13 @@ no root needed), `xattr`, `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Test
 | U-PLAN-01…07, P1 | Minimal clone plan (descend only into ancestors of exclusions); property: every non-excluded leaf covered exactly once | `src/domain/clone_plan.rs` |
 | U-PARSE-01…20, P1…P4 | `git --version`, `worktree list -z`, dirty status, gitlinks, object ids, bool config, `ls-files -v` flags, in-progress operation markers; properties incl. "never panics" | `src/git/parse.rs` |
 | U-ENV-01…05 | Child `git` env sanitization, locale, cwd/args, error mapping, `GIT_OPTIONAL_LOCKS=0` | `src/git/runner.rs` |
-| U-FS-01…20 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check, parallel relocation scan | `src/fs/apfs.rs` (macOS-only: U-FS-01…08, 12, 13, 17, 18) and `src/fs/unix.rs` (shared by Unix adapters: U-FS-09…11, 14…16, 19, 20) |
+| U-FS-01…22 | `clonefile`/`renamex_np`/`statfs` adapter on the real APFS `$TMPDIR`; `uchg` cleanup, `flock` (in-process and cross-process), EACCES, EILSEQ, NFC/NFD, no-follow dir check, parallel relocation scan; U-FS-21/22: the copy flavour (`--copy`) | `src/fs/apfs.rs` (macOS-only: U-FS-01…08, 12, 13, 17, 18, 21, 22) and `src/fs/unix.rs` (shared by Unix adapters: U-FS-09…11, 14…16, 19, 20) |
+| U-LFS-01…42 | Linux adapter on real btrfs / XFS / ext4 mounts (env `PARHEL_TEST_*`, skip-or-fail rule above): `volume` (`cow` from a probe, `fs_type` names, no leftovers from the probe, read-only dirs, unknown fs by magic number), `rename_exclusive` (`RENAME_NOREPLACE`: file, dir, empty dir, dangling symlink, 8 racers), `clone_entry` (contents, modes, symlinks never followed, empty dirs, FIFOs, sockets skipped, `user.*` xattrs, nanosecond file and directory mtimes, hard links separated, extents proven shared with FIEMAP, `cross-volume`, ext4 `clone-failed`, unreadable file named, read-only dirs), `copy_entry` (same tree, extents NOT shared even where `copy_file_range` would reflink, across volumes, sparse files, failures), `remove_dir_all` of read-only dirs, `write_file`, and the shared helpers being wired | `src/fs/linux.rs` (Linux-only) |
 | U-RB-01…12, P1 (U-RB-10…12: a branch is deleted only while it still points at its start commit; U-RB-06: fallback removes only its own registration, never `worktree prune`) | Journal encoding, rollback order, fallbacks, aggregated failure | `src/app/rollback.rs` |
-| U-TXN-01…79 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs, dirty submodules with reinit | `src/app/add.rs` |
+| U-TXN-01…90 | `add` transaction: order, refusals before any mutation (and their precedence), fallback, exclusions, rollback at each step, lost race, SIGINT, operation in progress, flagged index entries, source changed mid-run, journal lock, early failures, destination in submodule, non-UTF-8 destination, publish intent journaled before the rename, symlinks on the path to an exclusion cloned as links, relocation of untracked files, `.parhelignore`, detaching foreign gitfiles, permissions of created dirs, dirty submodules with reinit; U-TXN-80…90: `--copy` (no copy-on-write requirement, cross-volume allowed, copies even where cloning works, the same call sequence as the clone transaction with every `Clone` replaced by `Copy` for nested worktrees, nested destination, `.parhelignore`, submodules, symlink ancestors and relocation, rollback at each step and mid-copy, SIGINT, `--copy` + `--fallback` is a usage error, no other refusal weakened, the refusal for a missing copy-on-write names both `--copy` and `--fallback` without mentioning APFS) | `src/app/add.rs` |
 | U-DOC-01…19 | `doctor`: findings, read-only by default, `--fix` via journal, foreign gitfiles, live runs (`in-progress`), foreign prunable entries ignored, crash after publish repaired (not rolled back) even when the journal lacks the destination or is lost, scoped cleanup of orphan registrations | `src/app/doctor.rs` |
 
-## Integration tests (`tests/*.rs`, real `git`, real APFS)
+## Integration tests (`tests/*.rs`, real `git`, real APFS or btrfs/XFS)
 
 Every failure-path test checks the same invariants with `RepoSnapshot::assert_same`:
 source HEAD, status, worktree list, branches, `.git/worktrees` entries and file tree
@@ -105,7 +122,7 @@ or untouched.
 ### Fidelity — `tests/add_fidelity.rs`
 | ID | Behavior |
 |---|---|
-| I-23a…i | Symlinks (relative, absolute, dangling, to dir, ignored) not followed; modes; empty dirs; xattrs; NFD names and spaces; hard links decoupled; eol attributes; mtimes; directory permissions not widened |
+| I-23a…i | Symlinks (relative, absolute, dangling, to dir, ignored) not followed; modes; empty dirs; xattrs (libc, both platforms); NFD names and spaces; hard links decoupled; eol attributes; mtimes; directory permissions not widened. Linux fidelity under both modes: I-L30…I-L40 |
 | I-24 | Sparse-checkout → `sparse-checkout` refusal |
 
 ### Races — `tests/add_race.rs` (bug 1)
@@ -132,22 +149,24 @@ or untouched.
 | I-45c | Same, with the journal lost (truncated): publication is detected from the disk |
 | I-45d | Same, destination in another folder: the staging dir is found through the registration |
 | I-45e | A crashed run's branch that gained a commit is kept by `doctor --fix` |
-| I-46 | Rollback's fallback cleanup keeps unrelated, unreachable worktrees (unmounted disk) registered |
+| I-46 | Rollback's fallback cleanup keeps unrelated, unreachable worktrees (unmounted disk) registered; git is made to fail at removing the worktree with an immutable file (macOS) or a read-only directory (Linux) |
 
-### Filesystems — `tests/add_filesystems.rs` (disk images)
+### Filesystems — `tests/add_filesystems.rs` (macOS disk images; Linux: see below)
 | ID | Behavior |
 |---|---|
-| I-50 | Destination on another APFS volume → `cross-volume` |
-| I-51a/b | Source or destination on HFS+ (no copy-on-write) → `not-cow` with `--fallback` hint |
-| I-52a/b | `--fallback` → plain worktree + warning; inert on APFS |
-| I-53 | Case-sensitive APFS |
+| I-50 | macOS: destination on another APFS volume → `cross-volume` |
+| I-51a/b | macOS: source or destination on HFS+ (no copy-on-write) → `not-cow` with `--fallback` hint |
+| I-52a | macOS: `--fallback` → plain worktree + warning |
+| I-52b | `--fallback` is inert where copy-on-write works (APFS, btrfs, XFS) |
+| I-53 | macOS: case-sensitive APFS |
+| I-55a/b/c | macOS: `--copy` on HFS+ and across volumes; the `not-cow` refusal offers `--copy` and `--fallback` |
 
 ### Copy-on-write evidence — `tests/add_cow.rs`
 | ID | Behavior |
 |---|---|
-| I-54a | Tracked and ignored files share physical extents (`F_LOG2PHYS_EXT`) |
+| I-54a | Tracked and ignored files share physical extents (`F_LOG2PHYS_EXT` on macOS, `FIEMAP` on Linux) |
 | I-54b | Writes in the destination never reach the source |
-| I-54c | Cloning 128 MiB uses < 8 MiB of free space (isolated volume) |
+| I-54c | macOS: cloning 128 MiB uses < 8 MiB of free space (isolated volume) |
 
 ### Environment — `tests/add_env.rs`
 | ID | Behavior |
@@ -168,7 +187,7 @@ or untouched.
 ### Doctor — `tests/doctor.rs`
 | ID | Behavior |
 |---|---|
-| I-80a…f | Healthy, volume without copy-on-write (`not-cow`), orphan staging, orphan registration (branch kept without journal), foreign gitfile (never touched), outside repo |
+| I-80a…f | Healthy, volume without copy-on-write (`not-cow`; macOS: HFS+, Linux: I-L14), orphan staging, orphan registration (branch kept without journal), foreign gitfile (never touched), outside repo |
 | I-80g | `doctor --fix` during a live `add` reports `in-progress` and touches nothing; the run then succeeds |
 | I-80h | `doctor --fix` cleaning an orphan registration keeps unrelated, unreachable worktrees registered |
 | I-80k | Legitimate worktrees whose names look like staging (`.parhel-staging-feature`, `.parhel-staging-x/feat`) survive `doctor --fix` |
@@ -182,7 +201,7 @@ or untouched.
 | I-92 | `worktree lock`/`unlock`/`move`/`remove` work |
 | I-93 | `worktree repair` has nothing to do |
 | I-94 | 6 concurrent runs to different destinations all succeed |
-| I-95 / I-95b | `post-checkout` not run on copy-on-write (decision pinned); run by `--fallback` |
+| I-95 / I-95b | `post-checkout` not run on copy-on-write (decision pinned); run by `--fallback` (I-95b macOS; Linux: I-L07) |
 | I-96 | A parhel worktree as source of the next |
 | I-97 | Destination parent reached through a symlink |
 
@@ -217,11 +236,11 @@ or untouched.
 | ID | Behavior |
 |---|---|
 | I-130 | Unwritable destination parent → `permission-denied` |
-| I-131 | Full volume → real error, no trace |
+| I-131 | macOS: full volume → real error, no trace (Linux: I-L18) |
 | I-132 | Paths near `PATH_MAX`: full clone or clean `clone-failed` |
-| I-133 | Non-UTF-8 destination → `invalid-path` (APFS rejects it) |
-| I-134 | NFC destination when the NFD name exists → `dest-exists` |
-| I-135 / I-136 | `uchg` files are cloned with their flag; rollback still removes staging |
+| I-133 | macOS: non-UTF-8 destination → `invalid-path` (APFS rejects it) |
+| I-134 | macOS: NFC destination when the NFD name exists → `dest-exists` |
+| I-135 / I-136 | macOS: `uchg` files are cloned with their flag; rollback still removes staging (Linux: I-L15, I-L16) |
 | I-137 | FIFO and socket inside ignored dirs |
 | I-138 | 30k files + 64 MiB in under 10 s |
 
@@ -257,6 +276,50 @@ registrations must be identical after the run.
 | I-175 | Submodule reinit does not rewrite the shared configuration |
 | I-175b | Submodule reinit from a linked worktree with its own per-worktree URL keeps the shared config |
 | I-176 | `doctor --fix` keeps a non-empty folder that only looks like staging |
+
+### Copy mode — `tests/add_copy.rs` (macOS and Linux)
+`--copy` on the `$TMPDIR` volume, where cloning would work: the files must be copied.
+
+| ID | Behavior |
+|---|---|
+| I-C01 | Files equal and NOT sharing storage (`F_LOG2PHYS_EXT` / `FIEMAP`); strategy reported as a full copy, no warning |
+| I-C02 | Ignored files arrive, the source is unchanged, no staging left |
+| I-C03 | Writes do not cross between copy and source, either way |
+| I-C04 | `--copy --fallback` → `usage` (exit 2), nothing created |
+| I-C05 | References to the source path are relocated in copies; `--no-relocate` copies verbatim |
+| I-C06 | Existing destination → `dest-exists`, untouched |
+| I-C07 | The source-state refusals (`dirty-source`) apply; `--allow-dirty` carries changes |
+| I-C08 | Destination inside the source: the staging dir is not copied into itself |
+| I-C09 | `.parhelignore` is honored |
+| I-C10 | Injected error at every failpoint → no trace |
+| I-C11 | SIGINT during the copy → exit 130, rollback |
+| I-C12 | SIGKILL after publishing → `doctor --fix` repairs, never removes |
+
+### Linux — `tests/add_linux.rs` (btrfs, XFS, ext4 mounts from the environment)
+| ID | Behavior |
+|---|---|
+| I-L01 / I-L02 | btrfs / XFS: `add` succeeds, worktree clean, ignored and tracked files present and proven shared (FIEMAP), no warning |
+| I-L03 | Writes diverge on btrfs and XFS (reflink, not a hard link) |
+| I-L04 | ext4: `add` → `not-cow` naming ext4 and offering `--copy` and `--fallback`; zero mutation |
+| I-L05 | ext4 `--copy`: equal files, NOT shared |
+| I-L06 / I-L07 | ext4 `--fallback`: plain worktree with a warning; runs `post-checkout` |
+| I-L08 | Source on ext4 or destination on ext4 → `not-cow` naming the offending path; zero mutation |
+| I-L09 | `--copy` between ext4 and btrfs / XFS, both directions |
+| I-L10 / I-L11 / I-L12 | btrfs → XFS: `cross-volume` (zero mutation), `--copy` succeeds, `--fallback` gives a plain worktree |
+| I-L13 / I-L14 | `doctor`: quiet on btrfs and XFS; `not-cow` finding naming ext4 |
+| I-L15 | Read-only directories are filled and then locked: same modes, reflink and copy, three filesystems |
+| I-L16 / I-L17 | Rollback removes read-only directories, even when git itself cannot remove the staged worktree and unrelated unreachable worktrees keep their registration |
+| I-L18 | A copy that cannot write its data (a write-size limit, `ulimit -f`, stands in for a full disk) fails with a real error and no trace |
+| I-L30…I-L39 | Fidelity under reflink (btrfs, XFS) and copy (btrfs, XFS, ext4): modes incl. setgid and odd bits; symlinks (absolute, relative, dangling, to dirs, outside) never followed; file and directory mtimes to the nanosecond; `user.*` xattrs on files and directories; FIFOs kept and sockets skipped; empty dirs; NFC/NFD, CJK, emoji, spaces; destination with spaces and accents; hard links decoupled; sparse files |
+| I-L40 | The whole worktree equals the source entry by entry (kind, mode, content hash, link target) in every mode |
+| I-L41 | An empty directory created at the destination during assembly is not replaced (`RENAME_NOREPLACE`), reflink and copy |
+| I-L42 | Chained worktrees keep sharing |
+| I-L43 | Destination on tmpfs: `not-cow` without `--copy`, success with it |
+
+The platform-neutral suites (`add_race.rs`, `add_rollback.rs`, `doctor.rs`, `blast_radius.rs`, ...) run unchanged on Linux. Harness changes for portability: `Sandbox::drop` runs `chflags` only on macOS; `tests/common/volume.rs` gates `DiskImage` (hdiutil) to macOS and adds the env-var mounts (`test_mount`, with `resolve_mount` as its testable core); `tests/common/cow.rs` proves sharing with FIEMAP on Linux and names filesystems from `f_type`; extended attributes go through libc (`tests/common/xattr.rs`) instead of the `xattr` binary; I-23d and I-46 are written for both platforms.
+
+### Harness self-tests — `tests/harness.rs`
+They must pass on both platforms (they prove the tools the product tests rely on). Linux additions: a `cp --reflink=always` copy is detected as shared on btrfs and XFS and a plain copy is not, one file is not "shared" with itself, ext4 never reports sharing, `$TMPDIR` is a reflink filesystem, the three mounts have the announced filesystem and distinct devices, and the skip-or-fail rule of the mount helper (missing variable skips unless required; required, empty or non-directory values fail).
 
 ## Not covered (needs infrastructure)
 

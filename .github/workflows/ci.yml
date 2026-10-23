@@ -48,6 +48,38 @@ jobs:
       - name: Test suite (with failpoints)
         run: cargo test --features failpoints --no-fail-fast
 
+  test-linux:
+    name: test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs xfsprogs python3-venv
+      - name: Clippy (Linux)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --all-features -- -D warnings
+      - name: Mount btrfs, XFS (reflink) and ext4 loop filesystems
+        # The same script scripts/linux-test.sh runs in its container: it prints
+        # PARHEL_TEST_BTRFS/XFS/EXT4, PARHEL_REQUIRE_FS and TMPDIR (on btrfs) for
+        # the steps below.
+        run: |
+          sudo modprobe loop btrfs xfs || true
+          sudo scripts/mount-test-filesystems.sh "$USER" | tee -a "$GITHUB_ENV"
+      - name: Environment
+        run: |
+          uname -r
+          git --version
+          df -h "$TMPDIR"
+      - name: Test suite (with failpoints)
+        run: cargo test --features failpoints --no-fail-fast
+
   msrv:
     name: MSRV (shipped binary)
     needs: lint
