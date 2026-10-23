@@ -257,19 +257,19 @@ fn list(paths: &[PathBuf]) -> String {
 fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
     let source = env.fs.volume(&plan.repo.toplevel)?;
     let dest = env.fs.volume(&plan.parent)?;
-    let not_apfs = |path: &Path, fs_type: &str| {
+    let not_cow = |path: &Path, fs_type: &str| {
         Error::new(
-            ErrorCode::NotApfs,
+            ErrorCode::NotCow,
             format!(
-                "`{}` is on {fs_type}, not APFS; pass --fallback for a regular worktree",
+                "copy-on-write is not available on {fs_type} at `{}`; pass --fallback for a regular worktree",
                 path.display()
             ),
         )
     };
-    Ok(if source.fs_type != "apfs" {
-        Some(not_apfs(&plan.repo.toplevel, &source.fs_type))
-    } else if dest.fs_type != "apfs" {
-        Some(not_apfs(&plan.parent, &dest.fs_type))
+    Ok(if !source.cow {
+        Some(not_cow(&plan.repo.toplevel, &source.fs_type))
+    } else if !dest.cow {
+        Some(not_cow(&plan.parent, &dest.fs_type))
     } else if source.device != dest.device {
         Some(Error::new(
             ErrorCode::CrossVolume,
@@ -1095,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_source_not_on_apfs() {
+    fn refuses_source_without_cow() {
         let w = World {
             volumes: vec![
                 (p("/"), apfs(1)),
@@ -1103,6 +1103,7 @@ mod tests {
                     p("/w/repo"),
                     VolumeInfo {
                         fs_type: "hfs".into(),
+                        cow: false,
                         device: 2,
                     },
                 ),
@@ -1110,19 +1111,41 @@ mod tests {
             ..World::default()
         };
         let err = run(&w, &new_branch()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotApfs);
+        assert_eq!(err.code, ErrorCode::NotCow);
         assert!(err.message.contains("/w/repo") && err.message.contains("hfs"));
         assert_no_mutation(&w);
     }
 
+    // The decision comes from `cow`, never from the filesystem's name.
     #[test]
-    fn refuses_destination_parent_not_on_apfs() {
+    fn cow_flag_decides_not_the_fs_name() {
+        let w = World {
+            volumes: vec![
+                (p("/"), apfs(1)),
+                (
+                    p("/w/repo"),
+                    VolumeInfo {
+                        fs_type: "apfs".into(),
+                        cow: false,
+                        device: 1,
+                    },
+                ),
+            ],
+            ..World::default()
+        };
+        assert_eq!(run(&w, &new_branch()).unwrap_err().code, ErrorCode::NotCow);
+        assert_no_mutation(&w);
+    }
+
+    #[test]
+    fn refuses_destination_parent_without_cow() {
         let w = World {
             volumes: vec![
                 (
                     p("/"),
                     VolumeInfo {
                         fs_type: "exfat".into(),
+                        cow: false,
                         device: 2,
                     },
                 ),
@@ -1130,7 +1153,7 @@ mod tests {
             ],
             ..World::default()
         };
-        assert_eq!(run(&w, &new_branch()).unwrap_err().code, ErrorCode::NotApfs);
+        assert_eq!(run(&w, &new_branch()).unwrap_err().code, ErrorCode::NotCow);
         assert_no_mutation(&w);
     }
 
@@ -1185,12 +1208,13 @@ mod tests {
 
     // U-TXN-20
     #[test]
-    fn fallback_uses_plain_worktree_add_when_not_apfs() {
+    fn fallback_uses_plain_worktree_add_without_cow() {
         let w = World {
             volumes: vec![(
                 p("/"),
                 VolumeInfo {
                     fs_type: "hfs".into(),
+                    cow: false,
                     device: 1,
                 },
             )],
@@ -1247,6 +1271,7 @@ mod tests {
                 p("/"),
                 VolumeInfo {
                     fs_type: "hfs".into(),
+                    cow: false,
                     device: 1,
                 },
             )],

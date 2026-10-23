@@ -1,6 +1,6 @@
 //! Placeholder adapter for platforms without a copy-on-write backend yet.
 //! Every volume reports an unknown filesystem type, so `add` refuses with
-//! `not-apfs` (or uses `--fallback`).
+//! `not-cow` (or uses `--fallback`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,11 @@ pub struct UnsupportedFs;
 
 impl CowFs for UnsupportedFs {
     fn volume(&self, _: &Path) -> Result<VolumeInfo> {
-        Err(Error::not_implemented("copy-on-write on this platform"))
+        Ok(VolumeInfo {
+            fs_type: "unknown".into(),
+            cow: false,
+            device: 0,
+        })
     }
     fn canonicalize(&self, _: &Path) -> Result<PathBuf> {
         Err(Error::not_implemented("copy-on-write on this platform"))

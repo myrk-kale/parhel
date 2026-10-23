@@ -27,7 +27,7 @@ Detach HEAD at the target commit
 Carry uncommitted changes from the source (staged changes arrive unstaged)
 .TP
 \fB\-\-fallback\fR
-Use a plain `git worktree add` when copy\-on\-write is impossible (not APFS, different volumes)
+Use a plain `git worktree add` when copy\-on\-write is impossible (no copy\-on\-write on the volume, different volumes)
 .TP
 \fB\-\-no\-relocate\fR
 Leave copied files that mention the source\*(Aqs path as they are (by default such paths are rewritten to the new worktree\*(Aqs)

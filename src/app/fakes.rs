@@ -185,6 +185,7 @@ pub struct World {
 pub fn apfs(device: u64) -> VolumeInfo {
     VolumeInfo {
         fs_type: "apfs".into(),
+        cow: true,
         device,
     }
 }

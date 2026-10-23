@@ -6,7 +6,7 @@ git\-parhel\-doctor \- Diagnose the environment and clean up after crashed runs
 .SH SYNOPSIS
 \fBgit parhel doctor\fR [\fB\-\-from\fR] [\fB\-\-fix\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Report what would make `add` refuse or misbehave: a source that is not on APFS, staging directories and worktree registrations left by a crashed run, and .git files of other repositories nested in the source. Runs still in progress are detected and never touched.
+Report what would make `add` refuse or misbehave: a source on a volume without copy\-on\-write, staging directories and worktree registrations left by a crashed run, and .git files of other repositories nested in the source. Runs still in progress are detected and never touched.
 .PP
 With \-\-fix, leftovers are undone using the crashed run\*(Aqs journal: only what that run created is removed, and a worktree that was already published is repaired, not removed.
 .SH OPTIONS

@@ -282,7 +282,7 @@ install script both install.
 | Windows | Planned after Linux | |
 
 On a filesystem without copy-on-write support, or when the source and the
-destination are on different volumes, `add` stops with `not-apfs` or
+destination are on different volumes, `add` stops with `not-cow` or
 `cross-volume` before touching anything. Pass `--fallback` to get a regular
 `git worktree add` in those cases.
 
@@ -482,7 +482,7 @@ usage errors and `128 + signal` when a signal interrupted the run.
 | `dirty-source` | Commit or stash your changes, or pass `--allow-dirty` |
 | `dest-exists` | Choose another destination. parhel never overwrites |
 | `dest-parent-missing` | Create the parent directory first |
-| `not-apfs` / `cross-volume` | Use a destination on the same APFS volume, or pass `--fallback` |
+| `not-cow` / `cross-volume` | Use a destination on the same volume, on a filesystem with copy-on-write, or pass `--fallback` |
 | `submodules-present` | Pass `--submodules=reinit` |
 | `dirty-submodule` | Commit or stash the changes inside the submodule, or drop `--allow-dirty` |
 | `operation-in-progress` | Finish or abort the merge, rebase or cherry-pick first |

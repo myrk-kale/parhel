@@ -40,8 +40,8 @@ pub enum ErrorCode {
     OperationInProgress,
     /// The source HEAD or its files changed while the worktree was being assembled.
     SourceChanged,
-    /// Source or destination is not on an APFS volume.
-    NotApfs,
+    /// Source or destination volume cannot clone files copy-on-write.
+    NotCow,
     /// Source and destination are on different volumes (`clonefile` would fail with `EXDEV`).
     CrossVolume,
     /// The destination path already exists (checked up front and again at publish time).
@@ -92,7 +92,7 @@ impl ErrorCode {
             Self::DirtySubmodule => "dirty-submodule",
             Self::OperationInProgress => "operation-in-progress",
             Self::SourceChanged => "source-changed",
-            Self::NotApfs => "not-apfs",
+            Self::NotCow => "not-cow",
             Self::CrossVolume => "cross-volume",
             Self::DestExists => "dest-exists",
             Self::DestParentMissing => "dest-parent-missing",

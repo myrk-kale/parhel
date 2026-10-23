@@ -101,8 +101,11 @@ pub struct Scan {
 /// Filesystem identity of a path's volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeInfo {
-    /// `statfs.f_fstypename` (`"apfs"`, `"hfs"`, `"exfat"`, ...).
+    /// Name of the filesystem (`"apfs"`, `"hfs"`, `"exfat"`, ...), for messages only.
     pub fs_type: String,
+    /// Whether files can be cloned copy-on-write on this volume. Decided by the
+    /// adapter (APFS: always; Linux: a probe), never by comparing `fs_type`.
+    pub cow: bool,
     /// `st_dev` of the path.
     pub device: u64,
 }
