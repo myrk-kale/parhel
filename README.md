@@ -12,7 +12,7 @@ of your build output already in place.
 [![Release](https://img.shields.io/github/v/release/myrk-kale/parhel?sort=semver)](https://github.com/myrk-kale/parhel/releases)
 [![crates.io](https://img.shields.io/crates/v/parhel.svg)](https://crates.io/crates/parhel)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(APFS)-lightgrey)
+![Platform: macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 
 ```sh
 git parhel add ../my-feature --new-branch feature/my-feature
@@ -36,11 +36,13 @@ and a 300 MB build artifact:
 | `git worktree add`, then `cp -R node_modules target` | 6.9 s | 383 MiB |
 | `git parhel add` | 0.5 s | about 8 MiB |
 
-parhel currently runs on macOS (APFS). Linux is next, then Windows; see
+parhel runs on macOS (APFS) and on Linux (Btrfs, XFS with reflink and other
+filesystems that can reflink). Windows is planned; see
 [Platform support](#platform-support).
 
 parhel is at version 0.x. More than 430 tests run it against real git and real
-APFS volumes, but command-line details may still change before 1.0. If
+APFS, Btrfs, XFS and ext4 volumes, but command-line details may still change
+before 1.0. If
 something looks wrong, please
 [open an issue](https://github.com/myrk-kale/parhel/issues/new/choose).
 
@@ -65,8 +67,17 @@ something looks wrong, please
 
 ## Install
 
-You need macOS on an APFS volume (the default since macOS 10.13) and git 2.29
-or newer. The git that ships with Xcode's command line tools works.
+You need git 2.29 or newer and one of these:
+
+- macOS on an APFS volume (the default since macOS 10.13). The git that ships
+  with Xcode's command line tools works.
+- Linux on a filesystem that can reflink: Btrfs, XFS created with reflink
+  support (the default since xfsprogs 5.1), bcachefs, or ZFS 2.2 and newer.
+  On any other filesystem, `--copy` and `--fallback` still work; see
+  [Platform support](#platform-support).
+
+Prebuilt Linux binaries come in a later release. Until then, on Linux, build
+it with Cargo (below).
 
 With Homebrew:
 
@@ -84,7 +95,8 @@ curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | 
 Set `PARHEL_VERSION=0.2.0` to install a specific version, or
 `PARHEL_INSTALL_DIR` to put the binary somewhere else.
 
-With Cargo (Rust 1.85 or newer), from crates.io or straight from the repository:
+With Cargo (Rust 1.85 or newer; this is the way to install on Linux today), from
+crates.io or straight from the repository:
 
 ```sh
 cargo install parhel
@@ -205,7 +217,8 @@ the commit your current worktree is on. The parent directory of
 | `--from <path>` | Which worktree to copy, given as any path inside it. Defaults to the current directory |
 | `--allow-dirty` | Copy uncommitted changes too. Staged changes arrive unstaged. Without this flag, a worktree with uncommitted changes is refused |
 | `--submodules=refuse\|reinit` | By default, initialized submodules are refused. `reinit` gives each submodule in the new worktree its own git directory, cloned from your local copy, so it works offline |
-| `--fallback` | If copy-on-write is not possible (unsupported filesystem, or source and destination on different volumes), create a regular worktree instead of failing |
+| `--fallback` | If copy-on-write is not possible (unsupported filesystem, or source and destination on different volumes), create a regular worktree instead of failing. The ignored files are not copied |
+| `--copy` | Copy every file in full instead of cloning it. Slower and uses disk space, but works on any filesystem and across volumes, and brings the ignored files along. Cannot be combined with `--fallback` |
 | `--no-relocate` | Copy untracked files exactly as they are, without rewriting paths that point at the source (see [Copied files that point at the source](#copied-files-that-point-at-the-source)) |
 
 Besides tracked files, the copy brings along ignored files. Untracked files
@@ -256,7 +269,7 @@ Only untracked paths are affected; tracked files always come from git.
 
 Reports problems in the repository and its environment:
 
-- the worktree is on a filesystem parhel cannot clone on;
+- the worktree is on a filesystem without copy-on-write (`not-cow`);
 - an earlier run crashed and left a hidden `.parhel-staging-*` directory, or a
   worktree registration inside one;
 - a `.git` file inside your tree belongs to a different repository (`add`
@@ -278,13 +291,33 @@ install script both install.
 | Platform | Status | Mechanism |
 |---|---|---|
 | macOS, APFS | Supported | `clonefile(2)` |
-| Linux, Btrfs or XFS | Planned next | reflink copies (`FICLONE`) |
-| Windows | Planned after Linux | |
+| Linux: Btrfs, XFS with reflink, bcachefs, ZFS 2.2+ | Supported | reflink copies (`ioctl(FICLONE)`) per file |
+| Linux: other filesystems (ext4, tmpfs, NFS...) | `--copy` or `--fallback` | full copies, or a regular worktree |
+| Windows | Planned | |
 
-On a filesystem without copy-on-write support, or when the source and the
-destination are on different volumes, `add` stops with `not-cow` or
-`cross-volume` before touching anything. Pass `--fallback` to get a regular
-`git worktree add` in those cases.
+parhel does not go by the filesystem's name. On Linux it asks the directory
+itself, with two anonymous temporary files and a reflink between them, so a
+mount that cannot reflink is detected even when its type usually can (an XFS
+created without `reflink=1`, for example). If that test cannot run, for example
+in a read-only directory, it falls back to the name: Btrfs and bcachefs count as
+copy-on-write, everything else does not.
+
+When the source or the destination is on a filesystem without copy-on-write, or
+when they are on different volumes, `add` stops with `not-cow` or
+`cross-volume` before touching anything. You then have two ways out:
+
+- `--copy` copies every file in full through the same steps as a clone: the
+  staging directory, the exclusive rename, the rollback and the path rewriting.
+  It needs no copy-on-write and works across volumes, but it takes the time and
+  the disk space of a real copy.
+- `--fallback` gives you a regular `git worktree add`. It is fast and small,
+  and the ignored files are not copied.
+
+On Linux, symlinks are recreated as symlinks and never followed. FIFOs are
+recreated. Sockets and device files are skipped, as git does. Hard links inside
+the source become separate files in the copy. User extended attributes
+(`user.*`), modes, owners where permitted, and modification times to the
+nanosecond are kept, so build tools do not see every file as changed.
 
 The code keeps filesystem access behind one interface (`CowFs` in
 `src/ports.rs`), so adding a platform means writing a new implementation of it
@@ -292,39 +325,45 @@ and running the same test suite against it.
 
 ## How it works
 
-On macOS, `add` goes through five steps:
+`add` goes through five steps:
 
 1. It checks everything it can before making changes: the git version, the
-   state of the source worktree, the destination, and whether both are on the
-   same APFS volume. Any refusal happens here, so a refused command leaves no
+   state of the source worktree, the destination, and (unless you pass
+   `--copy`) whether both are on the same volume and that volume has
+   copy-on-write. Any refusal happens here, so a refused command leaves no
    trace.
 2. It registers a new worktree with `git worktree add --no-checkout`, inside a
    hidden staging directory next to the destination.
-3. It clones the source into the staging directory with `clonefile(2)`. A whole
-   directory takes a single call; parhel only walks into a directory when
-   something inside it must be left out: the root `.git`, other worktrees
-   nested in the source and, with `reinit`, submodules.
+3. It clones the source into the staging directory. On macOS that is
+   `clonefile(2)`, and a whole directory takes a single call; parhel only walks
+   into a directory when something inside it must be left out: the root `.git`,
+   other worktrees nested in the source and, with `reinit`, submodules. On
+   Linux no call clones a directory, so parhel walks the tree and clones each
+   file with `ioctl(FICLONE)`, on a few threads. With `--copy`, every file is
+   copied in full instead, on both platforms.
 4. It builds the index from the source commit. If `[ref]` points somewhere else,
    a two-way checkout rewrites the files that differ.
 5. It moves the finished worktree to the destination with
-   `renamex_np(RENAME_EXCL)`, which fails instead of overwriting anything, and
-   then points this worktree's registration at its final path.
+   `renamex_np(RENAME_EXCL)` (macOS) or `renameat2(RENAME_NOREPLACE)` (Linux),
+   which fail instead of overwriting anything, and then points this worktree's
+   registration at its final path.
 
 ```
  source worktree                      .parhel-staging-xxxx/ (next to the destination)
  ├── .git            (excluded)       └── my-feature/
- ├── src/            ─ clonefile ─▶       ├── .git   ← git worktree add --no-checkout
- ├── node_modules/   ─ clonefile ─▶       ├── src/
- └── target/         ─ clonefile ─▶       ├── node_modules/
+ ├── src/            ─ clone ─────▶       ├── .git   ← git worktree add --no-checkout
+ ├── node_modules/   ─ clone ─────▶       ├── src/
+ └── target/         ─ clone ─────▶       ├── node_modules/
                                           └── target/
                                                 │  index ← read-tree (+ two-way checkout if [ref] differs)
                                                 ▼
-                     renamex_np(RENAME_EXCL) ─▶ ../my-feature   then re-point its registration
+                            exclusive rename ─▶ ../my-feature   then re-point its registration
 ```
 
-An APFS clone shares data blocks with the original. When either side writes to
-a block, APFS copies that block first, so from the moment the clone exists the
-two worktrees change independently.
+A clone shares data blocks with the original. When either side writes to a
+block, the filesystem copies that block first, so from the moment the clone
+exists the two worktrees change independently. With `--copy` nothing is shared
+from the start.
 
 ## What parhel writes, and where
 
@@ -429,10 +468,11 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
-- Copy-on-write only works on macOS with APFS for now. Elsewhere, `--fallback`
-  creates a regular worktree. See [Platform support](#platform-support).
-- Source and destination must be on the same volume, because clones cannot
-  cross volumes. `--fallback` covers this case too.
+- Copy-on-write works on APFS (macOS) and on Linux filesystems that reflink.
+  Elsewhere, `--copy` copies every file and `--fallback` creates a regular
+  worktree. See [Platform support](#platform-support).
+- For a clone, source and destination must be on the same volume, because
+  clones cannot cross volumes. `--copy` and `--fallback` cover this case too.
 - Worktrees that use sparse-checkout are refused.
 - Hooks such as `post-checkout` do not run, the same as with
   `git worktree add --no-checkout`. With `--fallback`, git runs them as usual.
@@ -450,6 +490,11 @@ affecting the copy.
 **Why do Finder and `du` report the full size?**
 They count each file's logical size. Cloned blocks are stored once until one
 side changes them, so free space (`df -h`) shows what was actually used.
+
+**My filesystem has no copy-on-write. What now?**
+Pass `--copy` to get the same worktree with every file copied in full (it takes
+longer and uses disk space), or `--fallback` for a plain `git worktree add`
+without the ignored files.
 
 **How do I remove a worktree?**
 Run `git worktree remove <path>`. Ignored files do not block it.
@@ -482,7 +527,7 @@ usage errors and `128 + signal` when a signal interrupted the run.
 | `dirty-source` | Commit or stash your changes, or pass `--allow-dirty` |
 | `dest-exists` | Choose another destination. parhel never overwrites |
 | `dest-parent-missing` | Create the parent directory first |
-| `not-cow` / `cross-volume` | Use a destination on the same volume, on a filesystem with copy-on-write, or pass `--fallback` |
+| `not-cow` / `cross-volume` | Use a destination on the same volume, on a filesystem with copy-on-write, or pass `--copy` (full copy) or `--fallback` (regular worktree) |
 | `submodules-present` | Pass `--submodules=reinit` |
 | `dirty-submodule` | Commit or stash the changes inside the submodule, or drop `--allow-dirty` |
 | `operation-in-progress` | Finish or abort the merge, rebase or cherry-pick first |
@@ -495,7 +540,8 @@ usage errors and `128 + signal` when a signal interrupted the run.
 
 Less common codes: `not-a-repo`, `bare-repo`, `unborn-head`, `inside-git-dir`,
 `dest-is-source`, `dest-inside-git-dir`, `dest-inside-submodule`,
-`invalid-path`, `permission-denied`, `clone-failed`, `interrupted`, `usage`,
+`invalid-path`, `permission-denied`, `clone-failed` (also when a `--copy` fails),
+`interrupted`, `usage`,
 `io`.
 
 ## Uninstall
@@ -516,9 +562,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-The integration tests drive real git on real APFS volumes. They create
-throwaway disk images with `hdiutil`, which needs no root. To check that files
-were cloned rather than copied, they compare physical block addresses, and they
+The integration tests drive real git on real volumes. On macOS they create
+throwaway APFS disk images with `hdiutil`, which needs no root. On Linux they
+use loop-mounted Btrfs, XFS and ext4 images; `scripts/linux-test.sh` sets those
+up in a Docker container, so you can run the Linux suite from a Mac. To check
+that files were cloned rather than copied, they compare physical block
+addresses (`F_LOG2PHYS_EXT` on macOS, `FIEMAP` on Linux), and they
 use failpoints that work across processes to reproduce races and crashes on
 demand. [docs/test-catalog.md](docs/test-catalog.md) lists every behavior the
 tests cover, and [CONTRIBUTING.md](CONTRIBUTING.md) explains how to get

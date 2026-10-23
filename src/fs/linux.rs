@@ -1,92 +1,244 @@
 //! [`CowFs`] port on Linux: reflink through `ioctl(FICLONE)` (btrfs, XFS with
 //! `reflink=1`, bcachefs, ZFS 2.2+), `renameat2(RENAME_NOREPLACE)`, `statfs(2)`,
-//! `fsync`. Everything platform-independent is in [`super::unix`].
-//!
-//! Skeleton: every method still fails with `not-implemented`. The tests at the
-//! bottom describe the behaviour the adapter must have.
+//! `fsync`. Everything platform-independent is in [`super::unix`], the tree walk in
+//! [`super::tree`].
 
 use std::ffi::OsString;
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{Error, Result};
+use super::tree::{self, Data};
+use super::unix::{self, c_path, io_error};
+use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::{CowFs, FileLock, Scan, VolumeInfo};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxFs;
 
-fn unimplemented_yet<T>(what: &str) -> Result<T> {
-    Err(Error::not_implemented(&format!("{what} on Linux")))
+/// `f_type` magic numbers of `statfs(2)` (`<linux/magic.h>`).
+const EXT_MAGIC: u64 = 0xef53;
+const XFS_MAGIC: u64 = 0x5846_5342;
+const BTRFS_MAGIC: u64 = 0x9123_683e;
+const BCACHEFS_MAGIC: u64 = 0xca45_1a4e;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+const ZFS_MAGIC: u64 = 0x2fc1_2fc1;
+const OVERLAYFS_MAGIC: u64 = 0x794c_7630;
+const NFS_MAGIC: u64 = 0x6969;
+const FUSE_MAGIC: u64 = 0x6573_5546;
+
+/// Name of the filesystem for messages: known magic numbers by name, others in hex.
+fn fs_name(magic: u64) -> String {
+    match magic {
+        EXT_MAGIC => "ext4",
+        XFS_MAGIC => "xfs",
+        BTRFS_MAGIC => "btrfs",
+        BCACHEFS_MAGIC => "bcachefs",
+        TMPFS_MAGIC => "tmpfs",
+        ZFS_MAGIC => "zfs",
+        OVERLAYFS_MAGIC => "overlay",
+        NFS_MAGIC => "nfs",
+        FUSE_MAGIC => "fuse",
+        other => return format!("{other:#x}"),
+    }
+    .to_owned()
+}
+
+/// `ioctl(FICLONE)`: make `dst` (empty) share the storage of `src`.
+fn ficlone(src: &File, dst: &File) -> io::Result<()> {
+    // SAFETY: valid open fds; FICLONE takes the source fd as its argument.
+    let rc = unsafe { libc::ioctl(dst.as_raw_fd(), libc::FICLONE as _, src.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether the directory `dir` is on a filesystem that reflinks, found by trying
+/// it on two anonymous files (`O_TMPFILE`: nothing appears on disk). `None` when
+/// the probe cannot run there (read-only or unsearchable directory, no `O_TMPFILE`,
+/// disk full...): the caller then goes by the filesystem's name.
+fn reflink_probe(dir: &Path) -> Option<bool> {
+    let dir = c_path(dir).ok()?;
+    let anonymous = || {
+        // SAFETY: valid C string.
+        let fd = unsafe {
+            libc::open(
+                dir.as_ptr(),
+                libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        // SAFETY: a fresh descriptor nobody else owns.
+        (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+    };
+    let (src, dst) = (anonymous()?, anonymous()?);
+    // A block of data: a tail that is not block-aligned or an inline extent would
+    // be refused by some filesystems for reasons that say nothing about reflinks.
+    src.write_all_at(&[0u8; 4096], 0).ok()?;
+    match ficlone(&src, &dst) {
+        Ok(()) => Some(true),
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EOPNOTSUPP | libc::EINVAL | libc::EXDEV | libc::ENOTTY) => Some(false),
+            _ => None,
+        },
+    }
+}
+
+/// Clone only where the filesystem is known to reflink (probe unavailable).
+fn reflinks_by_name(magic: u64) -> bool {
+    matches!(magic, BTRFS_MAGIC | BCACHEFS_MAGIC)
+}
+
+/// Sync the directory entry of a file just written.
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    match File::open(parent.unwrap_or(Path::new("."))).and_then(|dir| dir.sync_all()) {
+        // Some filesystems cannot sync a directory: nothing to wait for there.
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
+    }
+}
+
+/// Durable on Linux: the data (`fsync`), then the name that points at it.
+fn sync_file(file: &File) -> io::Result<()> {
+    file.sync_all()
 }
 
 impl CowFs for LinuxFs {
-    fn volume(&self, _: &Path) -> Result<VolumeInfo> {
-        unimplemented_yet("volume")
+    fn volume(&self, path: &Path) -> Result<VolumeInfo> {
+        let c = c_path(path)?;
+        let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: valid C string and out-pointer.
+        if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return Err(io_error(path, &io::Error::last_os_error()));
+        }
+        // SAFETY: statfs succeeded.
+        let st = unsafe { st.assume_init() };
+        // The magic numbers are 32-bit patterns; the field's width and sign differ
+        // between targets.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let magic = u64::from(st.f_type as u32);
+        let cow = reflink_probe(path).unwrap_or_else(|| reflinks_by_name(magic));
+        Ok(VolumeInfo {
+            fs_type: fs_name(magic),
+            cow,
+            device: unix::device_of(path)?,
+        })
     }
-    fn canonicalize(&self, _: &Path) -> Result<PathBuf> {
-        unimplemented_yet("canonicalize")
+
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        unix::canonicalize(path)
     }
-    fn exists_no_follow(&self, _: &Path) -> Result<bool> {
-        unimplemented_yet("exists_no_follow")
+
+    fn exists_no_follow(&self, path: &Path) -> Result<bool> {
+        unix::exists_no_follow(path)
     }
-    fn is_dir(&self, _: &Path) -> Result<bool> {
-        unimplemented_yet("is_dir")
+
+    fn is_dir(&self, path: &Path) -> Result<bool> {
+        Ok(unix::is_dir(path))
     }
-    fn is_dir_no_follow(&self, _: &Path) -> Result<bool> {
-        unimplemented_yet("is_dir_no_follow")
+
+    fn is_dir_no_follow(&self, path: &Path) -> Result<bool> {
+        Ok(unix::is_dir_no_follow(path))
     }
-    fn create_staging_dir(&self, _: &Path) -> Result<PathBuf> {
-        unimplemented_yet("create_staging_dir")
+
+    fn create_staging_dir(&self, parent: &Path) -> Result<PathBuf> {
+        unix::create_staging_dir(parent)
     }
-    fn list_dir(&self, _: &Path) -> Result<Vec<OsString>> {
-        unimplemented_yet("list_dir")
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<OsString>> {
+        unix::list_dir(path)
     }
-    fn create_dir(&self, _: &Path) -> Result<()> {
-        unimplemented_yet("create_dir")
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        unix::create_dir(path)
     }
-    fn clone_entry(&self, _: &Path, _: &Path) -> Result<()> {
-        unimplemented_yet("clone_entry (FICLONE)")
+
+    fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+        tree::transfer(src, dst, Data::Reflink(ficlone))
     }
-    fn copy_entry(&self, _: &Path, _: &Path) -> Result<()> {
-        unimplemented_yet("copy_entry")
+
+    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+        tree::transfer(src, dst, Data::Copy)
     }
-    fn rename_exclusive(&self, _: &Path, _: &Path) -> Result<()> {
-        unimplemented_yet("rename_exclusive (RENAME_NOREPLACE)")
+
+    fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()> {
+        let (cf, ct) = (c_path(from)?, c_path(to)?);
+        // SAFETY: valid C strings. `renameat2` has no glibc wrapper before 2.28.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                cf.as_ptr(),
+                libc::AT_FDCWD,
+                ct.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) {
+            return Err(Error::new(
+                ErrorCode::DestExists,
+                format!("destination `{}` already exists", to.display()),
+            ));
+        }
+        Err(io_error(to, &e))
     }
-    fn remove_dir_all(&self, _: &Path) -> Result<()> {
-        unimplemented_yet("remove_dir_all")
+
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        unix::remove_dir_all(path, |path| unix::make_dirs_writable(path, &|_| {}))
     }
-    fn write_file(&self, _: &Path, _: &[u8]) -> Result<()> {
-        unimplemented_yet("write_file")
+
+    /// Durable write: the journal must reach the disk before the step it
+    /// describes.
+    fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        unix::write_file(path, contents, sync_file)?;
+        sync_parent(path).map_err(|e| io_error(path, &e))
     }
+
+    fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        unix::read_file(path)
+    }
+
     fn scan(
         &self,
-        _: &Path,
-        _: &[Vec<u8>],
-        _: u64,
-        _: &(dyn Fn(&Path) -> bool + Sync),
+        root: &Path,
+        needles: &[Vec<u8>],
+        max_len: u64,
+        skip: &(dyn Fn(&Path) -> bool + Sync),
     ) -> Result<Scan> {
-        unimplemented_yet("scan")
+        Ok(unix::scan(root, needles, max_len, skip))
     }
-    fn replace_contents(&self, _: &Path, _: &[u8]) -> Result<()> {
-        unimplemented_yet("replace_contents")
+
+    fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        unix::replace_contents(path, contents)
     }
-    fn remove_file(&self, _: &Path) -> Result<()> {
-        unimplemented_yet("remove_file")
+
+    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
+        unix::copy_mode(from, to)
     }
-    fn copy_mode(&self, _: &Path, _: &Path) -> Result<()> {
-        unimplemented_yet("copy_mode")
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        unix::remove_file(path)
     }
-    fn replace_symlink(&self, _: &Path, _: &Path) -> Result<()> {
-        unimplemented_yet("replace_symlink")
+
+    fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        unix::replace_symlink(path, target)
     }
-    fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
-        unimplemented_yet("read_file")
+
+    fn lock_exclusive(&self, path: &Path) -> Result<FileLock> {
+        unix::lock_exclusive(path)
     }
-    fn lock_exclusive(&self, _: &Path) -> Result<FileLock> {
-        unimplemented_yet("lock_exclusive")
-    }
-    fn is_locked(&self, _: &Path) -> Result<bool> {
-        unimplemented_yet("is_locked")
+
+    fn is_locked(&self, path: &Path) -> Result<bool> {
+        unix::is_locked(path)
     }
 }
 

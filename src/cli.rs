@@ -25,8 +25,9 @@ until one side changes them.
 The result is an ordinary worktree: list, move, lock and remove it with \
 `git worktree`.
 
-Platform support: macOS on APFS (clonefile). Linux and Windows are planned. \
-Elsewhere, `add --fallback` creates a regular worktree.";
+Platform support: macOS on APFS (clonefile) and Linux on Btrfs, XFS with reflink, \
+bcachefs or ZFS 2.2+ (FICLONE). Windows is planned. On other filesystems, `add --copy` \
+copies every file in full and `add --fallback` creates a regular worktree.";
 
 const AFTER_HELP: &str = "\
 Examples:

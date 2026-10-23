@@ -2,12 +2,13 @@
 //! `F_FULLFSYNC` and BSD flags. Everything platform-independent is in [`super::unix`].
 
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+use super::tree::{self, Data};
 use super::unix::{self, c_path, io_error};
 use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::{CowFs, FileLock, Scan, VolumeInfo};
@@ -21,21 +22,12 @@ pub struct ApfsFs;
 
 /// Clear BSD flags (`uchg`, `uappnd`) and make directories writable, recursively.
 fn make_removable(path: &Path) {
-    let Ok(md) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if let Ok(c) = c_path(path) {
-        // SAFETY: valid C string; lchflags never follows symlinks.
-        unsafe { libc::lchflags(c.as_ptr(), 0) };
-    }
-    if md.is_dir() {
-        let _ = fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                make_removable(&entry.path());
-            }
+    unix::make_dirs_writable(path, &|entry| {
+        if let Ok(c) = c_path(entry) {
+            // SAFETY: valid C string; lchflags never follows symlinks.
+            unsafe { libc::lchflags(c.as_ptr(), 0) };
         }
-    }
+    });
 }
 
 /// On macOS only `F_FULLFSYNC` flushes the drive's cache.
@@ -121,9 +113,9 @@ impl CowFs for ApfsFs {
         ))
     }
 
-    /// Not written yet: `--copy` must copy, never `clonefile`.
-    fn copy_entry(&self, _: &Path, _: &Path) -> Result<()> {
-        Err(Error::not_implemented("`--copy` on macOS"))
+    /// A plain recursive copy: `--copy` must copy, never `clonefile`.
+    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+        tree::transfer(src, dst, Data::Copy)
     }
 
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()> {

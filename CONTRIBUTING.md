@@ -4,7 +4,7 @@ Thanks for helping! parhel is small and test-driven; changes follow the same pat
 
 ## Setup
 
-macOS on APFS, Rust (the version in `rust-toolchain.toml` is installed
+macOS on APFS or Linux, Rust (the version in `rust-toolchain.toml` is installed
 automatically), git 2.29+.
 
 ```sh
@@ -38,7 +38,7 @@ Commit messages follow [Conventional Commits](https://www.conventionalcommits.or
 
 - `src/domain`: pure rules (paths, exclusions, clone plan, errors)
 - `src/ports.rs`: traits for side effects; `src/app/fakes.rs` implements them for unit tests
-- `src/git`, `src/fs`: adapters (the `git` binary, APFS syscalls)
+- `src/git`, `src/fs`: adapters (the `git` binary; APFS and Linux reflink syscalls)
 - `src/app`: the `add` transaction, rollback and `doctor`
 - `tests/`: integration tests; `tests/common` is the harness
 

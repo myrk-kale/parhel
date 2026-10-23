@@ -3,14 +3,14 @@ name = "parhel"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
-description = "Create Git worktrees with filesystem copy-on-write, ignored build output (node_modules, target/) included. Currently macOS/APFS; Linux and Windows planned"
+description = "Create Git worktrees with filesystem copy-on-write, ignored build output (node_modules, target/) included. macOS (APFS) and Linux (Btrfs, XFS); Windows planned"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/myrk-kale/parhel"
 homepage = "https://github.com/myrk-kale/parhel"
 authors = ["Kale"]
 exclude = [".github/", "skills/", ".serena/", "proptest-regressions/", "packaging/", "install.sh", "assets/*.png"]
-keywords = ["git", "worktree", "apfs", "copy-on-write", "clonefile"]
+keywords = ["git", "worktree", "apfs", "copy-on-write", "reflink"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]

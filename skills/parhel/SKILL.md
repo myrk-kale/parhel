@@ -16,8 +16,9 @@ description: >-
 `git parhel add` does what `git worktree add` does, then copies the source
 worktree's ignored and untracked files (`node_modules`, `target`, `.venv`,
 `.env`, caches) into the new worktree. On a copy-on-write filesystem the copy
-takes seconds and almost no disk space until files change. Today that means
-macOS on APFS.
+takes seconds and almost no disk space until files change. That means APFS
+on macOS and, on Linux, Btrfs, XFS with reflink, bcachefs or ZFS 2.2+. On
+other filesystems `--copy` copies every file in full instead.
 
 A copy is a full working environment, not a sandbox. It keeps the same
 credentials, talks to the same services and lives in the same git repository
@@ -88,9 +89,10 @@ git parhel add ../<project>-<task> --new-branch <branch>
 ```
 
 - Put the destination next to the project (same volume). `cross-volume` or
-  `not-cow` means copy-on-write is impossible there. Ask the user before
-  using `--fallback`, which creates a regular worktree without the copied
-  files.
+  `not-cow` means copy-on-write is impossible there. Offer the user the two
+  ways out and let them choose: `--copy` copies every file in full (works
+  anywhere, takes time and disk space), `--fallback` creates a regular
+  worktree without the copied files. They cannot be combined.
 - Other forms: `--branch <existing>`, `--detach <ref>`, a start commit as the
   last argument. With initialized submodules, `--submodules=reinit` is
   required.
@@ -109,7 +111,7 @@ git parhel add ../<project>-<task> --new-branch <branch>
 | `operation-in-progress` | A merge, rebase or cherry-pick is open in the source: ask the user |
 | `source-changed` | Something wrote to the source during the copy; wait for it and retry |
 | `submodules-present` | Retry with `--submodules=reinit` |
-| `not-cow`, `cross-volume` | Different location, or ask about `--fallback` |
+| `not-cow`, `cross-volume` | Different location, or ask whether to use `--copy` or `--fallback` |
 | `git-failed` | Git's message follows, for example a branch name already in use |
 | `rollback-failed` | Run `git parhel doctor`, show the user, then `--fix` (step 6) |
 
@@ -164,7 +166,7 @@ them alone.
 
 ## Rules
 
-- Ask before: `--allow-dirty`, `--fallback`, `--force` on any git command,
+- Ask before: `--allow-dirty`, `--copy`, `--fallback`, `--force` on any git command,
   removing a worktree with ignored files the user created, and running
   anything destructive against services the copy shares with the source.
 - Never: hand-edit `.git/worktrees`, delete `.parhel-staging-*` folders, run
