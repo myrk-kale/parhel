@@ -853,6 +853,13 @@ impl CowFs for World {
 
     fn lock_exclusive(&self, path: &Path) -> Result<FileLock> {
         self.record(Call::Lock(path.into()), Step::WriteJournal)?;
+        // Like `flock(LOCK_NB)`: refused while another live process holds it.
+        if self.locked.borrow().contains(path) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: Resource temporarily unavailable", path.display()),
+            ));
+        }
         Ok(FileLock::detached())
     }
 
