@@ -16,8 +16,24 @@ use super::repo::GitEnv;
 
 /// What `setup` writes into `.parhel-store` for a user.
 pub fn marker_text(user: &str) -> String {
-    format!("format=1\nuser={user}\nimage=/var/lib/parhel/{user}.img\nunit=parhel-{user}.mount\n")
+    marker_text_for(user, Path::new(&format!("/var/lib/parhel/{user}.img")))
 }
+
+/// ... for an image kept somewhere else.
+pub fn marker_text_for(user: &str, image: &Path) -> String {
+    format!(
+        "format=1\nuser={user}\nimage={}\nunit=parhel-{user}.mount\n",
+        image.display()
+    )
+}
+
+/// What the binary is told about the room on every disk (`PARHEL_SPACE`, a hook that only
+/// exists with the `failpoints` feature): a terabyte with half of it free, wherever. The
+/// checks of how much room there is - `store-low-space` in `doctor`, `store-no-space` in
+/// `add` - would otherwise depend on the disk the tests happen to run on (the btrfs of the
+/// test container is 1 GiB). A test of what happens on a real small disk takes this off
+/// with `env_remove("PARHEL_SPACE")`.
+pub const PLENTY_OF_ROOM: &str = "/=1099511627776:549755813888";
 
 /// Name of the user running the tests.
 pub fn current_user() -> String {
@@ -40,12 +56,25 @@ pub struct TestStore {
 impl TestStore {
     /// A store inside `base` (a directory on btrfs): marker, `baselines/`, `worktrees/`.
     pub fn new(base: &Path) -> Self {
+        Self::with_marker(base, None)
+    }
+
+    /// ... whose marker says that the image lives at `image`.
+    pub fn with_image(base: &Path, image: &Path) -> Self {
+        Self::with_marker(base, Some(image))
+    }
+
+    fn with_marker(base: &Path, image: Option<&Path>) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("parhel-store-")
             .tempdir_in(base)
             .unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
-        fs::write(root.join(".parhel-store"), marker_text(&current_user())).unwrap();
+        let marker = match image {
+            Some(image) => marker_text_for(&current_user(), image),
+            None => marker_text(&current_user()),
+        };
+        fs::write(root.join(".parhel-store"), marker).unwrap();
         fs::create_dir(root.join("baselines")).unwrap();
         fs::create_dir(root.join("worktrees")).unwrap();
         Self { _dir: dir, root }
@@ -122,7 +151,8 @@ pub fn parhel_store_cmd<S: AsRef<OsStr>>(
     store: &TestStore,
 ) -> Command {
     let mut cmd = parhel_cmd(env, cwd, args);
-    cmd.env("PARHEL_STORE", &store.root);
+    cmd.env("PARHEL_STORE", &store.root)
+        .env("PARHEL_SPACE", PLENTY_OF_ROOM);
     cmd
 }
 

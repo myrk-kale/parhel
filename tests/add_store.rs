@@ -21,6 +21,7 @@ use common::store::*;
 use common::volume::{MountedFs, test_mount};
 use common::*;
 use rstest::rstest;
+use serial_test::serial;
 
 const MIB: usize = 1 << 20;
 const SIGINT: i32 = 2;
@@ -1185,10 +1186,15 @@ fn is32_xattrs_acls_and_mtimes_survive_the_baseline_and_the_clone() {
     );
 }
 
+// (I-S33, I-S33b and I-S42 share the one small btrfs: they run one at a time.)
 // I-S33: the store fills up while the first sync copies (a 128 MiB btrfs, 192 MiB of
-// data): the run fails with the system's words, nothing of it remains, the baseline is
-// left usable, and a smaller source works right after.
+// data) - the estimate said there was room, as it can when something else writes at the
+// same time (the room check is told so with PARHEL_SPACE; I-S33b is the check itself):
+// the run fails with the system's words, nothing of it remains, the baseline is left
+// usable, and a smaller source works right after.
 #[test]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+#[serial(small_btrfs)]
 fn is33_a_full_store_fails_cleanly_and_recovers() {
     let Some(ext4) = test_mount(MountedFs::Ext4) else {
         return;
@@ -1649,4 +1655,150 @@ fn is41_doctor_fix_leaves_the_symlink_of_a_run_in_progress() {
     assert_eq!(fs::read_link(&dest).unwrap(), w.store.only_worktree());
     let out = parhel_store(&w.sb.env, &w.src.root, &["doctor"], &w.store);
     assert_success(&out);
+}
+
+/// 192 MiB of ignored blobs in the project, more than the 128 MiB btrfs can take.
+fn big_project(sb: &Sandbox) -> TestRepo {
+    let src = project(sb);
+    src.ignore(&["blobs/"]);
+    for i in 0..3 {
+        write_blob(&src.path(format!("blobs/b{i}.bin")), 64 * MIB, i);
+    }
+    src
+}
+
+// I-S33b: the same store, with nobody telling the binary there is room: it measures
+// (the whole tree for a first sync, plus a margin), finds that the store cannot take it,
+// and refuses with `store-no-space` before it has copied a byte: no baseline tree, no
+// `meta`, no staging, no registration, no branch. With less to copy it works.
+#[test]
+#[serial(small_btrfs)]
+fn is33b_a_store_too_small_for_the_mirror_is_refused_before_anything_is_copied() {
+    let Some(ext4) = test_mount(MountedFs::Ext4) else {
+        return;
+    };
+    let Some(small) = test_mount(MountedFs::SmallBtrfs) else {
+        return;
+    };
+    let sb = Sandbox::new_in(&ext4);
+    let store = TestStore::new(&small);
+    let src = big_project(&sb);
+    let dest = sb.path("wt");
+    let args = add_args(&dest, &["--new-branch", "f"]);
+    let out = parhel_store_cmd(&sb.env, &src.root, &args, &store)
+        .env_remove("PARHEL_SPACE")
+        .output()
+        .unwrap();
+    assert_error(&out, "store-no-space");
+    let said = stderr(&out);
+    assert!(said.contains(store.root.to_str().unwrap()), "{said}");
+    assert!(said.contains("--copy"), "{said}");
+    assert!(
+        !said.contains("No space left"),
+        "refused up front, not by the disk: {said}"
+    );
+    for baseline in store.baselines() {
+        assert!(!baseline.join("tree").exists(), "{}", baseline.display());
+        assert!(!baseline.join("meta").exists(), "{}", baseline.display());
+    }
+    assert!(fs::symlink_metadata(&dest).is_err());
+    assert_eq!(src.worktree_paths(), vec![src.root.clone()]);
+    assert_eq!(src.branch_tip("f"), None);
+    assert_eq!(store.worktrees(), Vec::<PathBuf>::new());
+    store.assert_no_staging();
+    assert_no_staging(&[&sb.root]);
+
+    fs::remove_dir_all(src.path("blobs")).unwrap();
+    let out = parhel_store_cmd(&sb.env, &src.root, &args, &store)
+        .env_remove("PARHEL_SPACE")
+        .output()
+        .unwrap();
+    assert_success(&out);
+    TestRepo::open(&sb.env, &dest).assert_clean();
+}
+
+// I-S42: the disk that holds the store's image is the one that runs out first: the store
+// is roomy (btrfs, 1 GiB) but its image - as the marker says - lives on the 128 MiB one.
+// The sparse image would grow into it and the disk would fill under the filesystem
+// inside; the run is refused up front, naming the image.
+#[test]
+#[serial(small_btrfs)]
+fn is42_a_disk_too_small_for_the_image_to_grow_is_refused() {
+    let Some(ext4) = test_mount(MountedFs::Ext4) else {
+        return;
+    };
+    let Some(btrfs) = test_mount(MountedFs::Btrfs) else {
+        return;
+    };
+    let Some(small) = test_mount(MountedFs::SmallBtrfs) else {
+        return;
+    };
+    let sb = Sandbox::new_in(&ext4);
+    let image = small.join("images").join("alice.img");
+    let store = TestStore::with_image(&btrfs, &image);
+    let src = big_project(&sb);
+    let dest = sb.path("wt");
+    let out = parhel_store_cmd(
+        &sb.env,
+        &src.root,
+        &add_args(&dest, &["--new-branch", "f"]),
+        &store,
+    )
+    .env_remove("PARHEL_SPACE")
+    .output()
+    .unwrap();
+    assert_error(&out, "store-no-space");
+    let said = stderr(&out);
+    assert!(said.contains(image.to_str().unwrap()), "{said}");
+    assert!(said.contains("sparse"), "{said}");
+    for baseline in store.baselines() {
+        assert!(!baseline.join("tree").exists(), "{}", baseline.display());
+    }
+    assert!(fs::symlink_metadata(&dest).is_err());
+    assert_eq!(src.branch_tip("f"), None);
+    store.assert_no_staging();
+}
+
+// I-S43: what `doctor` says about room does not depend on the disk the test happens to run
+// on: the room is told to the binary (PARHEL_SPACE, a hook of the failpoints build), so the
+// quiet of I-S24 is not luck and the warning is tested on purpose - for the store and for
+// the disk of the image, which the marker names.
+#[test]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn is43_doctor_low_space_is_told_not_found_by_luck() {
+    let Some(w) = world() else { return };
+    let root = w.store.root.display().to_string();
+    let doctor = |told: String| {
+        parhel_store_cmd(&w.sb.env, &w.src.root, &["doctor"], &w.store)
+            .env("PARHEL_SPACE", told)
+            .output()
+            .unwrap()
+    };
+    let out = doctor(common::store::PLENTY_OF_ROOM.to_owned());
+    assert_success(&out);
+    assert!(stdout(&out).contains("no issues"), "{}", stdout(&out));
+
+    let out = doctor(format!(
+        "{};{root}=1000000:50000",
+        common::store::PLENTY_OF_ROOM
+    ));
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let said = stdout(&out);
+    assert!(said.contains("store-low-space"), "{said}");
+    assert!(
+        said.contains(&format!("{root} has 50000 of 1000000")),
+        "{said}"
+    );
+
+    let out = doctor(format!(
+        "{};/var/lib/parhel=1000000:1000",
+        common::store::PLENTY_OF_ROOM
+    ));
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let said = stdout(&out);
+    assert!(said.contains("store-low-space"), "{said}");
+    assert!(
+        said.contains("/var/lib/parhel has 1000 of 1000000"),
+        "{said}"
+    );
 }

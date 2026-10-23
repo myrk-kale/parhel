@@ -435,6 +435,10 @@ pub(crate) fn is_writable(path: &Path) -> Result<bool> {
 // The statvfs fields are 32 or 64 bits wide depending on the target.
 #[allow(clippy::useless_conversion)]
 pub(crate) fn space(path: &Path) -> Result<Space> {
+    #[cfg(feature = "failpoints")]
+    if let Some(space) = space_override(path) {
+        return Ok(space);
+    }
     let mut last = None;
     for candidate in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         let c = c_path(candidate)?;
@@ -462,6 +466,43 @@ pub(crate) fn space(path: &Path) -> Result<Space> {
         || Error::new(ErrorCode::Io, "no path to measure"),
         |(p, e)| io_error(p, &e),
     ))
+}
+
+/// `PARHEL_SPACE` (only with the `failpoints` feature): `<prefix>=<total>:<free>;...` in
+/// bytes, the free room of every path under `<prefix>` (the longest prefix wins), as if the
+/// disk under it were that full. Lets a test say how much room there is without filling a
+/// disk, and keeps the tests of what `doctor` says about low space from depending on the
+/// machine they run on.
+#[cfg(feature = "failpoints")]
+fn space_override(path: &Path) -> Option<Space> {
+    let spec = std::env::var("PARHEL_SPACE").ok()?;
+    pick_space(&parse_space_overrides(&spec), path)
+}
+
+#[cfg(any(feature = "failpoints", test))]
+fn parse_space_overrides(spec: &str) -> Vec<(PathBuf, Space)> {
+    spec.split(';')
+        .filter_map(|item| {
+            let (prefix, amounts) = item.trim().rsplit_once('=')?;
+            let (total, free) = amounts.split_once(':')?;
+            Some((
+                PathBuf::from(prefix),
+                Space {
+                    total: total.trim().parse().ok()?,
+                    free: free.trim().parse().ok()?,
+                },
+            ))
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "failpoints", test))]
+fn pick_space(entries: &[(PathBuf, Space)], path: &Path) -> Option<Space> {
+    entries
+        .iter()
+        .filter(|(prefix, _)| path.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.components().count())
+        .map(|(_, space)| *space)
 }
 
 pub(crate) fn lock_exclusive(path: &Path) -> Result<FileLock> {
@@ -734,6 +775,45 @@ mod tests {
         fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(below.unwrap().total, here.total);
         assert_eq!(missing.unwrap().total, here.total);
+    }
+
+    // U-FS-31b: the test hook that says how much room a path has (only compiled with the
+    // failpoints feature): `<prefix>=<total>:<free>`, longest prefix wins, junk is skipped.
+    #[test]
+    fn the_space_override_picks_the_longest_prefix() {
+        let entries =
+            parse_space_overrides("/=1000:900; /var/lib/parhel=100:5 ;junk;/x=a:b;/with=eq=7:3");
+        let at = |p: &str| pick_space(&entries, Path::new(p));
+        assert_eq!(
+            at("/home/me"),
+            Some(Space {
+                total: 1000,
+                free: 900
+            })
+        );
+        assert_eq!(
+            at("/var/lib/parhel/alice.img"),
+            Some(Space {
+                total: 100,
+                free: 5
+            })
+        );
+        assert_eq!(
+            at("/var/lib/parhelx"),
+            Some(Space {
+                total: 1000,
+                free: 900
+            })
+        );
+        assert_eq!(at("/with=eq/y"), Some(Space { total: 7, free: 3 }));
+        assert_eq!(
+            at("/x"),
+            Some(Space {
+                total: 1000,
+                free: 900
+            })
+        );
+        assert_eq!(pick_space(&[], Path::new("/a")), None);
     }
 
     // U-FS-32: a flush succeeds on a directory and fails, naming it, on a missing one.

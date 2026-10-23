@@ -180,6 +180,24 @@ pub struct EntryMeta {
     pub link_target: Option<PathBuf>,
 }
 
+/// `1073741824` as `1.0 GiB`.
+#[must_use]
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Contents of a baseline's `meta`: the source it mirrors, whether a sync is under way
 /// (`syncing`) or finished (`synced`), when that was in seconds, and `sync_start_ns`, the
 /// moment (ns since the epoch) the last sync that ran to its end *began*. That moment is

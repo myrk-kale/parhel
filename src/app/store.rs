@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::exclusions::Exclusions;
 use crate::domain::store::{
-    EntryKind, EntryMeta, MARKER_FILE, Marker, Store, StoreState, SyncAction, sync_action,
+    EntryKind, EntryMeta, MARKER_FILE, Marker, Store, StoreState, SyncAction, human_size,
+    sync_action,
 };
 use crate::domain::{Error, ErrorCode, Result};
 use crate::ports::CowFs;
@@ -128,6 +129,106 @@ pub fn first_sync_size(
     Ok(Some(total))
 }
 
+/// With this much free on both filesystems an incremental sync is not measured first
+/// (measuring walks the whole tree once more to learn what the sync will copy, for
+/// nothing).
+pub const ROOM_PLENTY: u64 = 64 << 30;
+
+/// What a sync that will copy `bytes` needs: `bytes`, a sixteenth for what the filesystem
+/// adds on its own (metadata, a rewritten file's old extents while a worktree still holds
+/// them), and room to write at all.
+#[must_use]
+pub fn bytes_with_margin(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes / 16).saturating_add(32 << 20)
+}
+
+/// Refuse (`store-no-space`) before anything is written when mirroring `source` into the
+/// store would not fit: in the disk that holds the store's image, which the sparse image
+/// grows into (a disk that fills under it makes the filesystem inside fail in ways nothing
+/// recovers from cleanly), or in the store itself.
+///
+/// `first_sync` is what [`first_sync_size`] said (the whole tree); for a later sync the
+/// size of what it would copy is found by a pass that only looks ([`Sync::dry_run`]), but
+/// only when the room is not plentiful. What cannot be measured is not a reason to refuse.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_room(
+    fs: &dyn CowFs,
+    store: &Store,
+    first_sync: Option<u64>,
+    source: &Path,
+    baseline: &Path,
+    exclusions: &Exclusions,
+    last_sync: Option<i128>,
+    interrupted: &AtomicBool,
+) -> Result<()> {
+    let image = &store.marker.image;
+    let disk = image
+        .parent()
+        .and_then(|dir| fs.space(dir).ok())
+        .map(|space| (image, space));
+    let inside = fs.space(&store.root).ok().map(|space| (&store.root, space));
+    let Some(tightest) = [disk, inside]
+        .iter()
+        .flatten()
+        .map(|(_, space)| space.free)
+        .min()
+    else {
+        return Ok(());
+    };
+    let to_copy = match first_sync {
+        Some(bytes) => bytes,
+        None if tightest >= ROOM_PLENTY => return Ok(()),
+        None => {
+            let mut walk = Sync {
+                dry_run: true,
+                ..Sync::new(fs, source, baseline, exclusions, interrupted, last_sync)
+            };
+            walk.check_interrupt()?;
+            walk.entry(Path::new(""))?;
+            walk.report.bytes
+        }
+    };
+    let need = bytes_with_margin(to_copy);
+    let short = |what: &str, free: u64, advice: &str| {
+        Error::new(
+            ErrorCode::StoreNoSpace,
+            format!(
+                "not enough room to mirror `{}` into the store: it needs about {} ({} to copy, \
+                 plus a margin) and {what} has {} free. {advice} `--copy` and `--fallback` do \
+                 not use the store",
+                source.display(),
+                human_size(need),
+                human_size(to_copy),
+                human_size(free),
+            ),
+        )
+    };
+    if let Some((image, space)) = disk {
+        if space.free < need {
+            return Err(short(
+                &format!(
+                    "the disk that holds the store's image `{}`",
+                    image.display()
+                ),
+                space.free,
+                "The image is a sparse file that grows into that disk, and a disk that fills \
+                 under it can leave the store unusable: free some space there.",
+            ));
+        }
+    }
+    if let Some((root, space)) = inside {
+        if space.free < need {
+            return Err(short(
+                &format!("the store `{}`", root.display()),
+                space.free,
+                "Remove worktrees you no longer need (`git worktree remove`, then `git parhel \
+                 doctor --fix`) or make the store bigger.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The one-line notice printed before a first sync that copies `bytes`, if it is big
 /// enough to be worth one.
 #[must_use]
@@ -164,15 +265,7 @@ pub fn sync_baseline(
     interrupted: &AtomicBool,
     last_sync: Option<i128>,
 ) -> Result<SyncReport> {
-    let mut sync = Sync {
-        fs,
-        source,
-        baseline,
-        exclusions,
-        interrupted,
-        since: last_sync,
-        report: SyncReport::default(),
-    };
+    let mut sync = Sync::new(fs, source, baseline, exclusions, interrupted, last_sync);
     sync.check_interrupt()?;
     sync.entry(Path::new(""))?;
     Ok(sync.report)
@@ -185,10 +278,32 @@ struct Sync<'a> {
     exclusions: &'a Exclusions,
     interrupted: &'a AtomicBool,
     since: Option<i128>,
+    /// Only look: decide and count what the sync would do, change nothing.
+    dry_run: bool,
     report: SyncReport,
 }
 
-impl Sync<'_> {
+impl<'a> Sync<'a> {
+    fn new(
+        fs: &'a dyn CowFs,
+        source: &'a Path,
+        baseline: &'a Path,
+        exclusions: &'a Exclusions,
+        interrupted: &'a AtomicBool,
+        since: Option<i128>,
+    ) -> Self {
+        Self {
+            fs,
+            source,
+            baseline,
+            exclusions,
+            interrupted,
+            since,
+            dry_run: false,
+            report: SyncReport::default(),
+        }
+    }
+
     fn check_interrupt(&self) -> Result<()> {
         if self.interrupted.load(Ordering::SeqCst) {
             return Err(Error::new(
@@ -204,7 +319,7 @@ impl Sync<'_> {
     /// changes its parent directory).
     fn entry(&mut self, rel: &Path) -> Result<bool> {
         self.check_interrupt()?;
-        if !rel.as_os_str().is_empty() {
+        if !self.dry_run && !rel.as_os_str().is_empty() {
             crate::failpoint!("sync_entry", rel);
         }
         let Some(source) = self.fs.stat_within(self.source, rel)? else {
@@ -223,7 +338,15 @@ impl Sync<'_> {
             }
         }
         if action != SyncAction::Keep {
-            self.report.bytes += self.fs.mirror_entry(self.source, rel, &dst)?;
+            self.report.bytes += if self.dry_run {
+                if source.kind == EntryKind::File {
+                    source.size
+                } else {
+                    0
+                }
+            } else {
+                self.fs.mirror_entry(self.source, rel, &dst)?
+            };
             if source.kind != EntryKind::Dir {
                 self.report.copied += 1;
             }
@@ -232,7 +355,7 @@ impl Sync<'_> {
         if source.kind == EntryKind::Dir {
             touched |=
                 self.children(rel, held.as_ref().filter(|_| action != SyncAction::Replace))?;
-            if touched {
+            if touched && !self.dry_run {
                 self.check_interrupt()?;
                 self.fs.mirror_dir_meta(self.source, rel, &dst)?;
             }
@@ -283,6 +406,10 @@ impl Sync<'_> {
     /// Remove the baseline entry `rel`: a directory whole, anything else by name.
     fn remove(&mut self, rel: &Path, held: Option<&EntryMeta>) -> Result<()> {
         let Some(held) = held else { return Ok(()) };
+        if self.dry_run {
+            self.report.deleted += 1;
+            return Ok(());
+        }
         let path = self.baseline.join(rel);
         if held.kind == EntryKind::Dir {
             self.fs.remove_dir_all(&path)?;
@@ -301,6 +428,7 @@ mod tests {
     use crate::domain::ErrorCode;
     use crate::domain::exclusions::ExclusionInput;
     use crate::domain::store::{Marker, Store};
+    use crate::ports::Space;
     use rstest::rstest;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -629,6 +757,137 @@ mod tests {
         for rel in ["node_modules/big", "src/main.rs"] {
             assert!(mirrored.contains(&at(rel)), "{rel}: {mirrored:?}");
         }
+    }
+
+    // ------------------------------------------------------------------ room
+
+    const IMAGE_DIR: &str = "/var/lib/parhel";
+
+    fn store() -> Store {
+        Store {
+            root: p(STORE),
+            marker: Marker {
+                user: "alice".into(),
+                image: p("/var/lib/parhel/alice.img"),
+                unit: "parhel-alice.mount".into(),
+            },
+        }
+    }
+
+    fn free(w: &World, at: &str, total: u64, free: u64) {
+        w.spaces.borrow_mut().push((p(at), Space { total, free }));
+    }
+
+    fn room(w: &World, first_sync: Option<u64>) -> Result<()> {
+        ensure_room(
+            w,
+            &store(),
+            first_sync,
+            Path::new("/w/repo"),
+            &base(),
+            &exclusions(),
+            Some(LAST_SYNC),
+            &w.interrupted,
+        )
+    }
+
+    fn no_space(result: Result<()>) -> String {
+        let err = result.expect_err("expected store-no-space");
+        assert_eq!(err.code, ErrorCode::StoreNoSpace, "{err}");
+        err.message
+    }
+
+    // U-STO-99: the sparse image grows into the disk that holds it, and a disk that fills
+    // under it makes the filesystem inside fail in ways nothing recovers from cleanly.
+    // A first sync is measured by its estimate (what it will copy, plus a margin) against
+    // the free room of that disk - found from the image's place in the marker - and of the
+    // store, before anything is written; the message says which one is short.
+    #[test]
+    fn a_first_sync_larger_than_the_disk_is_refused_naming_the_disk() {
+        let w = world();
+        free(&w, IMAGE_DIR, 100 * GIB, 2 * GIB);
+        let said = no_space(room(&w, Some(3 * GIB)));
+        assert!(said.contains("/var/lib/parhel/alice.img"), "{said}");
+        assert!(said.contains("/w/repo"), "{said}");
+        assert!(said.contains("GiB"), "{said}");
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-99b: ... and the store itself.
+    #[test]
+    fn a_first_sync_larger_than_the_store_is_refused_naming_the_store() {
+        let w = world();
+        free(&w, STORE, 100 * GIB, GIB);
+        let said = no_space(room(&w, Some(3 * GIB)));
+        assert!(said.contains(STORE), "{said}");
+        assert!(!said.contains("alice.img"), "{said}");
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-99c: the margin is part of the need, to the byte.
+    #[test]
+    fn the_need_is_the_estimate_plus_the_margin() {
+        let wanted = bytes_with_margin(GIB);
+        assert!(wanted > GIB && wanted < 2 * GIB, "{wanted}");
+        assert!(
+            bytes_with_margin(0) > 0,
+            "even an empty sync needs room to write"
+        );
+        let w = world();
+        free(&w, IMAGE_DIR, 100 * GIB, wanted);
+        free(&w, STORE, 100 * GIB, wanted);
+        room(&w, Some(GIB)).unwrap();
+        let w = world();
+        free(&w, IMAGE_DIR, 100 * GIB, wanted - 1);
+        free(&w, STORE, 100 * GIB, wanted);
+        no_space(room(&w, Some(GIB)));
+        let w = world();
+        free(&w, IMAGE_DIR, 100 * GIB, wanted);
+        free(&w, STORE, 100 * GIB, wanted - 1);
+        no_space(room(&w, Some(GIB)));
+    }
+
+    // U-STO-99d: a later sync copies a difference: what counts is the size of the entries
+    // it would copy - by a pass that only looks - not the size of the tree or the
+    // baseline. A tree that did not change needs only the margin.
+    #[test]
+    fn a_later_sync_is_measured_by_what_it_would_copy() {
+        let w = synced();
+        free(&w, IMAGE_DIR, 100 * GIB, 4 * GIB);
+        free(&w, STORE, 100 * GIB, 4 * GIB);
+        room(&w, None).unwrap();
+        assert_no_mutation(&w);
+
+        // A 5 GiB file changed since the baseline was made.
+        let mut big = w
+            .stat_within(Path::new("/w/repo"), Path::new("node_modules/big"))
+            .unwrap()
+            .unwrap();
+        big.size = 5 * GIB;
+        w.meta.borrow_mut().insert(src("node_modules/big"), big);
+        let said = no_space(room(&w, None));
+        assert!(said.contains("alice.img") || said.contains(STORE), "{said}");
+        assert_no_mutation(&w);
+
+        // A change that fits.
+        let mut small = w
+            .stat_within(Path::new("/w/repo"), Path::new("node_modules/big"))
+            .unwrap()
+            .unwrap();
+        small.size = GIB;
+        w.meta.borrow_mut().insert(src("node_modules/big"), small);
+        room(&w, None).unwrap();
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-99e: where there is no telling (the disk of the image cannot be measured) the
+    // check does not invent a refusal.
+    #[test]
+    fn what_cannot_be_measured_is_not_a_reason_to_refuse() {
+        let w = world();
+        w.space_unavailable.set(true);
+        room(&w, Some(100 * GIB)).unwrap();
+        room(&w, None).unwrap();
     }
 
     // U-STO-34
