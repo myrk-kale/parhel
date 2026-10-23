@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- Linux packages: a `.deb` (`parhel_<version>_amd64.deb`, `parhel_<version>_arm64.deb`)
+- Linux packages: a `.deb` (`parhel_<version>-1_amd64.deb`, `parhel_<version>-1_arm64.deb`)
   and an `.rpm` (`parhel-<version>-1.x86_64.rpm`, `parhel-<version>-1.aarch64.rpm`)
   for the static musl builds. They install `/usr/bin/git-parhel` and the man
   pages, require `git` and recommend `btrfs-progs`. Each has a `.sha256` file and a

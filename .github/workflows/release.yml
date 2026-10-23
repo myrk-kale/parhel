@@ -198,7 +198,7 @@ jobs:
             expected+=("parhel-${GITHUB_REF_NAME}-${target}.tar.gz")
           done
           expected+=(
-            "parhel_${version}_amd64.deb" "parhel_${version}_arm64.deb"
+            "parhel_${version}-1_amd64.deb" "parhel_${version}-1_arm64.deb"
             "parhel-${version}-1.x86_64.rpm" "parhel-${version}-1.aarch64.rpm"
           )
           for file in "${expected[@]}"; do

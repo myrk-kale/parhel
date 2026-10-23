@@ -2,7 +2,7 @@
 # Install a .deb or .rpm in a container and check it, as a normal user.
 #
 #   scripts/test-package.sh <image> <package file>
-#   scripts/test-package.sh ubuntu:24.04 dist/parhel_0.3.0_amd64.deb
+#   scripts/test-package.sh ubuntu:24.04 dist/parhel_0.3.0-1_amd64.deb
 #   scripts/test-package.sh fedora:latest dist/parhel-0.3.0-1.x86_64.rpm
 #
 # The package manager resolves the dependencies (git) from the distribution's own
