@@ -7,6 +7,7 @@ pub mod cow;
 pub mod fiemap;
 pub mod fixtures;
 pub mod repo;
+pub mod store;
 pub mod volume;
 pub mod xattr;
 

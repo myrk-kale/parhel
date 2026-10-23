@@ -54,6 +54,9 @@ impl GitEnv {
                 self.global_config.clone().into(),
             ),
             ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            // A store that does not exist, so a developer's own `/parhel/<user>` can
+            // never change what a test sees. Tests of the store override it.
+            ("PARHEL_STORE".into(), self.home.join("no-store").into()),
             ("LC_ALL".into(), "C".into()),
             ("TZ".into(), "UTC".into()),
             ("PATH".into(), path),
