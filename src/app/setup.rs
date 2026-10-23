@@ -142,7 +142,7 @@ impl Places {
              What={image}\n\
              Where={root}\n\
              Type=btrfs\n\
-             Options=loop,discard,noatime\n\
+             Options=loop,discard,noatime,nosuid,nodev\n\
              \n\
              [Install]\n\
              WantedBy=local-fs.target\n",
@@ -166,7 +166,11 @@ pub fn setup(host: &dyn Host, request: &SetupRequest) -> Result<SetupOutcome> {
         return Err(not_root(request));
     }
     if !request.remove {
+        // Everything the run will start, before it creates anything: a tool that turns out
+        // to be missing in the middle leaves an image and a half-made store behind.
         require_tool(host, "mkfs.btrfs", "btrfs-progs")?;
+        require_tool(host, "blkid", "util-linux")?;
+        require_tool(host, "mount", "util-linux")?;
     }
     if !host.systemd_running() {
         return Err(Error::new(
@@ -272,6 +276,7 @@ fn account(host: &dyn Host, request: &SetupRequest) -> Result<UserInfo> {
             }
         },
     };
+    crate::domain::request::check_user_name(&name)?;
     host.user(&name)?.ok_or_else(|| {
         Error::new(
             ErrorCode::Usage,
@@ -746,7 +751,7 @@ mod tests {
         h.files.borrow_mut().insert(
             p(UNIT_FILE),
             "[Unit]\nDescription=parhel store for alice\n\n[Mount]\nWhat=/var/lib/parhel/alice.img\n\
-             Where=/parhel/alice\nType=btrfs\nOptions=loop,discard,noatime\n\n[Install]\n\
+             Where=/parhel/alice\nType=btrfs\nOptions=loop,discard,noatime,nosuid,nodev\n\n[Install]\n\
              WantedBy=local-fs.target\n"
                 .into(),
         );
@@ -812,6 +817,52 @@ mod tests {
         assert_eq!(err.code, ErrorCode::MissingTool, "{err}");
         assert!(err.message.contains("mkfs.btrfs"), "{}", err.message);
         assert!(err.message.contains("btrfs-progs"), "{}", err.message);
+        assert_no_mutation(&h);
+    }
+
+    // U-SET-03b: every program setup runs is checked before anything is created: a
+    // `blkid` or `mount` that turns out to be missing in the middle would leave an image
+    // (and a half-made store) behind.
+    #[rstest]
+    #[case::blkid("blkid", "util-linux")]
+    #[case::mount("mount", "util-linux")]
+    fn missing_tools_are_found_before_anything_is_created(
+        #[case] tool: &str,
+        #[case] package: &str,
+    ) {
+        let h = FakeHost::default().without_tool(tool);
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MissingTool, "{err}");
+        assert!(err.message.contains(tool), "{}", err.message);
+        assert!(err.message.contains(package), "{}", err.message);
+        assert_no_mutation(&h);
+    }
+
+    // U-SET-09b: the user name ends up in paths, a unit file and a mount unit name; one
+    // that systemd would expand (`%`) or that is not an account name is refused, whether
+    // it was typed (`--user`) or inferred from `$SUDO_USER`.
+    #[rstest]
+    #[case::percent("a%b")]
+    #[case::uppercase("Alice")]
+    #[case::space("a b")]
+    #[case::backslash("a\\b")]
+    #[case::dots("../etc")]
+    fn account_names_that_become_something_else_are_refused(#[case] name: &str) {
+        let mut h = FakeHost::default();
+        h.users.push(crate::ports::UserInfo {
+            name: name.into(),
+            uid: 1500,
+            gid: 1500,
+        });
+        h.env.insert("SUDO_USER".into(), name.into());
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage, "{err}");
+        assert_no_mutation(&h);
+        let typed = SetupRequest {
+            user: Some(name.into()),
+            ..request()
+        };
+        assert_eq!(setup(&h, &typed).unwrap_err().code, ErrorCode::Usage);
         assert_no_mutation(&h);
     }
 
@@ -969,7 +1020,7 @@ mod tests {
             "What=/var/lib/parhel/alice.img",
             "Where=/parhel/alice",
             "Type=btrfs",
-            "Options=loop,discard,noatime",
+            "Options=loop,discard,noatime,nosuid,nodev",
             "WantedBy=local-fs.target",
         ] {
             assert!(lines.contains(&line), "unit lacks `{line}`:\n{unit}");
