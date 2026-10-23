@@ -1054,17 +1054,18 @@ fn mirror_io(root: &Path, rel: &Path, dst: &Path) -> std::result::Result<u64, Fa
     let (parent, name) = at_src(&shown, anchor::open_parent(root_fd.as_raw_fd(), rel))?;
     let st = at_src(&shown, anchor::stat_at(parent.as_raw_fd(), &name))?;
     let kind = kind_of_mode(st.st_mode);
+    // The mirror keeps the source's modes, read-only directories included: one that
+    // has to take an entry (a file, a link, a subdirectory) is opened for the owner (its
+    // mode comes back with the metadata the sync gives every directory it touched).
     match kind {
         Kind::Dir => {
+            at(dst, make_parent_writable(dst))?;
             mirror_dir(dst)?;
             return Ok(0);
         }
         Kind::Other => return Ok(0),
         _ => {}
     }
-    // The mirror keeps the source's modes, read-only directories included: one that
-    // has to take an entry is opened for the owner (its mode comes back with the
-    // metadata the sync gives every directory it touched).
     at(dst, make_parent_writable(dst))?;
     let temporary = temporary_name(dst);
     let copied = copy_leaf(
@@ -1374,6 +1375,22 @@ mod tests {
         fs::write(src.join("sub2"), b"y").unwrap();
         mirror(&src, Path::new("sub2"), &dst.join("sub/new")).unwrap();
         assert_eq!(fs::read(dst.join("sub/new")).unwrap(), b"y");
+
+        // ... and so does a new directory, in a mirrored directory that is read-only
+        // (`mkdir` there fails with EACCES for its owner as much as for anyone), and a
+        // file that became a directory (the caller removes the file, which leaves the
+        // parent read-only again, then asks for the directory).
+        fs::create_dir(src.join("fresh")).unwrap();
+        set_mode(&dst.join("sub"), 0o555);
+        mirror(&src, Path::new("fresh"), &dst.join("sub/fresh")).unwrap();
+        assert!(dst.join("sub/fresh").is_dir(), "a new directory");
+        set_mode(&dst.join("sub"), 0o555);
+        unix::remove_file(&dst.join("sub/new")).unwrap();
+        mirror(&src, Path::new("fresh"), &dst.join("sub/new")).unwrap();
+        assert!(
+            dst.join("sub/new").is_dir(),
+            "a file replaced by a directory"
+        );
         set_mode(&dst.join("sub"), 0o755);
     }
 
