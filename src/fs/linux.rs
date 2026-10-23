@@ -79,6 +79,8 @@ fn reflink_probe(dir: &Path) -> Option<bool> {
     // A block of data: a tail that is not block-aligned or an inline extent would
     // be refused by some filesystems for reasons that say nothing about reflinks.
     src.write_all_at(&[0u8; 4096], 0).ok()?;
+    // ZFS only clones data that has reached a transaction group.
+    src.sync_all().ok()?;
     match ficlone(&src, &dst) {
         Ok(()) => Some(true),
         Err(e) => match e.raw_os_error() {
@@ -129,6 +131,28 @@ fn filesystem_id(path: &Path, st: &libc::statfs, magic: u64, device: u64) -> u64
 /// Clone only where the filesystem is known to reflink (probe unavailable).
 fn reflinks_by_name(magic: u64) -> bool {
     matches!(magic, BTRFS_MAGIC | BCACHEFS_MAGIC)
+}
+
+/// What a failed `renameat2(RENAME_NOREPLACE)` into `to` means.
+fn rename_failure(to: &Path, e: &io::Error) -> Error {
+    match e.raw_os_error() {
+        Some(libc::EEXIST | libc::ENOTEMPTY) => Error::new(
+            ErrorCode::DestExists,
+            format!("destination `{}` already exists", to.display()),
+        ),
+        // Old kernels and some filesystems (FAT, older NFS, FUSE) lack the flag.
+        Some(libc::EINVAL | libc::ENOSYS) => Error::new(
+            ErrorCode::Io,
+            format!(
+                "cannot publish the worktree at `{}`: the kernel or the filesystem does not \
+                 support renameat2 with RENAME_NOREPLACE ({e}), which parhel needs to never \
+                 replace an existing destination; nothing was created, use a destination on \
+                 another filesystem",
+                to.display()
+            ),
+        ),
+        _ => io_error(to, e),
+    }
 }
 
 /// Sync the directory entry of a file just written.
@@ -226,14 +250,7 @@ impl CowFs for LinuxFs {
         if rc == 0 {
             return Ok(());
         }
-        let e = io::Error::last_os_error();
-        if matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) {
-            return Err(Error::new(
-                ErrorCode::DestExists,
-                format!("destination `{}` already exists", to.display()),
-            ));
-        }
-        Err(io_error(to, &e))
+        Err(rename_failure(to, &io::Error::last_os_error()))
     }
 
     fn remove_dir_all(&self, path: &Path) -> Result<()> {
@@ -1416,6 +1433,28 @@ mod tests {
             .args(["subvolume", "delete"])
             .arg(&sub)
             .output();
+    }
+
+    // U-LFS-44: a filesystem or kernel without RENAME_NOREPLACE (`EINVAL`, `ENOSYS`) is
+    // explained, not reported as a bare errno; a name clash stays `dest-exists`.
+    #[test]
+    fn rename_noreplace_unsupported_is_explained() {
+        let to = Path::new("/w/dest");
+        for errno in [libc::EINVAL, libc::ENOSYS] {
+            let err = rename_failure(to, &io::Error::from_raw_os_error(errno));
+            assert_eq!(err.code, ErrorCode::Io, "errno {errno}");
+            assert!(err.message.contains("RENAME_NOREPLACE"), "{}", err.message);
+            assert!(err.message.contains("/w/dest"), "{}", err.message);
+            assert!(
+                err.message.contains("another filesystem"),
+                "{}",
+                err.message
+            );
+        }
+        let clash = rename_failure(to, &io::Error::from_raw_os_error(libc::EEXIST));
+        assert_eq!(clash.code, ErrorCode::DestExists);
+        let other = rename_failure(to, &io::Error::from_raw_os_error(libc::EACCES));
+        assert_eq!(other.code, ErrorCode::PermissionDenied);
     }
 
     // U-LFS-42: the platform-independent operations are wired to the shared helpers.
