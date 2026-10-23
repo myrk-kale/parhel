@@ -84,6 +84,55 @@ jobs:
       - name: Test suite (with failpoints)
         run: cargo test --features failpoints --no-fail-fast
 
+  setup-linux:
+    name: setup (Linux)
+    runs-on: ubuntu-24.04
+    # `git parhel setup` creates a loop-mounted btrfs image, a systemd unit and
+    # /parhel/<user> and needs root, so its tests (tests/setup.rs) change the machine and
+    # run only here: PARHEL_TEST_SETUP=1. They run as the ordinary runner user, like the
+    # product: the few commands that need root (the binary's `setup`, systemctl, rm/mv of
+    # the protected image) go through `sudo -n` inside the tests. Running the whole test
+    # binary under sudo instead would make root create the worktrees and hide permission
+    # bugs, and cargo would not find the toolchain. Needs systemd as PID 1 (the hosted
+    # runners have it) and passwordless sudo.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install btrfs-progs and e2fsprogs (chattr)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs python3-venv
+      - name: What setup needs from the machine
+        shell: bash
+        run: |
+          id
+          echo "PID 1: $(ps -p 1 -o comm=)"
+          systemctl --version | head -n 1
+          sudo -n true
+          sudo modprobe loop btrfs || true
+          grep -w btrfs /proc/filesystems
+          command -v mkfs.btrfs chattr systemd-escape
+      - name: Mount the ext4 filesystem for the sources (shared script)
+        # The same script as the test job: also prints PARHEL_TEST_EXT4 and friends.
+        shell: bash
+        run: |
+          sudo modprobe loop btrfs xfs || true
+          sudo scripts/mount-test-filesystems.sh "$USER" | tee -a "$GITHUB_ENV"
+      - name: Build the tests (as the ordinary user)
+        run: cargo test --features failpoints --test setup --no-run
+      - name: Setup tests (sudo, systemd, loop mounts)
+        env:
+          PARHEL_TEST_SETUP: "1"
+        # One at a time: they share /parhel/<user>.
+        run: cargo test --features failpoints --test setup --no-fail-fast -- --test-threads=1
+      - name: Leftovers (should be none)
+        if: always()
+        shell: bash
+        run: |
+          sudo systemctl list-units --all 'parhel-*' --no-legend || true
+          ls -la /var/lib/parhel /parhel 2>&1 || true
+
   linux-musl:
     name: build linux musl (${{ matrix.target }})
     needs: lint
