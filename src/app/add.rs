@@ -87,11 +87,15 @@ struct Plan {
 /// Run `git parhel add`.
 pub fn add(env: &Env<'_>, request: &AddRequest) -> Result<AddOutcome> {
     let plan = validate(env, request)?;
-    if let Some(problem) = cow_problem(env, &plan)? {
-        if !request.fallback {
-            return Err(problem);
+    // `--copy` needs neither copy-on-write nor a common volume: the staging
+    // directory, the only thing that must share the destination's volume, always does.
+    if !request.copy {
+        if let Some(problem) = cow_problem(env, &plan)? {
+            if !request.fallback {
+                return Err(problem);
+            }
+            return fallback(env, request, &plan, &problem);
         }
-        return fallback(env, request, &plan, &problem);
     }
     crate::failpoint!("after_validate");
     transaction(env, request, &plan)
@@ -107,16 +111,31 @@ fn validate(env: &Env<'_>, request: &AddRequest) -> Result<Plan> {
         ));
     }
     let raw = paths::resolve_destination(env.cwd, &request.destination);
-    if raw.to_str().is_none() {
+    let name = paths::destination_basename(&raw)?.to_owned();
+    // APFS cannot store names that are not UTF-8; Linux filesystems store any bytes.
+    if raw.to_str().is_none() && cfg!(target_os = "macos") {
         return Err(Error::new(
             ErrorCode::InvalidPath,
             format!(
-                "destination `{}` is not valid UTF-8, which APFS cannot store",
+                "destination `{}` is not valid UTF-8, which this filesystem cannot store",
                 raw.display()
             ),
         ));
     }
-    let name = paths::destination_basename(&raw)?.to_owned();
+    // The branch git creates from the basename must be a name parhel can journal.
+    if request.branch == BranchMode::Default
+        && request.reference.is_none()
+        && name.to_str().is_none()
+    {
+        return Err(Error::new(
+            ErrorCode::InvalidPath,
+            format!(
+                "destination name `{}` is not valid UTF-8, so it cannot name the implicit \
+                 branch; pass --new-branch, --branch or --detach",
+                name.to_string_lossy()
+            ),
+        ));
+    }
     // Without a branch flag git turns the basename into a `git branch` argument.
     if request.branch == BranchMode::Default
         && request.reference.is_none()
@@ -271,7 +290,9 @@ fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
         Error::new(
             ErrorCode::NotCow,
             format!(
-                "copy-on-write is not available on {fs_type} at `{}`; pass --fallback for a regular worktree",
+                "copy-on-write is not available on {fs_type} at `{}`; pass --copy to copy \
+                 every file in full (uses disk space) or --fallback for a regular worktree \
+                 without the copied files",
                 path.display()
             ),
         )
@@ -284,7 +305,9 @@ fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
         Some(Error::new(
             ErrorCode::CrossVolume,
             format!(
-                "`{}` and `{}` are on different volumes; pass --fallback for a regular worktree",
+                "`{}` and `{}` are on different volumes; pass --copy to copy every file in \
+                 full (uses disk space) or --fallback for a regular worktree without the \
+                 copied files",
                 plan.repo.toplevel.display(),
                 plan.parent.display()
             ),
@@ -349,7 +372,7 @@ fn transaction(env: &Env<'_>, request: &AddRequest, plan: &Plan) -> Result<AddOu
         ))
     });
     match assembled {
-        Ok(report) => publish(env, plan, &staging, &report),
+        Ok(report) => publish(env, request, plan, &staging, &report),
         Err(cause) => {
             #[cfg(feature = "failpoints")]
             let _ = crate::failpoint::eval(crate::failpoint::ROLLBACK_FAILPOINT);
@@ -400,7 +423,7 @@ fn assemble(
         exclude_submodules: request.submodules == SubmodulePolicy::Reinit,
         user_excluded: git.parhelignored(&repo.toplevel)?,
     });
-    clone_tree(env, &repo.toplevel, &staged, &exclusions)?;
+    clone_tree(env, &repo.toplevel, &staged, &exclusions, request.copy)?;
     crate::failpoint!("after_clone");
     check_interrupt(env)?;
 
@@ -507,8 +530,15 @@ fn register(
     Ok(())
 }
 
-/// Clone the source into `staged`, minus `exclusions`.
-fn clone_tree(env: &Env<'_>, source: &Path, staged: &Path, exclusions: &Exclusions) -> Result<()> {
+/// Clone the source into `staged`, minus `exclusions` (copy every file in full
+/// instead with `copy`).
+fn clone_tree(
+    env: &Env<'_>,
+    source: &Path,
+    staged: &Path,
+    exclusions: &Exclusions,
+    copy: bool,
+) -> Result<()> {
     let fs = env.fs;
     let ops = clone_plan::plan(&Lister { fs, root: source }, exclusions)?;
     for (i, op) in ops.iter().enumerate() {
@@ -517,6 +547,7 @@ fn clone_tree(env: &Env<'_>, source: &Path, staged: &Path, exclusions: &Exclusio
                 fs.create_dir(&staged.join(rel))?;
                 fs.copy_mode(&source.join(rel), &staged.join(rel))?;
             }
+            CloneOp::Clone(rel) if copy => fs.copy_entry(&source.join(rel), &staged.join(rel))?,
             CloneOp::Clone(rel) => fs.clone_entry(&source.join(rel), &staged.join(rel))?,
         }
         if i == 0 {
@@ -643,6 +674,7 @@ fn gitfile_link(
 /// After the exclusive rename the worktree is ours and valid: never roll it back.
 fn publish(
     env: &Env<'_>,
+    request: &AddRequest,
     plan: &Plan,
     staging: &Path,
     report: &RelocationReport,
@@ -715,7 +747,11 @@ fn publish(
     Ok(AddOutcome {
         destination: plan.destination.clone(),
         head: env.git.head(&plan.destination)?,
-        strategy: Strategy::CopyOnWrite,
+        strategy: if request.copy {
+            Strategy::Copy
+        } else {
+            Strategy::CopyOnWrite
+        },
         warnings,
         relocated: report.rewritten + report.relinked,
     })
@@ -1713,12 +1749,33 @@ mod tests {
     }
 
     // U-TXN-60: names APFS cannot store are refused up front, not at publish time.
+    // macOS only: Linux filesystems store any byte but `/` and NUL (U-TXN-60b).
+    #[cfg(target_os = "macos")]
     #[test]
     fn refuses_non_utf8_destination_before_mutation() {
         use std::os::unix::ffi::OsStrExt;
         let w = World::default();
         let mut req = new_branch();
         req.destination = Path::new("/w").join(std::ffi::OsStr::from_bytes(b"feat-\xff"));
+        assert_eq!(run(&w, &req).unwrap_err().code, ErrorCode::InvalidPath);
+        assert_no_mutation(&w);
+    }
+
+    // U-TXN-60b: where names are bytes, a non-UTF-8 destination is fine, except that
+    // it cannot name the implicit branch (which the journal stores as text).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_utf8_destination_is_accepted_unless_it_names_the_branch() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new("/w").join(std::ffi::OsStr::from_bytes(b"feat-\xff"));
+        let w = World::default();
+        let mut req = new_branch();
+        req.destination.clone_from(&bad);
+        assert_eq!(run(&w, &req).unwrap().destination, bad);
+        let w = World::default();
+        let mut req = new_branch();
+        req.destination = bad;
+        req.branch = BranchMode::Default;
         assert_eq!(run(&w, &req).unwrap_err().code, ErrorCode::InvalidPath);
         assert_no_mutation(&w);
     }
