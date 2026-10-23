@@ -46,5 +46,6 @@ Commit messages follow [Conventional Commits](https://www.conventionalcommits.or
 
 Bump `version` in `Cargo.toml`, move `[Unreleased]` to the new version in
 `CHANGELOG.md`, commit, then `git tag vX.Y.Z && git push --tags`. The release
-workflow builds the universal binary, publishes the GitHub release and updates
-the Homebrew tap.
+workflow builds the macOS universal binary and the Linux musl binaries (x86_64,
+aarch64), smoke-tests each, attests them, publishes one GitHub release with all
+archives and updates the Homebrew tap. `scripts/smoke-test.sh` is the smoke test.

@@ -28,8 +28,11 @@ All notable changes to this project are documented here. The format follows
 - Linux support. On Btrfs, XFS (with reflink), bcachefs and ZFS 2.2+, `add`
   clones each file with `ioctl(FICLONE)` and publishes with
   `renameat2(RENAME_NOREPLACE)`. Whether a directory can reflink is found by a
-  probe with two anonymous temporary files, not by the filesystem's name. Linux
-  binaries are not released yet; install with `cargo install parhel`.
+  probe with two anonymous temporary files, not by the filesystem's name.
+- Linux release binaries: static musl builds for x86_64 and aarch64
+  (`parhel-v<version>-<target>.tar.gz` with a `.sha256` file and a build
+  provenance attestation, like the macOS archive). The install script picks the
+  archive for the system, and the Homebrew formula installs on Linux too.
 - `--copy`: copy every file in full instead of cloning it. It works on any
   filesystem and across volumes (ext4, tmpfs, NFS, another disk), goes through
   the same staging, journal, rollback and path rewriting as a clone, and is
