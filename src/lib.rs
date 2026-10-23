@@ -93,14 +93,21 @@ where
     }
 }
 
-/// Where the user's store lives, if stores exist here.
-///
-/// TDD: only `PARHEL_STORE` is honored for now; the default `/parhel/<user>` is wired
-/// together with store discovery.
+/// Where the user's store lives: `PARHEL_STORE`, else `/parhel/<user>` (the user is the
+/// account of the process, not `$USER`, which `sudo` and `su` leave behind). `None` where
+/// stores do not exist (they are Linux only), so nothing is looked up or suggested.
+#[cfg(target_os = "linux")]
 fn store_path() -> Option<PathBuf> {
-    std::env::var_os("PARHEL_STORE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    let user = fs::unix::current_user_name()?;
+    Some(domain::store::store_path(
+        std::env::var_os("PARHEL_STORE").as_deref(),
+        &user,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn store_path() -> Option<PathBuf> {
+    None
 }
 
 fn fail(error: &Error) -> ExitCode {
@@ -127,6 +134,13 @@ fn report_added(outcome: &AddOutcome) {
         "Created {how} worktree at {}",
         outcome.destination.display()
     );
+    if let Some(real) = &outcome.real_path {
+        println!(
+            "The worktree lives in the store at {}; {} is a symlink to it",
+            real.display(),
+            outcome.destination.display()
+        );
+    }
     if outcome.relocated > 0 {
         println!(
             "Relocated {} copied file(s) that pointed at the source",
