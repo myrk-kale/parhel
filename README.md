@@ -83,7 +83,18 @@ curl -fsSL https://raw.githubusercontent.com/myrk-kale/parhel/main/install.sh | 
 ```
 
 On Debian, Ubuntu, Fedora and similar distributions you can install a `.deb` or
-`.rpm` package instead; see [Linux](#linux). Then create your first worktree:
+`.rpm` package instead; see [Linux](#linux).
+
+On Linux, copy-on-write needs btrfs, XFS (with reflink) or a similar
+filesystem. Most distributions put your home on ext4, which has none. There,
+run this once; it creates a copy-on-write area that `add` then uses on its own
+(see [Filesystems without copy-on-write](#filesystems-without-copy-on-write)):
+
+```sh
+sudo git parhel setup
+```
+
+Then create your first worktree:
 
 ```sh
 cd ~/code/my-app                       # any path inside your worktree
@@ -100,6 +111,10 @@ When you are done with it, remove the worktree with git itself:
 ```sh
 git worktree remove ../my-app-login
 ```
+
+A worktree created through the setup area is locked, so it takes
+`git worktree unlock` first; see
+[Removing a store worktree](#removing-a-store-worktree).
 
 Before you rely on parhel, read
 [Read this before you rely on it](#read-this-before-you-rely-on-it): a copy
