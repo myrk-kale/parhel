@@ -19,3 +19,37 @@ pub use apfs::ApfsFs as PlatformFs;
 pub use linux::LinuxFs as PlatformFs;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub use unsupported::UnsupportedFs as PlatformFs;
+
+/// The adapters' tests clone and copy loose paths: `src` is `parent/name`.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) trait CowFsExt: crate::ports::CowFs {
+    fn clone_entry(
+        &self,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> crate::domain::Result<()> {
+        let (root, name) = split(src);
+        self.clone_within(root, name, dst)
+    }
+
+    fn copy_entry(
+        &self,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> crate::domain::Result<()> {
+        let (root, name) = split(src);
+        self.copy_within(root, name, dst)
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+impl<T: crate::ports::CowFs> CowFsExt for T {}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+fn split(src: &std::path::Path) -> (&std::path::Path, &std::path::Path) {
+    let root = src.parent().unwrap_or(std::path::Path::new("/"));
+    (
+        root,
+        std::path::Path::new(src.file_name().expect("a named entry")),
+    )
+}

@@ -158,12 +158,16 @@ impl CowFs for LinuxFs {
         unix::create_dir(path)
     }
 
-    fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()> {
-        tree::transfer(src, dst, Data::Reflink(ficlone))
+    fn list_dir_within(&self, root: &Path, rel: &Path) -> Result<Option<Vec<OsString>>> {
+        unix::list_dir_within(root, rel)
     }
 
-    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
-        tree::transfer(src, dst, Data::Copy)
+    fn clone_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+        tree::transfer(root, rel, dst, Data::Reflink(ficlone))
+    }
+
+    fn copy_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+        tree::transfer(root, rel, dst, Data::Copy)
     }
 
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()> {
@@ -252,6 +256,7 @@ mod tests {
 
     use super::*;
     use crate::domain::ErrorCode;
+    use crate::fs::CowFsExt as _;
     use crate::fs::unix::c_path;
     use std::collections::BTreeMap;
     use std::fmt::Write as _;

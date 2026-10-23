@@ -563,22 +563,30 @@ impl CowFs for World {
         self.record(Call::CreateDir(path.into()), Step::Clone)
     }
 
-    fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+    fn list_dir_within(&self, root: &Path, rel: &Path) -> Result<Option<Vec<OsString>>> {
+        let path = root.join(rel);
+        if !self.is_dir_no_follow(&path)? {
+            return Ok(None);
+        }
+        self.list_dir(&path).map(Some)
+    }
+
+    fn clone_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
         self.record(
             Call::Clone {
-                src: src.into(),
+                src: root.join(rel),
                 dst: dst.into(),
             },
             Step::Clone,
         )
     }
 
-    /// Shares `Step::Clone` with `clone_entry`: a failure injected there hits whichever
+    /// Shares `Step::Clone` with `clone_within`: a failure injected there hits whichever
     /// flavour the run uses.
-    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+    fn copy_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
         self.record(
             Call::Copy {
-                src: src.into(),
+                src: root.join(rel),
                 dst: dst.into(),
             },
             Step::Clone,

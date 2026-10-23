@@ -124,13 +124,20 @@ pub trait CowFs {
     fn create_staging_dir(&self, parent: &Path) -> Result<PathBuf>;
     fn list_dir(&self, path: &Path) -> Result<Vec<OsString>>;
     fn create_dir(&self, path: &Path) -> Result<()>;
-    /// `clonefile(src, dst, CLONE_NOFOLLOW)`. Errors: `clone-failed`, `cross-volume`.
-    fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()>;
-    /// The `--copy` flavour of [`clone_entry`](Self::clone_entry): same contract (one
-    /// entry, file or directory tree, symlinks never followed, metadata preserved) but
+    /// Entries of the directory `root/rel` of the source tree, reached from `root`
+    /// without following any symlink; `None` when it is not a directory (a symlink
+    /// to one is not) or is gone.
+    fn list_dir_within(&self, root: &Path, rel: &Path) -> Result<Option<Vec<OsString>>>;
+    /// Clone the entry `root/rel` (file, symlink, FIFO or directory tree) to the new
+    /// path `dst`: copy-on-write, symlinks never followed, metadata preserved. The
+    /// entry is reached from `root` by descending one component at a time without
+    /// following symlinks, so a directory swapped for a symlink meanwhile is an error
+    /// and never a way out of the source. Errors: `clone-failed`, `cross-volume`.
+    fn clone_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()>;
+    /// The `--copy` flavour of [`clone_within`](Self::clone_within): same contract but
     /// every file's data is copied in full, never shared, and the volumes need not
     /// support copy-on-write nor be the same. Errors: `clone-failed`.
-    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()>;
+    fn copy_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()>;
     /// `renamex_np(from, to, RENAME_EXCL)`. Errors: `dest-exists` when `to` exists
     /// (even as an empty dir), `io` otherwise.
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()>;

@@ -47,8 +47,8 @@ impl std::fmt::Debug for Data {
 /// `dst`. Fails, touching nothing, when `dst` exists. Errors: `cross-volume` when a
 /// reflink crosses filesystems, `clone-failed` otherwise, naming the entry that failed.
 /// Whatever was created before a failure is removed again.
-pub(crate) fn transfer(src: &Path, dst: &Path, data: Data) -> Result<()> {
-    run(src, dst, data).map_err(|failure| {
+pub(crate) fn transfer(root: &Path, rel: &Path, dst: &Path, data: Data) -> Result<()> {
+    run(root, rel, dst, data).map_err(|failure| {
         let (verb, code) = match data {
             Data::Copy => ("copy", ErrorCode::CloneFailed),
             Data::Reflink(_) if failure.error.raw_os_error() == Some(libc::EXDEV) => {
@@ -106,18 +106,38 @@ fn kind_of(ft: fs::FileType) -> Kind {
     }
 }
 
-fn run(src: &Path, dst: &Path, data: Data) -> Step {
-    let md = at(src, fs::symlink_metadata(src))?;
+/// The failpoint of the walk, before the entry `rel` (relative to the source root) is
+/// opened.
+fn enter(rel: &Path) -> Step {
+    let hit = || -> Result<()> {
+        crate::failpoint!("walk_entry", rel);
+        Ok(())
+    };
+    at(rel, hit().map_err(io::Error::other))
+}
+
+fn run(root: &Path, rel: &Path, dst: &Path, data: Data) -> Step {
+    let src = root.join(rel);
+    enter(rel)?;
+    let md = at(&src, fs::symlink_metadata(&src))?;
     match kind_of(md.file_type()) {
-        Kind::Dir => copy_dir(src, dst, md, data),
+        Kind::Dir => copy_dir(root, rel, dst, md, data),
         Kind::Other => Ok(()),
-        kind => copy_leaf(src, dst, kind, data, &mut Vec::new()),
+        kind => copy_leaf(root, rel, dst, kind, data, &mut Vec::new()),
     }
 }
 
 // ------------------------------------------------------------------ leaves
 
-fn copy_leaf(src: &Path, dst: &Path, kind: Kind, data: Data, buf: &mut Vec<u8>) -> Step {
+fn copy_leaf(
+    root: &Path,
+    rel: &Path,
+    dst: &Path,
+    kind: Kind,
+    data: Data,
+    buf: &mut Vec<u8>,
+) -> Step {
+    let src = &root.join(rel);
     match kind {
         Kind::File => copy_file(src, dst, data, buf),
         Kind::Symlink => {
@@ -472,14 +492,14 @@ mod xattr {
 
 /// A directory created in the destination, to be finished once it is full.
 struct Dir {
-    src: PathBuf,
+    rel: PathBuf,
     dst: PathBuf,
     md: fs::Metadata,
 }
 
 /// Entries of one directory (a slice of it) to copy by one worker.
 struct Job {
-    src: PathBuf,
+    rel: PathBuf,
     dst: PathBuf,
     entries: Vec<(OsString, Kind)>,
 }
@@ -491,15 +511,15 @@ fn mkdir(dst: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(dst)
 }
 
-fn copy_dir(src: &Path, dst: &Path, md: fs::Metadata, data: Data) -> Step {
+fn copy_dir(root: &Path, rel: &Path, dst: &Path, md: fs::Metadata, data: Data) -> Step {
     // Fails when `dst` exists: nothing has been created yet, nothing to undo.
     at(dst, mkdir(dst))?;
     let mut dirs = vec![Dir {
-        src: src.to_path_buf(),
+        rel: rel.to_path_buf(),
         dst: dst.to_path_buf(),
         md,
     }];
-    let done = fill(&mut dirs, data).and_then(|()| finish(&dirs));
+    let done = fill(root, &mut dirs, data).and_then(|()| finish(root, &dirs));
     if done.is_err() {
         let _ = unix::remove_dir_all(dst, |path| unix::make_dirs_writable(path, &|_| {}));
     }
@@ -508,7 +528,7 @@ fn copy_dir(src: &Path, dst: &Path, md: fs::Metadata, data: Data) -> Step {
 
 /// Create every directory below the first of `dirs` (appended to it, parents before
 /// children) and copy the other entries, in parallel.
-fn fill(dirs: &mut Vec<Dir>, data: Data) -> Step {
+fn fill(root: &Path, dirs: &mut Vec<Dir>, data: Data) -> Step {
     let failed = AtomicBool::new(false);
     let first = Mutex::new(None);
     let record = |failure: Failure| {
@@ -531,13 +551,13 @@ fn fill(dirs: &mut Vec<Dir>, data: Data) -> Step {
                     if failed.load(Ordering::SeqCst) {
                         continue;
                     }
-                    if let Err(failure) = run_job(&job, data, &mut buf) {
+                    if let Err(failure) = run_job(root, &job, data, &mut buf) {
                         record(failure);
                     }
                 }
             });
         }
-        if let Err(failure) = list_and_make_dirs(dirs, &tx, &failed) {
+        if let Err(failure) = list_and_make_dirs(root, dirs, &tx, &failed) {
             record(failure);
         }
         drop(tx);
@@ -548,9 +568,11 @@ fn fill(dirs: &mut Vec<Dir>, data: Data) -> Step {
         .map_or(Ok(()), Err)
 }
 
-fn run_job(job: &Job, data: Data, buf: &mut Vec<u8>) -> Step {
+fn run_job(root: &Path, job: &Job, data: Data, buf: &mut Vec<u8>) -> Step {
     for (name, kind) in &job.entries {
-        copy_leaf(&job.src.join(name), &job.dst.join(name), *kind, data, buf)?;
+        let rel = job.rel.join(name);
+        enter(&rel)?;
+        copy_leaf(root, &rel, &job.dst.join(name), *kind, data, buf)?;
     }
     Ok(())
 }
@@ -558,18 +580,20 @@ fn run_job(job: &Job, data: Data, buf: &mut Vec<u8>) -> Step {
 /// Breadth-first over the directories (`dirs` doubles as the queue): create each
 /// subdirectory in the destination and hand the other entries to the workers.
 fn list_and_make_dirs(
+    root: &Path,
     dirs: &mut Vec<Dir>,
     tx: &std::sync::mpsc::SyncSender<Job>,
     failed: &AtomicBool,
 ) -> Step {
     let mut next = 0;
     while next < dirs.len() && !failed.load(Ordering::SeqCst) {
-        let (src, dst) = (dirs[next].src.clone(), dirs[next].dst.clone());
+        let (rel, dst) = (dirs[next].rel.clone(), dirs[next].dst.clone());
+        let src = root.join(&rel);
         next += 1;
         let mut entries = Vec::new();
         let send = |entries: &mut Vec<(OsString, Kind)>| {
             let job = Job {
-                src: src.clone(),
+                rel: rel.clone(),
                 dst: dst.clone(),
                 entries: std::mem::take(entries),
             };
@@ -582,11 +606,13 @@ fn list_and_make_dirs(
             let kind = kind_of(at(&entry.path(), entry.file_type())?);
             match kind {
                 Kind::Dir => {
-                    let (child_src, child_dst) = (src.join(&name), dst.join(&name));
+                    let (child_rel, child_dst) = (rel.join(&name), dst.join(&name));
+                    enter(&child_rel)?;
+                    let child_src = root.join(&child_rel);
                     let md = at(&child_src, fs::symlink_metadata(&child_src))?;
                     at(&child_dst, mkdir(&child_dst))?;
                     dirs.push(Dir {
-                        src: child_src,
+                        rel: child_rel,
                         dst: child_dst,
                         md,
                     });
@@ -608,9 +634,9 @@ fn list_and_make_dirs(
 }
 
 /// Attributes, owner, mode and times of every directory, deepest first.
-fn finish(dirs: &[Dir]) -> Step {
+fn finish(root: &Path, dirs: &[Dir]) -> Step {
     for dir in dirs.iter().rev() {
-        restore(&dir.src, &dir.dst, &dir.md, Kind::Dir)?;
+        restore(&root.join(&dir.rel), &dir.dst, &dir.md, Kind::Dir)?;
     }
     Ok(())
 }

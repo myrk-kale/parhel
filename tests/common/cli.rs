@@ -150,6 +150,22 @@ pub fn finish(child: Child) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// Like [`finish`], but a child still running after `secs` seconds is killed and the
+/// test fails: a product bug that blocks forever must not hang the suite.
+pub fn finish_within(child: Child, secs: u64) -> Output {
+    let mut child = child;
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(secs) {
+            child.kill().unwrap();
+            let out = child.wait_with_output().unwrap();
+            panic!("still running after {secs}s (killed)\n{}", describe(&out));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
 /// Directory containing a `git-parhel` symlink, to put on PATH so `git parhel` works.
 pub fn install_extension(dir: &Path) -> PathBuf {
     let bin = dir.join("bin");

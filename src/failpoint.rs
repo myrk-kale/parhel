@@ -9,6 +9,10 @@
 //! - `wait:<path>`: create `<path>.reached`, then block until `<path>` exists.
 //!   Lets a test freeze the process at a precise step, act, and release it.
 //!
+//! A failpoint placed once per entry of a tree walk is named `<name>:<path>`, the path
+//! being the entry's, relative to the source root (`walk_entry:node_modules/pkg`):
+//! a test freezes the walk at one entry only.
+//!
 //! This module is test infrastructure, not product behavior: it is implemented
 //! (not stubbed) so integration tests can drive the product deterministically.
 
@@ -29,6 +33,10 @@ pub const ADD_FAILPOINTS: &[&str] = &[
     "after_index",
     "before_rename",
 ];
+
+/// Failpoint of the tree walk (clone or copy), evaluated as `walk_entry:<path>` just
+/// before each entry below the source root is opened.
+pub const WALK_FAILPOINT: &str = "walk_entry";
 
 /// Failpoint between the publishing rename and `git worktree repair`.
 pub const PUBLISH_FAILPOINT: &str = "after_rename";
@@ -113,13 +121,20 @@ pub fn eval(name: &str) -> Result<()> {
 }
 
 /// `failpoint!("name")` inside a function returning [`Result`]: no-op unless the
-/// `failpoints` feature is enabled.
+/// `failpoints` feature is enabled. `failpoint!("name", path)` is the per-entry form,
+/// named `name:<path>`.
 #[macro_export]
 macro_rules! failpoint {
     ($name:literal) => {{
         #[cfg(feature = "failpoints")]
         {
             $crate::failpoint::eval($name)?;
+        }
+    }};
+    ($name:literal, $path:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            $crate::failpoint::eval(&format!("{}:{}", $name, $path.display()))?;
         }
     }};
 }
