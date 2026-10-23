@@ -29,6 +29,7 @@ use std::sync::mpsc::sync_channel;
 use std::sync::{Mutex, PoisonError};
 
 use super::{anchor, unix};
+use crate::domain::store::{EntryKind, EntryMeta};
 use crate::domain::{Error, ErrorCode, Result};
 
 /// How the data of regular files reaches the destination.
@@ -57,32 +58,35 @@ impl std::fmt::Debug for Data {
 /// otherwise, naming the entry that failed. Whatever was created before a failure is
 /// removed again.
 pub(crate) fn transfer(root: &Path, rel: &Path, dst: &Path, data: Data) -> Result<()> {
-    run(root, rel, dst, data).map_err(|failure| {
-        if failure
-            .error
-            .get_ref()
-            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<Cancelled>)
-        {
-            return Error::new(ErrorCode::Interrupted, "interrupted; rolled back");
+    run(root, rel, dst, data).map_err(|failure| error_of(&failure, data))
+}
+
+/// The error a [`Failure`] of a walk with `data` is reported as.
+fn error_of(failure: &Failure, data: Data) -> Error {
+    if failure
+        .error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<Cancelled>)
+    {
+        return Error::new(ErrorCode::Interrupted, "interrupted; rolled back");
+    }
+    let (verb, code) = match data {
+        Data::Copy => ("copy", ErrorCode::CloneFailed),
+        Data::Reflink(_) if failure.error.raw_os_error() == Some(libc::EXDEV) => {
+            ("clone", ErrorCode::CrossVolume)
         }
-        let (verb, code) = match data {
-            Data::Copy => ("copy", ErrorCode::CloneFailed),
-            Data::Reflink(_) if failure.error.raw_os_error() == Some(libc::EXDEV) => {
-                ("clone", ErrorCode::CrossVolume)
-            }
-            Data::Reflink(_) => ("clone", ErrorCode::CloneFailed),
-        };
-        let mut message = format!(
-            "cannot {verb} `{}`: {}",
-            failure.path.display(),
-            failure.error
-        );
-        if let Some(hint) = failure.hint {
-            message.push_str("; ");
-            message.push_str(hint);
-        }
-        Error::new(code, message)
-    })
+        Data::Reflink(_) => ("clone", ErrorCode::CloneFailed),
+    };
+    let mut message = format!(
+        "cannot {verb} `{}`: {}",
+        failure.path.display(),
+        failure.error
+    );
+    if let Some(hint) = failure.hint {
+        message.push_str("; ");
+        message.push_str(hint);
+    }
+    Error::new(code, message)
 }
 
 /// What went wrong and on which entry.
@@ -952,6 +956,156 @@ fn finish(source: Source<'_>, dirs: &[Dir]) -> Step {
         )?;
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------ the store's mirror
+
+/// `lstat` of `root/rel` for comparing a tree with its mirror: `None` when the entry (or
+/// a directory above it) is gone, and for sockets and device nodes, which are not part of
+/// a worktree. A directory above `rel` that became a symlink is an error: the walk must
+/// never leave `root`. `rel` empty is `root` itself.
+pub(crate) fn stat_entry(root: &Path, rel: &Path) -> Result<Option<EntryMeta>> {
+    stat_entry_io(root, rel).map_err(|e| {
+        let e = if anchor::changed(&e) {
+            io::Error::other("changed while it was being read")
+        } else {
+            e
+        };
+        unix::io_error(&root.join(rel), &e)
+    })
+}
+
+fn gone(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+}
+
+fn stat_entry_io(root: &Path, rel: &Path) -> io::Result<Option<EntryMeta>> {
+    let root_fd = match anchor::open_root(root) {
+        Ok(fd) => fd,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if rel.as_os_str().is_empty() {
+        let st = anchor::fstat(root_fd.as_raw_fd())?;
+        return Ok(entry_meta(&st, None));
+    }
+    let (parent, name) = match anchor::open_parent(root_fd.as_raw_fd(), rel) {
+        Ok(found) => found,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let st = match anchor::stat_at(parent.as_raw_fd(), &name) {
+        Ok(st) => st,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let target = if kind_of_mode(st.st_mode) == Kind::Symlink {
+        Some(anchor::read_link_at(parent.as_raw_fd(), &name)?)
+    } else {
+        None
+    };
+    Ok(entry_meta(&st, target))
+}
+
+fn entry_meta(st: &libc::stat, link_target: Option<PathBuf>) -> Option<EntryMeta> {
+    let kind = match kind_of_mode(st.st_mode) {
+        Kind::Dir => EntryKind::Dir,
+        Kind::File => EntryKind::File,
+        Kind::Symlink => EntryKind::Symlink,
+        Kind::Fifo => EntryKind::Fifo,
+        Kind::Other => return None,
+    };
+    let md = Meta::new(st);
+    Some(EntryMeta {
+        kind,
+        size: if kind == EntryKind::File { md.size } else { 0 },
+        mtime_ns: i128::from(md.mtime.tv_sec) * 1_000_000_000 + i128::from(md.mtime.tv_nsec),
+        mode: u32::from(md.mode) & 0o7777,
+        link_target,
+    })
+}
+
+/// Name for the temporary entry a replacement is built under, next to its target.
+fn temporary_name(dst: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(".parhel-tmp-{}-{n}", std::process::id());
+    dst.parent().unwrap_or(Path::new("")).join(name)
+}
+
+/// Make `dst` a copy of the entry `root/rel` (see [`CowFs::mirror_entry`]): a file,
+/// symlink or FIFO is built under a temporary name and renamed over `dst`; a directory
+/// is created empty (owner-only, so it can be filled) when `dst` is not one already.
+/// Returns the bytes of file data copied.
+pub(crate) fn mirror(root: &Path, rel: &Path, dst: &Path) -> Result<u64> {
+    mirror_io(root, rel, dst).map_err(|failure| error_of(&failure, Data::Copy))
+}
+
+fn mirror_io(root: &Path, rel: &Path, dst: &Path) -> std::result::Result<u64, Failure> {
+    let root_fd = at(root, anchor::open_root(root))?;
+    let shown = root.join(rel);
+    at(rel, check_interrupt())?;
+    if rel.as_os_str().is_empty() {
+        mirror_dir(dst)?;
+        return Ok(0);
+    }
+    let (parent, name) = at_src(&shown, anchor::open_parent(root_fd.as_raw_fd(), rel))?;
+    let st = at_src(&shown, anchor::stat_at(parent.as_raw_fd(), &name))?;
+    let kind = kind_of_mode(st.st_mode);
+    match kind {
+        Kind::Dir => {
+            mirror_dir(dst)?;
+            return Ok(0);
+        }
+        Kind::Other => return Ok(0),
+        _ => {}
+    }
+    let temporary = temporary_name(dst);
+    let copied = copy_leaf(
+        parent.as_raw_fd(),
+        &name,
+        &shown,
+        &temporary,
+        kind,
+        Data::Copy,
+        &mut Vec::new(),
+    )
+    .and_then(|()| at(dst, fs::rename(&temporary, dst)));
+    if copied.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    copied?;
+    Ok(if kind == Kind::File {
+        u64::try_from(st.st_size).unwrap_or(0)
+    } else {
+        0
+    })
+}
+
+/// The directory `dst`, created owner-only unless it is one already (never a symlink to
+/// one: the mirror is not to be steered elsewhere).
+fn mirror_dir(dst: &Path) -> Step {
+    match mkdir(dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let md = at(dst, fs::symlink_metadata(dst))?;
+            if md.is_dir() { Ok(()) } else { at(dst, Err(e)) }
+        }
+        Err(e) => at(dst, Err(e)),
+    }
+}
+
+/// The attributes, owner, mode and times of the directory `root/rel`, given to `dst`
+/// once its contents are in place (see [`CowFs::mirror_dir_meta`]).
+pub(crate) fn mirror_dir_meta(root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+    let source = || -> Step {
+        let root_fd = at(root, anchor::open_root(root))?;
+        let shown = root.join(rel);
+        let held = at_src(&shown, anchor::open_rel_dir(root_fd.as_raw_fd(), rel))?;
+        let md = Meta::new(&at(&shown, anchor::fstat(held.as_raw_fd()))?);
+        restore(&shown, Some(held.as_raw_fd()), dst, &md, Kind::Dir)
+    };
+    source().map_err(|failure| error_of(&failure, Data::Copy))
 }
 
 #[cfg(test)]

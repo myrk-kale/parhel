@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::domain::store::EntryMeta;
-use crate::domain::{BranchMode, Error, Result};
+use crate::domain::{BranchMode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
 
 /// Facts about the source worktree, discovered from `--from`.
@@ -177,15 +177,11 @@ pub trait CowFs {
     fn is_locked(&self, path: &Path) -> Result<bool>;
 
     // --- the store (Linux): sync of the baseline, the symlink at the destination.
-    //
-    // TDD stubs: these defaults answer `not-implemented`; the adapters override them
-    // when the store work is implemented, and the defaults go away with it.
 
     /// `lstat` of the entry `root/rel` (`rel` empty: `root` itself), reached from
-    /// `root` without following any symlink; `None` when it does not exist.
-    fn stat_within(&self, _root: &Path, _rel: &Path) -> Result<Option<EntryMeta>> {
-        Err(Error::not_implemented("stat_within"))
-    }
+    /// `root` without following any symlink; `None` when it does not exist (or is a
+    /// socket or device node, which are not part of a worktree).
+    fn stat_within(&self, root: &Path, rel: &Path) -> Result<Option<EntryMeta>>;
     /// Make `dst` a copy of the source entry `root/rel`, replacing what `dst` holds
     /// when it is of the same kind: files are copied in full (never reflinked: the
     /// baseline is on another filesystem) through a temporary name and renamed over
@@ -193,36 +189,22 @@ pub trait CowFs {
     /// missing (its children are separate calls). Returns the bytes copied.
     /// Metadata that depends on the children (directory mtime) is left to
     /// [`mirror_dir_meta`](Self::mirror_dir_meta).
-    fn mirror_entry(&self, _root: &Path, _rel: &Path, _dst: &Path) -> Result<u64> {
-        Err(Error::not_implemented("mirror_entry"))
-    }
+    fn mirror_entry(&self, root: &Path, rel: &Path, dst: &Path) -> Result<u64>;
     /// Give the directory `dst` the mode, ownership-independent metadata (xattrs,
     /// ACLs, mtime) of the source directory `root/rel`; called once its children are
     /// in place.
-    fn mirror_dir_meta(&self, _root: &Path, _rel: &Path, _dst: &Path) -> Result<()> {
-        Err(Error::not_implemented("mirror_dir_meta"))
-    }
+    fn mirror_dir_meta(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()>;
     /// `symlink(target, link)` that never replaces anything. Errors: `dest-exists`
     /// when `link` exists (even as a dangling symlink).
-    fn symlink_exclusive(&self, _target: &Path, _link: &Path) -> Result<()> {
-        Err(Error::not_implemented("symlink_exclusive"))
-    }
+    fn symlink_exclusive(&self, target: &Path, link: &Path) -> Result<()>;
     /// Target of the symlink at `path`; `None` when it is not a symlink or is gone.
-    fn read_link(&self, _path: &Path) -> Result<Option<PathBuf>> {
-        Err(Error::not_implemented("read_link"))
-    }
+    fn read_link(&self, path: &Path) -> Result<Option<PathBuf>>;
     /// Append `bytes` to `path` (created if missing) and sync it.
-    fn append_file(&self, _path: &Path, _bytes: &[u8]) -> Result<()> {
-        Err(Error::not_implemented("append_file"))
-    }
+    fn append_file(&self, path: &Path, bytes: &[u8]) -> Result<()>;
     /// Whether the current user can create entries in the directory `path`.
-    fn is_writable(&self, _path: &Path) -> Result<bool> {
-        Err(Error::not_implemented("is_writable"))
-    }
+    fn is_writable(&self, path: &Path) -> Result<bool>;
     /// Free and total space of the filesystem holding `path` (`statvfs`).
-    fn space(&self, _path: &Path) -> Result<Space> {
-        Err(Error::not_implemented("space"))
-    }
+    fn space(&self, path: &Path) -> Result<Space>;
 }
 
 /// Space of a filesystem, in bytes (what an unprivileged user can use).
