@@ -152,6 +152,7 @@ git parhel add ../<project>-<task> --new-branch <branch>
 | `submodules-present` | Retry with `--submodules=reinit` |
 | `not-cow`, `cross-volume` | Linux: stop, tell the user to run `sudo git parhel setup` once, wait. macOS: a destination on APFS. `--copy` or `--fallback` only if the user chooses them after hearing about setup |
 | `store-unavailable` | Stop. Show `git parhel doctor` and `systemctl status <unit>`; the user fixes it (`sudo systemctl start <unit>` or `sudo git parhel setup`), then retry |
+| `store-no-space` | Stop. The disk that holds the store's image, or the store, is too small for what `add` would copy (the message gives the figures). Tell the user; they free space or remove store worktrees they no longer need. Do not switch to `--copy` or `--fallback` on your own |
 | `git-failed` | Git's message follows, for example a branch name already in use |
 | `rollback-failed` | Run `git parhel doctor`, show the user, then `--fix` (step 6) |
 
@@ -179,17 +180,30 @@ git -C <worktree> status --ignored --short  # ignored files are not protected
 git worktree remove <worktree>
 ```
 
-- A worktree in the store is removed the same way, by either path.
+- A worktree in the store is **locked** in git (`git worktree list` shows
+  `locked parhel store: ...`), so that `git worktree prune` and `git gc` cannot
+  forget it while the store's mount is down. Remove it by either path in three
+  steps:
+
+  ```sh
+  git worktree unlock <path>
+  git worktree remove <path>
+  git parhel doctor --fix       # removes the dangling symlink; never a worktree
+  ```
+
   `git worktree remove <symlink>` deletes the real worktree and leaves the
-  symlink dangling, which keeps that path taken (`dest-exists`). Then run
-  `git parhel doctor --fix`: it removes dangling symlinks that `add` created
-  and never a worktree.
+  symlink dangling, which keeps that path taken (`dest-exists`) until
+  `doctor --fix` removes it. `git worktree remove --force --force <path>` also
+  overrides the lock, but its first `--force` discards uncommitted changes:
+  use it only with the user's agreement. Never run `git worktree prune` or
+  `git gc` to clean up a store worktree.
 
 - `git worktree remove` refuses only when tracked or untracked files changed.
   Ignored files, such as a local database, logs, generated reports or an
   edited `.env`, are deleted without warning. If the ignored listing shows
   anything the user created in this worktree, ask before removing.
-- Do not add `--force` unless the user agrees to lose what it would delete.
+- Do not add `--force` (or the second one for a locked store worktree) unless
+  the user agrees to lose what it would delete.
 - Delete the branch only if it was created for this task and is merged or
   pushed: `git branch -d <branch>` (lowercase `-d`, which refuses unmerged
   work). Never delete branches you did not create.
@@ -209,11 +223,13 @@ interrupted runs from their journal, or completes them when the worktree was
 already in place, and it never deletes a worktree it cannot prove parhel
 created. `in-progress` findings belong to a run that is still active: leave
 them alone. With a store, `doctor` also reports `store-unavailable`,
-`store-image-deleted` (the image was deleted behind a mounted store: tell the
-user at once to copy their work out before unmounting), `store-low-space`,
-`store-orphan` and `store-dangling-link`; `--fix` clears dangling links and
-stale baselines, never a worktree. Problems that need root are for the user to
-fix.
+`store-worktrees-unreachable` (the store is down while git still lists
+worktrees in it: tell the user, and do not run `git worktree prune` or
+`git gc` until it is back), `store-image-deleted` (the image was deleted behind
+a mounted store: tell the user at once to copy their work out before
+unmounting), `store-low-space`, `store-orphan` and `store-dangling-link`;
+`--fix` clears dangling links and stale baselines, never a worktree. Problems
+that need root are for the user to fix.
 
 ## Rules
 
@@ -225,7 +241,8 @@ fix.
 - Never: run `git parhel setup` (with or without `--remove`) or anything with
   `sudo`, touch `/var/lib/parhel`, `/parhel` or the systemd unit of a store,
   hand-edit `.git/worktrees`, delete `.parhel-staging-*` folders, run
-  `git worktree prune` to clean up after parhel (use `git parhel doctor`), or
+  `git worktree prune` or `git gc` to clean up after parhel (use
+  `git parhel doctor`), or
   copy files back from the source into a worktree to "fix" relocation.
 - Repository safety: parhel only changes its own worktree registration and a
   branch it created in that run. Every worktree still shares one `.git`, so

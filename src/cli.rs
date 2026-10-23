@@ -38,7 +38,8 @@ Examples:
   git parhel doctor --fix
   sudo git parhel setup        # Linux, ext4: a store for worktrees without copy-on-write
 
-Remove a worktree with `git worktree remove <path>`.
+Remove a worktree with `git worktree remove <path>` (one in the store is locked: run
+`git worktree unlock <path>` first).
 Docs: https://github.com/myrk-kale/parhel";
 
 /// Shown above `--help` only (not `-h`, errors or man pages).

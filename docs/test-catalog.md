@@ -382,6 +382,31 @@ removed image starts blank when it is created again. The fake also starts and st
 `is_immutable` and `filesystem_of` (`blkid -p`): an image with no signature is what an
 interrupted setup leaves, one that holds another filesystem is data.
 
+Changes made by the second review of the store (13 findings; each fix has a test that was
+seen red first, and the commit says how). Existing tests that changed, and why:
+
+- U-SET-10/15/18/23 and the expected sequences: `Host::create_image` now only creates the
+  empty file and `Host::size_image` (idempotent) sizes it, so the lines read `create-image` and
+  `size-image` instead of one `image` line (finding 10: nothing slow may run while the
+  directory is open). U-SET-22/22b: the protection is back right after the image is created
+  (not at the end of the run), which is the point of the finding.
+- U-SET-36/39: removing an image whose unit is gone now mounts it read-only to look first, and
+  the unit-less unmount goes through `Host::umount` (finding 1).
+- U-SYS-01 moved to `src/domain/mounts.rs` with the code it tests (doctor and setup share it);
+  U-SYS-08 follows the create/size split.
+- U-STO-72 ignores the new `store-worktrees-unreachable` finding (it is about the one
+  finding of an unusable store; the registrations are reported on top, on purpose); U-STO-83
+  expects the lock that completing a publication now places.
+- I-S03 and I-S05 let the fixture age 2 s (`settle()`): a file changed within the sync's margin
+  of the last sync is copied again, which they would count (finding 2). I-S16 and I-S25,
+  I-SET05 and I-SET06 remove a store worktree the way it must now be removed (unlock, or two
+  `--force`), since it is locked (finding 3). I-S33 runs with the hook that tells the binary
+  there is room (`PARHEL_SPACE`, failpoints builds), as the room check now refuses before the
+  disk fills (I-S33b is the check) (finding 5).
+- Every store command of the integration harness is told there is a terabyte with half free
+  (`PARHEL_SPACE`), so `doctor`'s `store-low-space` and `add`'s `store-no-space` never depend on
+  the disk the tests run on (finding 13); I-S43 injects low space on purpose.
+
 ### Unit tests with fakes
 `World` (recording fake of git and the filesystem) gained `with_store()`, `stat_within`,
 `mirror_entry`, `mirror_dir_meta`, `symlink_exclusive`, `read_link`, `append_file`,
@@ -392,9 +417,16 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 |---|---|---|
 | U-STO-01…04 | Marker `.parhel-store`: round trip, exact text (`format=1` first), order and unknown keys ignored, rejects empty/garbage/newer format/missing keys with `store-unavailable` | `src/domain/store.rs` |
 | U-STO-05 | Store path: `PARHEL_STORE` wins, empty is ignored, default `/parhel/<user>` | `src/domain/store.rs` |
+| U-STO-07b / 07c | Sync decision with the status-change time: size, mtime and mode equal but ctime not older than the last finished sync's start (less the 2 s margin) → copy, to the nanosecond; without a sync on record every file and directory is copied again, a symlink is still compared by its target | `src/domain/store.rs` |
+| U-STO-08 | The baseline's `meta` records when the last finished sync began (`sync_start_ns`); absent or garbage → none | `src/domain/store.rs` |
 | U-STO-06 | Repository id = first 16 bytes of SHA-256 of the path bytes (known vectors, non-UTF-8) | `src/domain/store.rs` |
 | U-STO-07 | Sync decision table: unchanged, new, size, mtime to the nanosecond, mode, kind changes, symlink target, FIFO, directory mtime ignored but directory mode compared | `src/domain/store.rs` |
+| U-FS-26 (extended) | A new directory, and a file replaced by a directory, in a mirrored directory that is read-only | `src/fs/tree.rs` |
+| U-FS-31b | `PARHEL_SPACE` (failpoints builds): the free room a test tells the binary, longest prefix wins, junk skipped | `src/fs/unix.rs` |
+| U-GIT-04 | A locked worktree survives `git worktree prune` with its directory out of reach and an unlocked one does not (control); git reports the reason; `worktree_remove_force` and `unregister_worktree` still remove a locked one | `src/git/cli.rs` |
 | U-FS-24…33 | The adapter on a real filesystem (macOS and Linux): `stat_within` (kinds, size, mtime in ns, mode, symlink target; absent and swapped components), `mirror_entry` (data, mode, ns mtime, user xattrs, replaced in one rename without a leftover temporary name; symlinks, FIFOs, owner-only directories finished by `mirror_dir_meta`, read-only directories that still take entries; failures name the entry), `symlink_exclusive`, `read_link`, `append_file`, `is_writable`, `space` (nearest searchable ancestor), `flush`, `current_user_name` (the account, not `$USER`) | `src/fs/tree.rs`, `src/fs/unix.rs` |
+| U-STO-33b / 33c | A same-size rewrite with mtime and mode restored (ctime later than the last sync) is copied; with no sync on record the whole tree is copied again | `src/app/store.rs` |
+| U-STO-99…99e | Room before the first write: a first sync larger than the disk of the image (found from the marker) or than the store → `store-no-space` naming which; the need is the estimate plus a margin, to the byte; a later sync is measured by what it would copy (a pass that only looks); nothing mutated; what cannot be measured does not refuse | `src/app/store.rs` |
 | U-STO-10…16 | Discovery: not configured, available, no marker, other format, garbage, store without copy-on-write, not writable; never mutates | `src/app/store.rs` |
 | U-STO-30…44 | Sync: first sync creates parents first and sets directory metadata last, nothing changed → no call, changed file alone (+ its directory's metadata), mode-only change, new file, deleted file, deleted directory in one removal, file ↔ directory replaced (remove then create), symlinks by target, exclusions never copied and removed when new, Ctrl-C, failing copy, half-synced baseline repaired | `src/app/store.rs` |
 | U-STO-20 | When the store is taken: ext4 source and destination, copy-on-write source with an ext4 destination, ext4 source with a cow destination, two cow filesystems; not when the source can clone, when the store shares the source's filesystem, or with `--copy` / `--fallback` | `src/app/add.rs` |
@@ -407,6 +439,11 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-STO-48 / 49 | The journal records the link and the real destination before the symlink exists; `links` registry line `<link>\t<target>` appended first | `src/app/add.rs` |
 | U-STO-50 / 51 | Symlink cannot be created → `dest-exists`, nothing removed from the destination; lost exclusive rename → our symlink removed | `src/app/add.rs` |
 | U-STO-50b | A rival link to the very same real path (same destination and name raced) is never removed by the loser's rollback: found by I-S09a on CI, fixed by forgetting the journaled link when its creation fails | `src/app/add.rs` |
+| U-STO-59b / 59c / 59d | The finished sync records its start in `meta` and the next is judged against it; a sync that failed keeps the previous mark (a first one that failed leaves none); a baseline without a mark is copied again | `src/app/add.rs` |
+| U-STO-91 / 92 | A published store worktree is locked (`parhel store: <root>`) after its registration is repaired, nothing else is; a lock that fails is a warning naming `git worktree lock`, never a rollback | `src/app/add.rs` |
+| U-STO-95 / 95b / 96 | A real name is a lock held to the end of the run: a name another run holds is taken though nothing is at its path, an existing path is taken too; a publishing rename lost anyway names the requested destination | `src/app/add.rs` |
+| U-STO-98 | The symlink removed or retargeted when the worktree is published (a `doctor --fix` at the same moment): a loud failure with the real path and the `ln -s`, nothing rolled back | `src/app/add.rs` |
+| U-STO-101 | No room: `store-no-space` before any mirror, staging, registration, link or `meta` write; names the disk of the image or the store, and `--copy` | `src/app/add.rs` |
 | U-STO-52 | Real name suffixes `-2`, `-3` (first free); the requested path is unchanged | `src/app/add.rs` |
 | U-STO-53 | Relocation rewrites to the real path | `src/app/add.rs` |
 | U-STO-54…58 | Failure at every step, failing sync, Ctrl-C during/after the sync, source changed, existing branch: no symlink, no registration, branch only if ours, staging removed last, baseline untouched | `src/app/add.rs` |
@@ -427,6 +464,9 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-STO-78 / 79 | `store-stale-baseline` (source no longer a worktree) fixed by deleting that baseline; a baseline of a linked worktree is not stale | `src/app/doctor.rs` |
 | U-STO-80 | `--fix` never deletes anything under `worktrees/` | `src/app/doctor.rs` |
 | U-STO-81…83 | Crashed store runs: the symlink goes with the rollback when it still points where the journal says; a forged or retargeted link is never removed; killed after the rename → repair at the real path, keep worktree, branch and symlink | `src/app/doctor.rs` |
+| U-STO-93 / 93b / 93c | `store-worktrees-unreachable`: the store down (or its directory gone) and git lists worktrees in it → named, with those not locked apart; nothing changed; not reported when the store is up, none are listed or they lie elsewhere | `src/app/doctor.rs` |
+| U-STO-97 / 97b | A symlink claimed by a live run (journal locked) is not dangling and is left alone by `--fix`; the same state with nobody holding the journal is cleaned up | `src/app/doctor.rs` |
+| U-STO-102 | Killed after the registration was repaired, before the staging directory was removed: `--fix` finishes (lock, cleanup) and keeps the symlink | `src/app/doctor.rs` |
 | U-STO-84 | `not-cow` is not reported while the store can serve the source (it is when the store is broken or absent) | `src/app/doctor.rs` |
 | U-SET-01 | Off Linux: `unsupported-platform`, no mutation (real) | `src/app/setup.rs` |
 | U-SET-02…09 | Preconditions: root (`not-root` naming `sudo git parhel setup [--remove]`), `mkfs.btrfs` (`missing-tool` naming `btrfs-progs`), btrfs loadable or not, systemd, unknown user, user from `$SUDO_USER`, inferred root refused and explicit `--user root` honored | `src/app/setup.rs` |
@@ -435,15 +475,23 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-SET-15…18 | Size, `--preallocate`; re-run is a no-op (`AlreadySetUp`); a stopped store is started again; an existing image is never reformatted | `src/app/setup.rs` |
 | U-SET-19…21 | Missing `chattr` or an unprotected image fails loudly leaving a usable store; summary | `src/app/setup.rs` |
 | U-SET-22 / 22b | A second user's image: the directory protecting the first is lifted, the image created, the protection put back; also when the run fails half way | `src/app/setup.rs` |
+| U-SET-22c…22g | The directory is open only around the exclusive creation of the image (signals held back, sparse and preallocated), also when creation fails; a protection that cannot be restored is reported naming `chattr +i`; the first store has no window; a blank image from an interrupted run is sized and formatted, not recreated | `src/app/setup.rs` |
 | U-SET-23 | An image with no signature (interrupted setup) is formatted, not recreated; one that holds another filesystem is refused untouched | `src/app/setup.rs` |
+| U-SET-03b / 09b | `blkid` and `mount` are checked before anything is created; user names that systemd would expand or that are not account names are a usage error, typed or from `$SUDO_USER` | `src/app/setup.rs` |
+| U-SET-27 / 27b / 27c / 28 | A mount at the store's place that is not the user's image (tmpfs, another disk, another loop file) is not laid out, protected for or unmounted, by `setup` or `--remove`, also when it turns up after the unit started; a mounted store is never formatted | `src/app/setup.rs` |
 | U-SET-24 | A re-run adds back a lost protection and does nothing else (`Restored`) | `src/app/setup.rs` |
 | U-SET-25 | Not this store's: a mount whose image is gone, a unit of that name for another image, a marker of another user: `store-unavailable`, nothing overwritten | `src/app/setup.rs` |
 | U-SET-26 | Setup again after `--remove` builds the same store from scratch | `src/app/setup.rs` |
 | U-SET-38 | `--remove` of a stopped store mounts it to look for worktrees (they cannot be seen otherwise) and puts it back down when it refuses | `src/app/setup.rs` |
 | U-SET-39 / 40 | `--remove` unmounts a mount no unit owns; staging directories of an `add` are not worktrees | `src/app/setup.rs` |
+| U-SET-36 / 36b…36j / 38b / 02c | `--remove` looks inside before deleting: an image whose unit is gone is mounted read-only, looked into and unmounted; worktrees → `store-in-use` (named where they will appear, image intact, nothing left mounted, never overridden by the flag); a blank image is deleted without mounting; a store it cannot vouch for (does not mount, another filesystem, marker missing next to files or not this user's, unit that does not start) → `store-unavailable` saying nothing was deleted with the commands to look and to insist; files that are not the store's → `store-in-use`; `--discard-contents` overrides those two; the symlinks of `links` are printed once each before anything is deleted; a unit started to look is stopped again when looking fails | `src/app/setup.rs` |
 | U-SET-30…37 | `--remove`: refuses with worktrees (`store-in-use`, listing them), ignores baselines and empty directories, the order (disable, remove unit, reload, `chattr -i`, delete image, remove mount point), re-protects the directory while other images remain, idempotent, same user rules, partial stores, touches only parhel's paths | `src/app/setup.rs` |
-| U-SYS-01…09 | The real `Host` (`src/sys`): mountinfo with the kernel's octal escapes; programs only from absolute `PATH` directories; `run` reports stderr, a missing program is `missing-tool`; directories get their mode and owner through a descriptor and a link is not a directory; files are replaced whole and a link at their place is replaced, never followed; a marker that is a link is refused without reading its target; listing does not look through a link; sparse and fully allocated images, never over an existing one, a failed one removed; **verifying the protection of an unprotected directory reports it and keeps the image** | `src/sys/mod.rs` |
-| U-CLI-20…24 | `setup` command line: defaults, flags, `--remove` conflicts, invalid usage, help mentions sudo and `/parhel/<user>` (real) | `src/cli.rs` |
+| U-SYS-01 / 01b | `/proc/self/mountinfo`: octal escapes, the fields read, the topmost mount at a path, the deepest mount holding one | `src/domain/mounts.rs` |
+| U-SYS-06b / 06c / 10 / 11 | Reading as root: a FIFO is refused without blocking, a file over 64 KiB is refused; `mount_backing` against the machine's mount table (loop mount, an alias of the image, anything else, nothing); signals raised while deferred are delivered after | `src/sys/mod.rs` |
+| U-SYS-01…09 | The real `Host` (`src/sys`): programs only from absolute `PATH` directories; `run` reports stderr, a missing program is `missing-tool`; directories get their mode and owner through a descriptor and a link is not a directory; files are replaced whole and a link at their place is replaced, never followed; a marker that is a link is refused without reading its target; listing does not look through a link; sparse and fully allocated images, never over an existing one, a failed one removed; **verifying the protection of an unprotected directory reports it and keeps the image** | `src/sys/mod.rs` |
+| U-CLI-20…24 | `setup` command line: defaults, flags, `--remove` conflicts, invalid usage (including user names that are not account names), help mentions sudo, `/parhel/<user>` and `--discard-contents` (real) | `src/cli.rs` |
+| U-CLI-22b | `--discard-contents` belongs to `--remove` | `src/cli.rs` |
+| U-CLI-27 | Account names accepted and rejected (`[a-z_][a-z0-9_.-]*`) | `src/domain/request.rs` |
 | U-CLI-25 / 26 | `--size`: `K/M/G/T` suffixes, bare bytes; rejects malformed, overflowing, below 256M (real) | `src/domain/request.rs` |
 
 ### Integration — `tests/add_store.rs` (Linux; source on ext4, store on btrfs)
@@ -469,7 +517,7 @@ command gets a `PARHEL_STORE` that does not exist, so a developer's real store n
 | I-S13 / I-S13b | Marker missing / newer format / garbage: `store-unavailable`; `--copy` and `--fallback` bypass the store |
 | I-S14 | A source on btrfs does not use the store |
 | I-S15 | Refusals (existing destination, dirty source) create nothing in the store |
-| I-S16 | `git worktree remove <symlink>` removes the real worktree and leaves the link dangling; the path stays taken until `doctor --fix` |
+| I-S16 | A store worktree is locked: `git worktree remove` refuses; after `git worktree unlock <symlink>` it removes the real worktree and leaves the link dangling; the path stays taken until `doctor --fix` |
 | I-S17 | Same name twice: `feat` and `feat-2`, each path points at its own |
 | I-S18 | `--allow-dirty` carries work; the baseline follows the source back |
 | I-S19 | A ref other than HEAD (detached) |
@@ -480,10 +528,19 @@ command gets a `PARHEL_STORE` that does not exist, so a developer's real store n
 | I-S29 / I-S30 | SIGKILL after the rename: `doctor --fix` repairs, keeps worktree, branch and link; SIGKILL after the link: `doctor --fix` removes link, registration, branch, staging |
 | I-S31 | `--submodules=reinit`: refused by default before the store is touched; the submodule is reinitialized (not mirrored), has its own git dir under the new worktree's admin dir, its links name the real path, and the source's submodule is unchanged |
 | I-S32 | Extended attributes, POSIX ACLs and nanosecond mtimes of files and directories survive the baseline and the clone, and the worktree root takes the source's ACL |
-| I-S33 | A full store (128 MiB btrfs, 192 MiB of data): fails with "No space left on device", leaves no worktree, symlink, registration, branch or staging; a smaller source works right after |
+| I-S33 | The estimate said there was room but a 128 MiB btrfs fills under 192 MiB of data (the hook tells the binary so): fails with "No space left on device", leaves no worktree, symlink, registration, branch or staging; a smaller source works right after |
 | I-S34 | A second `add` on the same repository waits for the first to finish with the baseline; both succeed |
 | I-S35 | A destination with a tab or a newline is refused with `usage`, before anything is created |
 | I-S36 | A baseline marked `state=syncing` is not trusted: a file with the right size and mtime and wrong data is replaced |
+| I-S37 | A read-only directory in the source gains a subdirectory and a file becomes a directory inside it: the next `add` mirrors both |
+| I-S38 / I-S38b | A same-size rewrite with mtime and mode put back reaches the baseline and the next worktree; a baseline whose `meta` lacks the sync mark is copied again (a corrupted file with the right size and mtime is replaced) |
+| I-S39 | The store's mount down (directory moved away): a published worktree is locked with the store named; `doctor` names the registrations at stake; `git worktree prune` and `gc` keep them; unlocked, the same prune forgets it (control) |
+| I-S16b | `git worktree remove --force --force <symlink>` needs no unlock |
+| I-S40 | Two runs, two destinations of the same name, one frozen before the rename while the other publishes: distinct real paths (`feat`, `feat-2`), both succeed |
+| I-S41 | `doctor --fix` while an `add` is frozen after creating its symlink: the symlink stays (`in-progress`), the run publishes, the path works |
+| I-S33b | A 128 MiB store and 192 MiB of data, no hook: `store-no-space` naming the store before a byte is copied (no tree, no `meta`, no trace); works with less |
+| I-S42 | The marker's image lives on the small disk: `store-no-space` naming the image |
+| I-S43 | `doctor` low space is injected, not found by luck: quiet with room, `store-low-space` for the store and for the disk of the image when told |
 
 ### Setup — `tests/setup.rs` (needs sudo, systemd, btrfs-progs; `PARHEL_TEST_SETUP=1`, CI job `setup (Linux)`)
 Without the variable every test prints `SKIPPED: PARHEL_TEST_SETUP=1 is not set ...` and
@@ -507,6 +564,12 @@ protected image (see the comment on the CI job for why).
 | I-SET12 | Unknown `--user`: usage error, nothing created |
 | I-SET13 | `doctor` reports `store-image-deleted` when the image was deleted under a mounted store |
 | I-SET14 | Off Linux (macOS): `setup` is `unsupported-platform` (the only test here that runs unguarded) |
+| I-SET16 | The guard of the suite: `PARHEL_TEST_SETUP=1` on a machine that already has the user's image, unit or mount refuses with an explanation unless `CI` is set (the decision is pure and always runs) |
+| I-SET17 | The unit deleted by hand and a worktree in the store: `--remove` mounts the image read-only, finds it, `store-in-use` naming it, image untouched, nothing left mounted; setup brings the store back with the uncommitted work |
+| I-SET18 | The unit deleted by hand, nothing in the store: `--remove` looks, then removes image and mount point |
+| I-SET19 | Another file in the store root: `--remove` refuses naming it; `--discard-contents` removes |
+| I-SET20 | A tmpfs mounted at the store's place: `setup` and `--remove` say `store-unavailable` naming it and touch nothing |
+| I-SET21 | `--user` names that systemd would expand or that are not account names: usage error naming the rule, nothing created |
 | I-SET15 | A second (real) user's store goes into the directory that protects the first image: both images exist, both stores are mounted and the new one is that user's, `lsattr` shows the attribute, `rm` of either image as root fails with `Operation not permitted`; removing one store leaves the other image protected |
 
 Found by the first runs of the job on the CI runner (ubuntu-24.04, systemd as PID 1):

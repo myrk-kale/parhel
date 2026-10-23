@@ -25,50 +25,82 @@ All notable changes to this project are documented here. The format follows
   relocation. No flag: it is automatic; `--copy` and `--fallback` bypass it. A
   configured store that cannot be used is the new error `store-unavailable`, never
   a silent fallback; where there is no store, `not-cow` also suggests
-  `sudo git parhel setup`. Two runs on one repository take turns on the baseline,
-  a first sync over 1 GiB prints a notice, and a baseline whose sync died without
-  finishing is mirrored again instead of trusted. `git worktree remove <symlink>`
-  removes the real worktree and leaves the symlink dangling.
-- `doctor` checks the store: `store-unavailable`, `store-image-deleted`,
-  `store-low-space`, `store-orphan`, `store-dangling-link` and
-  `store-stale-baseline`; `--fix` removes dangling symlinks and stale baselines
-  and never a worktree. A source on ext4 is no longer reported as `not-cow` while
+  `sudo git parhel setup`. Two runs on one repository take turns on the baseline
+  and reserve the real name each takes (`feat`, `feat-2`...) with a lock, so two
+  destinations of one name never collide in the store; a first sync over 1 GiB
+  prints a notice, and a baseline whose sync died without finishing is mirrored
+  again instead of trusted. The sync compares the status-change time too, so a file
+  rewritten with the same size and its mtime and mode put back is still copied,
+  and a directory that is read-only in the source can still gain entries. Before
+  writing anything, `add` checks that the disk holding the store's image, and the
+  store, have room for what it will copy plus a margin, and stops with
+  `store-no-space` otherwise. `add` checks at the end that the symlink it made is
+  still there. Store worktrees are locked in git (`git worktree lock`, reason
+  `parhel store: <mount point>`) so that `git worktree prune` and `git gc` do not
+  forget them while the store's mount is down; remove one with `git worktree
+  unlock <path>`, `git worktree remove <path>` and `git parhel doctor --fix` for
+  the dangling symlink (or `remove --force --force`).
+- `doctor` checks the store: `store-unavailable`, `store-worktrees-unreachable`
+  (the store is down and git still lists worktrees in it: do not prune),
+  `store-image-deleted`, `store-low-space`, `store-orphan`, `store-dangling-link`
+  and `store-stale-baseline`; `--fix` removes dangling symlinks (never the symlink
+  of an `add` that is still running) and stale baselines and never a worktree. A source on ext4 is no longer reported as `not-cow` while
   the store can serve it, and the journals of crashed store runs are repaired or
   rolled back, trusting only paths inside the store.
 - **`git parhel setup` (Linux, run with sudo) creates the store.** One command makes
   everything the store needs: `/var/lib/parhel` (root, 0700), a sparse
   `/var/lib/parhel/<user>.img` (`--size`, default 100G, minimum 256M; `--preallocate`
   reserves it) formatted as Btrfs, a systemd mount unit (`parhel-<user>.mount`,
-  `loop,discard,noatime`, wanted by `local-fs.target`, so the store is back after a
-  reboot) mounted at `/parhel/<user>`, and inside it the user's directories and the
+  `loop,discard,noatime,nosuid,nodev`, wanted by `local-fs.target`, so the store is
+  back after a reboot) mounted at `/parhel/<user>`, and inside it the user's directories and the
   `.parhel-store` marker. The store belongs to `$SUDO_USER` or to `--user`; root is
-  never inferred. Re-running is safe: a healthy store is reported, a stopped one is
-  started, a lost protection is added back, an image that holds a filesystem is
-  never formatted, and a unit, marker or image that is not this store's is refused
-  untouched.
+  never inferred, and the name must be an account name (`[a-z_][a-z0-9_.-]*`).
+  Re-running is safe: a healthy store is reported, a stopped one is started, a lost
+  protection is added back, an image that holds a filesystem is never formatted, and
+  a unit, marker or image that is not this store's is refused untouched. So is a
+  mount at `/parhel/<user>` that is not the user's image (a tmpfs, another disk): it
+  is not laid out, protected for, or unmounted. `blkid` and `mount` are checked
+  before anything is created.
 - **The images are protected from deletion.** `setup` sets `chattr +i` on
   `/var/lib/parhel` (the directory, so the image stays writable for the loop
   device) and checks it: removing and renaming the image fail with `EPERM` even for
   root. When `chattr` is missing or the filesystem does not honor the attribute, the
   store still works and the command fails naming the image that is not protected.
-- **`git parhel setup --remove`** refuses with `store-in-use` (listing them) while
-  worktrees live in the store, and otherwise stops the unit, deletes it, the image
-  and the mount point, and protects the directory again if other users' images
-  remain. Nothing is removed that is not parhel's.
-- New error codes `store-unavailable`, `store-in-use`, `not-root`, `missing-tool`
-  and `unsupported-platform` (`setup` off Linux, or on a Linux without systemd or
-  btrfs).
+  Adding a second user's image opens the directory only around creating the empty
+  image file (signals held back, closed again at once); sizing and `mkfs` follow
+  with it protected.
+- **`git parhel setup --remove`** looks inside the store before it deletes anything
+  (through the mount, by starting the unit, or, when the unit was deleted by hand,
+  by mounting the image read-only on a private directory). It refuses with
+  `store-in-use` (listing them) while worktrees live in the store, or files that are
+  not the store's own; with `store-unavailable`, saying that nothing was deleted and
+  how to look by hand, when the image cannot be looked into or is not this user's.
+  Otherwise it prints the symlinks the store's registry names (they will dangle),
+  stops the unit, deletes it, the image and the mount point, and protects the
+  directory again if other users' images remain. `--discard-contents` deletes an
+  image that could not be checked or holds other files; worktrees still block it.
+  Nothing is removed that is not parhel's.
+- New error codes `store-unavailable`, `store-in-use`, `store-no-space`, `not-root`,
+  `missing-tool` and `unsupported-platform` (`setup` off Linux, or on a Linux
+  without systemd or btrfs).
 - The agent skill tells the agent to stop on `not-cow` and `store-unavailable`, ask
   the user to run the one-time `sudo git parhel setup`, and never run it or `sudo`
   itself; `--copy` and `--fallback` only when the user chooses them after hearing
-  about it. It also teaches the store route: the symlink and
-  `git worktree remove` followed by `git parhel doctor --fix`.
+  about it. It also teaches the store route: the symlink, the lock (`git worktree
+  unlock`, `git worktree remove`, then `git parhel doctor --fix`), never `git
+  worktree prune` or `git gc`, and `store-no-space`.
 
 ### Changed
 
 - `remove_dir_all` (rollback, `doctor`) now also removes a tree inside a
   read-only parent directory, which a mirror of a source with read-only
   directories needs.
+- Reading a file a user can write (the store marker, the unit) as root no longer
+  blocks on a FIFO planted in its place or reads a file without end: it must be a
+  regular file of at most 64 KiB.
+- `cargo clippy --all-targets --all-features -- -D warnings` passes on the musl
+  targets too (the `ioctl` request and `statfs` fields differ from glibc's), and CI
+  runs it there.
 
 ## [0.3.0] - 2026-10-23
 

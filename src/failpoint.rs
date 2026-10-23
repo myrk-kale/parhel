@@ -13,6 +13,12 @@
 //! being the entry's, relative to the source root (`walk_entry:node_modules/pkg`):
 //! a test freezes the walk at one entry only.
 //!
+//! The same build has one more test hook that is not a failpoint: `PARHEL_SPACE`, a
+//! `;`-separated list of `<path prefix>=<total bytes>:<free bytes>`, which says how much
+//! room the disk under a path has (the longest prefix wins), so that the checks of room
+//! (`doctor`'s `store-low-space`, `add`'s `store-no-space`) can be tested without filling a
+//! disk and without depending on the one the tests run on. See `fs::unix::space`.
+//!
 //! This module is test infrastructure, not product behavior: it is implemented
 //! (not stubbed) so integration tests can drive the product deterministically.
 
