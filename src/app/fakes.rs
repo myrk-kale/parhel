@@ -1128,11 +1128,14 @@ pub enum HostCall {
         mode: u32,
         owner: Owner,
     },
-    CreateImage {
+    CreateImage(PathBuf),
+    SizeImage {
         path: PathBuf,
         bytes: u64,
         preallocate: bool,
     },
+    /// The signals are held back (`true`) or let through again (`false`).
+    Signals(bool),
     VerifyImmutable {
         dir: PathBuf,
         image: PathBuf,
@@ -1148,16 +1151,19 @@ impl HostCall {
             Self::Run { program, args } => format!("run {program} {}", args.join(" ")),
             Self::CreateDir { path, .. } => format!("mkdir {}", path.display()),
             Self::WriteFile { path, .. } => format!("write {}", path.display()),
-            Self::CreateImage {
+            Self::CreateImage(path) => format!("create-image {}", path.display()),
+            Self::SizeImage {
                 path,
                 bytes,
                 preallocate: false,
-            } => format!("image {} {bytes} sparse", path.display()),
-            Self::CreateImage {
+            } => format!("size-image {} {bytes} sparse", path.display()),
+            Self::SizeImage {
                 path,
                 bytes,
                 preallocate: true,
-            } => format!("image {} {bytes} allocated", path.display()),
+            } => format!("size-image {} {bytes} allocated", path.display()),
+            Self::Signals(true) => "signals held back".to_owned(),
+            Self::Signals(false) => "signals let through".to_owned(),
             Self::VerifyImmutable { dir, image } => {
                 format!("verify-immutable {} {}", dir.display(), image.display())
             }
@@ -1203,6 +1209,10 @@ pub struct FakeHost {
     pub fail_run: RefCell<HashMap<String, ErrorCode>>,
     /// A `chattr` that succeeds without setting anything (a filesystem that ignores it).
     pub chattr_does_nothing: bool,
+    /// Creating an image fails (after the directory was checked).
+    pub fail_create_image: Cell<bool>,
+    /// Sizing an image fails.
+    pub fail_size_image: Cell<bool>,
 }
 
 impl Default for FakeHost {
@@ -1249,6 +1259,8 @@ impl Default for FakeHost {
             attrs: RefCell::default(),
             fail_run: RefCell::default(),
             chattr_does_nothing: false,
+            fail_create_image: Cell::new(false),
+            fail_size_image: Cell::new(false),
         }
     }
 }
@@ -1538,22 +1550,52 @@ impl Host for FakeHost {
         Ok(())
     }
 
-    fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()> {
-        self.log(HostCall::CreateImage {
-            path: path.into(),
-            bytes,
-            preallocate,
-        });
+    fn create_image(&self, path: &Path) -> Result<()> {
+        self.log(HostCall::CreateImage(path.into()));
+        if self.images.borrow().contains_key(path) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: File exists", path.display()),
+            ));
+        }
         self.guard(path, true)?;
+        if self.fail_create_image.get() {
+            return Err(Error::new(ErrorCode::Io, "fake: cannot create the image"));
+        }
         self.images.borrow_mut().insert(
             path.into(),
             ImageUsage {
-                apparent: bytes,
-                allocated: if preallocate { bytes } else { 4096 },
+                apparent: 0,
+                allocated: 0,
             },
         );
         self.remember(path, 0o600, None);
         Ok(())
+    }
+
+    fn size_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()> {
+        self.log(HostCall::SizeImage {
+            path: path.into(),
+            bytes,
+            preallocate,
+        });
+        if self.fail_size_image.get() {
+            return Err(Error::new(ErrorCode::Io, "fake: cannot size the image"));
+        }
+        let mut images = self.images.borrow_mut();
+        let usage = images
+            .get_mut(path)
+            .ok_or_else(|| Error::new(ErrorCode::Io, format!("no image {}", path.display())))?;
+        usage.apparent = usage.apparent.max(bytes);
+        usage.allocated = if preallocate { bytes } else { 4096 };
+        Ok(())
+    }
+
+    fn with_signals_deferred(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.log(HostCall::Signals(true));
+        let result = f();
+        self.log(HostCall::Signals(false));
+        result
     }
 
     fn image_usage(&self, path: &Path) -> Result<ImageUsage> {

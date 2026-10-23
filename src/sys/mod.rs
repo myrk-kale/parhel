@@ -435,7 +435,7 @@ impl Host for SystemHost {
         Ok(())
     }
 
-    fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()> {
+    fn create_image(&self, path: &Path) -> Result<()> {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -443,34 +443,72 @@ impl Host for SystemHost {
             .custom_flags(NO_FOLLOW)
             .open(path)
             .map_err(|e| io_error(path, &e))?;
-        let sized = (|| -> io::Result<()> {
-            // Created by the process that is root: no chown needed.
-            fchmod(&file, 0o600)?;
-            if preallocate {
-                allocate(&file, bytes)?;
-            } else {
-                file.set_len(bytes)?;
-            }
-            file.sync_all()?;
-            sync_parent(path)
-        })();
-        if let Err(e) = sized {
+        // Created by the process that is root: no chown needed.
+        let made = fchmod(&file, 0o600)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_parent(path));
+        if let Err(e) = made {
             drop(file);
             let _ = fs::remove_file(path);
+            return Err(io_error(path, &e));
+        }
+        Ok(())
+    }
+
+    fn size_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(NO_FOLLOW)
+            .open(path)
+            .map_err(|e| io_error(path, &e))?;
+        let sized = (|| -> io::Result<()> {
+            let md = file.metadata()?;
+            if !md.is_file() {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            if md.len() < bytes {
+                file.set_len(bytes)?;
+            }
+            if preallocate {
+                allocate(&file, bytes)?;
+            }
+            file.sync_all()
+        })();
+        sized.map_err(|e| {
             let why = match errno_of(&e) {
                 Some(libc::ENOSPC) => format!("not enough free space for {bytes} bytes"),
                 Some(libc::EOPNOTSUPP) => {
                     "this filesystem cannot preallocate; leave --preallocate out".to_owned()
                 }
                 Some(libc::EFBIG) => "this filesystem cannot hold a file that large".to_owned(),
+                Some(libc::EINVAL) => "it is not a regular file".to_owned(),
                 _ => e.to_string(),
             };
-            return Err(Error::new(
-                ErrorCode::Io,
-                format!("creating `{}`: {why}", path.display()),
-            ));
+            Error::new(ErrorCode::Io, format!("sizing `{}`: {why}", path.display()))
+        })
+    }
+
+    fn with_signals_deferred(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        // SAFETY: plain signal-set calls on locals; the mask is this thread's own.
+        let held = unsafe {
+            let mut hold: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut hold);
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::sigaddset(&raw mut hold, signal);
+            }
+            let mut before: libc::sigset_t = std::mem::zeroed();
+            (libc::pthread_sigmask(libc::SIG_BLOCK, &raw const hold, &raw mut before) == 0)
+                .then_some(before)
+        };
+        let result = f();
+        if let Some(before) = held {
+            // SAFETY: restores the mask saved above; a signal that came meanwhile is
+            // delivered here.
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
+            }
         }
-        Ok(())
+        result
     }
 
     fn image_usage(&self, path: &Path) -> Result<ImageUsage> {
@@ -823,33 +861,68 @@ mod tests {
         assert_eq!(host.list_dir(&dir.path().join("real/a")).unwrap(), none);
     }
 
-    // U-SYS-08: sparse and preallocated images, measured.
+    // U-SYS-08: images are made empty and exclusively, then sized: sparse, or fully
+    // allocated; sizing again is harmless and never shrinks.
     #[test]
-    fn images_are_sparse_or_fully_allocated() {
+    fn images_are_created_empty_and_sized_sparse_or_fully_allocated() {
         let dir = tmp();
         let host = SystemHost;
         let sparse = dir.path().join("sparse.img");
-        host.create_image(&sparse, 64 << 20, false).unwrap();
-        let usage = host.image_usage(&sparse).unwrap();
-        assert_eq!(usage.apparent, 64 << 20);
-        assert!(usage.allocated < 1 << 20, "{usage:?}");
+        host.create_image(&sparse).unwrap();
+        assert_eq!(host.image_usage(&sparse).unwrap().apparent, 0);
         assert_eq!(
             fs::metadata(&sparse).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        // Never over an existing image.
-        let err = host.create_image(&sparse, 1 << 20, false).unwrap_err();
+        host.size_image(&sparse, 64 << 20, false).unwrap();
+        let usage = host.image_usage(&sparse).unwrap();
+        assert_eq!(usage.apparent, 64 << 20);
+        assert!(usage.allocated < 1 << 20, "{usage:?}");
+        // Never over an existing image; sizing does not shrink it.
+        let err = host.create_image(&sparse).unwrap_err();
         assert_eq!(err.code, ErrorCode::Io, "{err}");
+        host.size_image(&sparse, 1 << 20, false).unwrap();
         assert_eq!(fs::metadata(&sparse).unwrap().len(), 64 << 20);
-        // `fallocate` is Linux's: elsewhere preallocating says so and leaves nothing.
+        // A link is not followed, nor is a directory an image.
+        let link = dir.path().join("link.img");
+        symlink(&sparse, &link).unwrap();
+        host.create_image(&link).unwrap_err();
+        host.size_image(&link, 1 << 20, false).unwrap_err();
+        host.size_image(dir.path(), 1 << 20, false).unwrap_err();
+        // `fallocate` is Linux's: elsewhere preallocating says so and still leaves the image.
         let full = dir.path().join("full.img");
-        match host.create_image(&full, 4 << 20, true) {
+        host.create_image(&full).unwrap();
+        match host.size_image(&full, 4 << 20, true) {
             Ok(()) => assert!(host.image_usage(&full).unwrap().allocated >= 4 << 20),
-            Err(e) => {
-                assert!(!full.exists(), "a failed image is removed");
-                assert!(e.message.contains("creating"), "{}", e.message);
-            }
+            Err(e) => assert!(e.message.contains("sizing"), "{}", e.message),
         }
+    }
+
+    // U-SYS-11: a signal that arrives while the signals are deferred is delivered after,
+    // not before; the previous mask is restored; the result of the closure is passed on.
+    #[test]
+    fn signals_are_held_back_for_the_duration_and_delivered_after() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HUP: AtomicBool = AtomicBool::new(false);
+        extern "C" fn on_hup(_: libc::c_int) {
+            HUP.store(true, Ordering::SeqCst);
+        }
+        // SAFETY: installs a handler that only stores to an atomic.
+        let handler: extern "C" fn(libc::c_int) = on_hup;
+        let old = unsafe { libc::signal(libc::SIGHUP, handler as libc::sighandler_t) };
+        let mut during = None;
+        let result = SystemHost.with_signals_deferred(&mut || {
+            // SAFETY: `raise` has no preconditions.
+            unsafe { libc::raise(libc::SIGHUP) };
+            during = Some(HUP.load(Ordering::SeqCst));
+            Err(Error::new(ErrorCode::Io, "the closure's own result"))
+        });
+        let after = HUP.load(Ordering::SeqCst);
+        // SAFETY: puts the previous disposition back.
+        unsafe { libc::signal(libc::SIGHUP, old) };
+        assert_eq!(during, Some(false), "delivered while it was held back");
+        assert!(after, "never delivered");
+        assert_eq!(result.unwrap_err().message, "the closure's own result");
     }
 
     // U-SYS-09: the check of the protection never destroys the image it checks, even
