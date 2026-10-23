@@ -4,7 +4,7 @@
 .SH NAME
 git\-parhel\-add \- Create a copy\-on\-write worktree
 .SH SYNOPSIS
-\fBgit parhel add\fR [\fB\-\-from\fR] [\fB\-\-branch\fR] [\fB\-\-new\-branch\fR] [\fB\-\-detach\fR] [\fB\-\-allow\-dirty\fR] [\fB\-\-fallback\fR] [\fB\-\-no\-relocate\fR] [\fB\-\-submodules\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDESTINATION\fR> [\fIREFERENCE\fR] 
+\fBgit parhel add\fR [\fB\-\-from\fR] [\fB\-\-branch\fR] [\fB\-\-new\-branch\fR] [\fB\-\-detach\fR] [\fB\-\-allow\-dirty\fR] [\fB\-\-fallback\fR] [\fB\-\-copy\fR] [\fB\-\-no\-relocate\fR] [\fB\-\-submodules\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDESTINATION\fR> [\fIREFERENCE\fR] 
 .SH DESCRIPTION
 Create a worktree at <destination> by cloning the source worktree with copy\-on\-write, then check out [ref] (default: the source HEAD). Only tracked files that differ between the source HEAD and [ref] are rewritten; everything else, ignored files included, is shared with the source until modified.
 .PP
@@ -28,6 +28,9 @@ Carry uncommitted changes from the source (staged changes arrive unstaged)
 .TP
 \fB\-\-fallback\fR
 Use a plain `git worktree add` when copy\-on\-write is impossible (no copy\-on\-write on the volume, different volumes)
+.TP
+\fB\-\-copy\fR
+Copy every file in full instead of cloning it copy\-on\-write: uses disk space, works on any filesystem and across volumes. Cannot be combined with \-\-fallback
 .TP
 \fB\-\-no\-relocate\fR
 Leave copied files that mention the source\*(Aqs path as they are (by default such paths are rewritten to the new worktree\*(Aqs)

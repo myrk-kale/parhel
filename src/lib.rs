@@ -99,6 +99,7 @@ fn report_added(outcome: &AddOutcome) {
     let how = match outcome.strategy {
         app::Strategy::CopyOnWrite => "copy-on-write",
         app::Strategy::Fallback => "regular",
+        app::Strategy::Copy => "full-copy",
     };
     println!(
         "Created {how} worktree at {}",

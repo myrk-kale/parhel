@@ -43,6 +43,9 @@ impl CowFs for UnsupportedFs {
     fn clone_entry(&self, _: &Path, _: &Path) -> Result<()> {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }
+    fn copy_entry(&self, _: &Path, _: &Path) -> Result<()> {
+        Err(Error::not_implemented("copy on this platform"))
+    }
     fn rename_exclusive(&self, _: &Path, _: &Path) -> Result<()> {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }
