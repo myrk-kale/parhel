@@ -1400,8 +1400,9 @@ fn is38b_a_baseline_without_a_mark_is_copied_again() {
         &meta,
         text.lines()
             .filter(|l| !l.starts_with("sync_start_ns="))
-            .map(|l| format!("{l}\n"))
-            .collect::<String>(),
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
     )
     .unwrap();
 
