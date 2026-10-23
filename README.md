@@ -413,6 +413,96 @@ are still going hold a lock on their journal, and `doctor` skips them. For the
 store, `--fix` also removes dangling symlinks created by `add` and baselines whose
 source is gone; it never deletes a worktree.
 
+### `git parhel setup [--size <size>] [--preallocate] [--user <name>] [--remove]`
+
+Linux only (anywhere else it stops with `unsupported-platform`). Creates the
+[store](#filesystems-without-copy-on-write) once, or with `--remove` takes it
+down. It changes the system (an image file, a mount, a systemd unit), so it needs
+root:
+
+```sh
+sudo git parhel setup
+```
+
+If `sudo` cannot find `git-parhel` (installed in `~/.local/bin` or `~/.cargo/bin`,
+which sudo's `PATH` usually lacks), give the full path:
+`sudo "$(command -v git-parhel)" setup`.
+
+| Option | Meaning |
+|---|---|
+| `--size <size>` | Size the image claims: a number with an optional `K`, `M`, `G` or `T` suffix (binary multiples). Default `100G`, minimum `256M`. The image is sparse, so it takes disk space only as it fills |
+| `--preallocate` | Reserve the whole size on disk now (`fallocate`). The disk space is yours from the start, and the store can never run out of room because the host did |
+| `--user <name>` | Whose store. Defaults to the user who ran `sudo` (`$SUDO_USER`). A root shell does not name anyone, so it is refused unless you pass `--user`; `--user root` is honored when you ask for it |
+| `--remove` | Take the store down (see [Removing the store](#removing-the-store)). Cannot be combined with `--size` or `--preallocate` |
+
+Needs `mkfs.btrfs` (package `btrfs-progs`), `chattr` (`e2fsprogs`), a kernel with
+btrfs (the module is loaded when it is only available) and systemd as the init
+system. Containers and WSL1 usually lack the last one.
+
+**What it creates**, in this order, each step only when it is missing:
+
+| What | Where |
+|---|---|
+| The directory for images, owned by root, mode 0700 | `/var/lib/parhel` |
+| The image, mode 0600, root's. Sparse, or fully allocated with `--preallocate`, formatted with `mkfs.btrfs -L parhel-<user>` | `/var/lib/parhel/<user>.img` |
+| The mount point (parents 0755, root's) | `/parhel/<user>` |
+| The systemd mount unit (`What=` the image, `Where=` the mount point, `Type=btrfs`, `Options=loop,discard,noatime`, wanted by `local-fs.target`), then `systemctl daemon-reload` and `systemctl enable --now`. The name is whatever `systemd-escape --path --suffix=mount /parhel/<user>` says, so `parhel-alice.mount` | `/etc/systemd/system/` |
+| Inside the mounted store: the root directory owned by the user (mode 0700), `baselines/`, `worktrees/` and the `.parhel-store` marker | `/parhel/<user>` |
+| The protection below | `/var/lib/parhel` |
+
+The store is mounted again at every boot by the unit. A boot where the image
+cannot be mounted does not stop the system from starting: `add` then answers
+`store-unavailable`, and `systemctl status parhel-<user>.mount` says why.
+
+**The protection.** The last step is `chattr +i` on `/var/lib/parhel`, the
+directory, not the image. An immutable directory forbids creating, deleting and
+renaming entries in it, even for root, while the image stays writable for the
+loop device. `setup` then checks it: removing the image and creating entries
+beside it (renaming goes through the same two checks) fail with `EPERM`, and
+opening the image for writing works. The probes are chosen so that they cannot
+destroy anything if the protection turns out to be missing: removal is probed with
+`rmdir` on the image, which a writable directory refuses with `ENOTDIR` and never
+deletes, and creation with a symlink that is removed again. If `chattr` is missing, or the
+filesystem under `/var/lib` does not honor the attribute, the store is left
+working, `setup` fails loudly and names the image that is not protected, and
+running it again after fixing the cause only adds the protection. Setting up a
+second user lifts the attribute for the new image and puts it back.
+
+**Running it again** is safe. A healthy store is reported and nothing is
+changed. A store whose unit was stopped is started, one that lost its protection
+gets it back, and a run that stopped half way is finished. An image that holds a
+filesystem is never formatted; only an image with no signature at all (what an
+interrupted setup leaves) is. A unit, marker or image that belongs to something
+else, or a store that is mounted without its image, is reported as
+`store-unavailable` and left alone.
+
+#### Removing the store
+
+```sh
+sudo git parhel setup --remove            # add --user <name> if it is not yours
+```
+
+It refuses with `store-in-use` and lists the worktrees while any lives in the
+store; remove each with `git worktree remove <path>` first (and let
+`git parhel doctor --fix` clear the symlinks left behind). Baselines are a cache
+and do not block it. Otherwise it stops and disables the unit, deletes it,
+reloads systemd, lifts the protection, deletes the image and the mount point, and
+puts the protection back if other users' images remain. Running it with nothing
+to remove does nothing. `/parhel` and `/var/lib/parhel` stay, empty. If a damaged
+image will not mount, `--remove` cannot look inside it and stops; remove it by
+hand with `systemctl disable --now`, `chattr -i /var/lib/parhel` and `rm`.
+
+#### Risks
+
+- The store is **one image file** on the host's disk. If it is lost, everything
+  uncommitted in the store's worktrees is lost with it. The protection above
+  prevents the accidental `rm`, not a failing disk or a deliberate `chattr -i`.
+- Commits and branches are **safe**: they live in your repository's own `.git`,
+  not in the store. Push work you cannot lose, as you would before any tool that
+  writes to `.git`.
+- A sparse image can outgrow the disk under it. `git parhel doctor` warns with
+  `store-low-space`; `--preallocate` avoids the surprise.
+
 ### Help
 
 `git parhel -h` prints a short summary. `git parhel --help` and
@@ -481,7 +571,8 @@ and running the same test suite against it.
 
 On Linux, a source on ext4 (or any filesystem that cannot reflink) can still get
 copy-on-write worktrees through the **store**: a Btrfs image, one per user, that
-is mounted at `/parhel/<user>` and created once with `sudo git parhel setup`.
+is mounted at `/parhel/<user>` and created once with
+[`sudo git parhel setup`](#git-parhel-setup---size-size---preallocate---user-name---remove).
 The worktree is created inside the store, where files can share blocks, and the
 path you asked for becomes a symlink to it.
 
@@ -629,6 +720,11 @@ it touches. These are all the writes `add` makes:
 | Cloned files, rewritten paths, removed foreign `.git` files | Only inside the new worktree |
 | Pointing the registration at the final path | Only that registration's `gitdir` file |
 | With a store: the baseline, the worktree, the registry of links | `<store>/baselines/<id>`, `<store>/worktrees/<id>/<name>` and `<store>/links`, all inside the store; plus the symlink at the destination you asked for |
+
+`git parhel setup` is the one command that writes outside your repositories, as
+root, and only at the places listed under [its reference](#git-parhel-setup---size-size---preallocate---user-name---remove):
+`/var/lib/parhel`, `/parhel/<user>` and one unit in `/etc/systemd/system`.
+`--remove` deletes exactly those and nothing that merely lies next to them.
 
 It never writes to other worktrees, never changes `.git/config` (submodule
 settings are written only if they differ, and only for the new worktree's
@@ -789,6 +885,10 @@ usage errors and `128 + signal` when a signal interrupted the run.
 | `dest-parent-missing` | Create the parent directory first |
 | `not-cow` / `cross-volume` | Use a destination on the same volume, on a filesystem with copy-on-write, set up the [store](#filesystems-without-copy-on-write) (`sudo git parhel setup`, Linux), or pass `--copy` (full copy) or `--fallback` (regular worktree) |
 | `store-unavailable` | The store exists but cannot be used (not mounted, marker missing, no copy-on-write, not writable). Run `git parhel doctor` and look at `systemctl status` of its mount; `--copy` and `--fallback` do not need it |
+| `not-root` | `git parhel setup` changes the system and must run as root; the message gives the exact `sudo` command |
+| `missing-tool` | A program `setup` needs is not installed: `mkfs.btrfs` (package `btrfs-progs`) or `chattr` (`e2fsprogs`). With `chattr` the store was created but its image is not protected; install the package and run `setup` again |
+| `unsupported-platform` | `setup` only exists on Linux, and there it needs systemd and a kernel with btrfs |
+| `store-in-use` | `setup --remove` refuses while worktrees live in the store; the message lists them. Remove them with `git worktree remove` first |
 | `submodules-present` | Pass `--submodules=reinit` |
 | `dirty-submodule` | Commit or stash the changes inside the submodule, or drop `--allow-dirty` |
 | `operation-in-progress` | Finish or abort the merge, rebase or cherry-pick first |
@@ -817,6 +917,10 @@ cargo uninstall parhel                # cargo
 ```
 
 Worktrees you already created keep working. They are regular git worktrees.
+
+If you set up a [store](#filesystems-without-copy-on-write) on Linux, take it down
+first, while `git parhel` is still installed: `sudo git parhel setup --remove`
+(after removing the worktrees that live in it).
 
 ## Development
 

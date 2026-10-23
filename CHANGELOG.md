@@ -35,7 +35,34 @@ All notable changes to this project are documented here. The format follows
   and never a worktree. A source on ext4 is no longer reported as `not-cow` while
   the store can serve it, and the journals of crashed store runs are repaired or
   rolled back, trusting only paths inside the store.
-- New error code `store-unavailable`.
+- **`git parhel setup` (Linux, run with sudo) creates the store.** One command makes
+  everything the store needs: `/var/lib/parhel` (root, 0700), a sparse
+  `/var/lib/parhel/<user>.img` (`--size`, default 100G, minimum 256M; `--preallocate`
+  reserves it) formatted as Btrfs, a systemd mount unit (`parhel-<user>.mount`,
+  `loop,discard,noatime`, wanted by `local-fs.target`, so the store is back after a
+  reboot) mounted at `/parhel/<user>`, and inside it the user's directories and the
+  `.parhel-store` marker. The store belongs to `$SUDO_USER` or to `--user`; root is
+  never inferred. Re-running is safe: a healthy store is reported, a stopped one is
+  started, a lost protection is added back, an image that holds a filesystem is
+  never formatted, and a unit, marker or image that is not this store's is refused
+  untouched.
+- **The images are protected from deletion.** `setup` sets `chattr +i` on
+  `/var/lib/parhel` (the directory, so the image stays writable for the loop
+  device) and checks it: removing and renaming the image fail with `EPERM` even for
+  root. When `chattr` is missing or the filesystem does not honor the attribute, the
+  store still works and the command fails naming the image that is not protected.
+- **`git parhel setup --remove`** refuses with `store-in-use` (listing them) while
+  worktrees live in the store, and otherwise stops the unit, deletes it, the image
+  and the mount point, and protects the directory again if other users' images
+  remain. Nothing is removed that is not parhel's.
+- New error codes `store-unavailable`, `store-in-use`, `not-root`, `missing-tool`
+  and `unsupported-platform` (`setup` off Linux, or on a Linux without systemd or
+  btrfs).
+- The agent skill tells the agent to stop on `not-cow` and `store-unavailable`, ask
+  the user to run the one-time `sudo git parhel setup`, and never run it or `sudo`
+  itself; `--copy` and `--fallback` only when the user chooses them after hearing
+  about it. It also teaches the store route: the symlink and
+  `git worktree remove` followed by `git parhel doctor --fix`.
 
 ### Changed
 

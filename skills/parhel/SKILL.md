@@ -8,7 +8,9 @@ description: >-
   checkout, a hotfix next to unfinished work, one worktree per agent) and the
   project has heavy dependencies or builds. Also covers the safe workflow:
   keeping copies away from shared databases and services, not losing ignored
-  data when a worktree is removed, and recovering from interrupted runs.
+  data when a worktree is removed, recovering from interrupted runs, and what
+  to do when copy-on-write is not available (stop and ask the user to run the
+  one-time `sudo git parhel setup`; never run it yourself).
 ---
 
 # parhel: copy-on-write git worktrees
@@ -18,7 +20,11 @@ worktree's ignored and untracked files (`node_modules`, `target`, `.venv`,
 `.env`, caches) into the new worktree. On a copy-on-write filesystem the copy
 takes seconds and almost no disk space until files change. That means APFS
 on macOS and, on Linux, Btrfs, XFS with reflink, bcachefs or ZFS 2.2+. On
-other filesystems `--copy` copies every file in full instead.
+Linux filesystems without it (ext4, for example) the user can set up a
+**store** once with `sudo git parhel setup`: a Btrfs image where the
+worktrees live, copy-on-write again. Only the user can do that, because it
+needs root. Without it, `--copy` copies every file in full and `--fallback`
+makes a regular worktree, and both are a last resort (see step 3).
 
 A copy is a full working environment, not a sandbox. It keeps the same
 credentials, talks to the same services and lives in the same git repository
@@ -88,11 +94,44 @@ ls -a .env* 2>/dev/null
 git parhel add ../<project>-<task> --new-branch <branch>
 ```
 
-- Put the destination next to the project (same volume). `cross-volume` or
-  `not-cow` means copy-on-write is impossible there. Offer the user the two
-  ways out and let them choose: `--copy` copies every file in full (works
-  anywhere, takes time and disk space), `--fallback` creates a regular
-  worktree without the copied files. They cannot be combined.
+- Put the destination next to the project (same volume).
+- **If `add` fails with `not-cow` or `cross-volume` on Linux, stop.** Do not
+  try `--copy` or `--fallback` to get past it, and do not look for another
+  directory to make the error go away. Tell the user that copy-on-write needs
+  a one-time setup that only they can run, give them the exact command, and
+  wait until they say it is done:
+
+  > Copy-on-write is not available between the source and `<destination>`.
+  > On Linux this is fixed once with a store: please run
+  > `sudo git parhel setup` (it creates a Btrfs image mounted at
+  > `/parhel/<user>`; `git parhel setup --help` says exactly what it does).
+  > Tell me when it is done and I will run the same `git parhel add` again.
+
+  Never run `git parhel setup` yourself and never run anything with `sudo`.
+  The user may need `sudo "$(command -v git-parhel)" setup` if sudo cannot
+  find `git-parhel`.
+- **If `add` fails with `store-unavailable`,** a store exists but cannot be
+  used (not mounted, marker missing, not writable). Stop here too. You may run
+  the read-only checks `git parhel doctor` and `systemctl status <unit>` (the
+  unit is named in the error and in `/parhel/<user>/.parhel-store`) and show
+  the output. The fix needs root, so it is the user's: most often
+  `sudo systemctl start <unit>`, or `sudo git parhel setup`, which is safe to
+  run again. Wait for them. `git parhel add` never falls back by itself.
+- On macOS `not-cow` means the destination is not on APFS: choose a
+  destination on an APFS volume. There is no `setup` there.
+- `--copy` and `--fallback` exist, but avoid them. Use one only when the user,
+  after being told that `sudo git parhel setup` would give them copy-on-write,
+  explicitly chooses it, and say what it costs: `--copy` copies every file in
+  full, so each worktree takes the whole disk space and the time of a real
+  copy; `--fallback` gives a regular worktree without dependencies or build
+  output, which have to be installed and built again. They cannot be combined.
+- With a store, `add` uses it by itself and prints where the worktree really
+  lives. The worktree is in the store (`/parhel/<user>/worktrees/<id>/<name>`)
+  and the path you asked for is a **symlink** to it. Work from either path;
+  git registers the real one. Remember that the store is one image file:
+  commits are safe in the repository's `.git`, but uncommitted work inside a
+  store worktree goes with the image if it is lost, so tell the user to push
+  what matters.
 - Other forms: `--branch <existing>`, `--detach <ref>`, a start commit as the
   last argument. With initialized submodules, `--submodules=reinit` is
   required.
@@ -111,7 +150,8 @@ git parhel add ../<project>-<task> --new-branch <branch>
 | `operation-in-progress` | A merge, rebase or cherry-pick is open in the source: ask the user |
 | `source-changed` | Something wrote to the source during the copy; wait for it and retry |
 | `submodules-present` | Retry with `--submodules=reinit` |
-| `not-cow`, `cross-volume` | Different location, or ask whether to use `--copy` or `--fallback` |
+| `not-cow`, `cross-volume` | Linux: stop, tell the user to run `sudo git parhel setup` once, wait. macOS: a destination on APFS. `--copy` or `--fallback` only if the user chooses them after hearing about setup |
+| `store-unavailable` | Stop. Show `git parhel doctor` and `systemctl status <unit>`; the user fixes it (`sudo systemctl start <unit>` or `sudo git parhel setup`), then retry |
 | `git-failed` | Git's message follows, for example a branch name already in use |
 | `rollback-failed` | Run `git parhel doctor`, show the user, then `--fix` (step 6) |
 
@@ -139,6 +179,12 @@ git -C <worktree> status --ignored --short  # ignored files are not protected
 git worktree remove <worktree>
 ```
 
+- A worktree in the store is removed the same way, by either path.
+  `git worktree remove <symlink>` deletes the real worktree and leaves the
+  symlink dangling, which keeps that path taken (`dest-exists`). Then run
+  `git parhel doctor --fix`: it removes dangling symlinks that `add` created
+  and never a worktree.
+
 - `git worktree remove` refuses only when tracked or untracked files changed.
   Ignored files, such as a local database, logs, generated reports or an
   edited `.env`, are deleted without warning. If the ignored listing shows
@@ -162,14 +208,23 @@ Show the findings to the user, then run `git parhel doctor --fix`. It undoes
 interrupted runs from their journal, or completes them when the worktree was
 already in place, and it never deletes a worktree it cannot prove parhel
 created. `in-progress` findings belong to a run that is still active: leave
-them alone.
+them alone. With a store, `doctor` also reports `store-unavailable`,
+`store-image-deleted` (the image was deleted behind a mounted store: tell the
+user at once to copy their work out before unmounting), `store-low-space`,
+`store-orphan` and `store-dangling-link`; `--fix` clears dangling links and
+stale baselines, never a worktree. Problems that need root are for the user to
+fix.
 
 ## Rules
 
 - Ask before: `--allow-dirty`, `--copy`, `--fallback`, `--force` on any git command,
   removing a worktree with ignored files the user created, and running
   anything destructive against services the copy shares with the source.
-- Never: hand-edit `.git/worktrees`, delete `.parhel-staging-*` folders, run
+  `--copy` and `--fallback` are never the default way past `not-cow`: first
+  tell the user about `sudo git parhel setup` and wait for their choice.
+- Never: run `git parhel setup` (with or without `--remove`) or anything with
+  `sudo`, touch `/var/lib/parhel`, `/parhel` or the systemd unit of a store,
+  hand-edit `.git/worktrees`, delete `.parhel-staging-*` folders, run
   `git worktree prune` to clean up after parhel (use `git parhel doctor`), or
   copy files back from the source into a worktree to "fix" relocation.
 - Repository safety: parhel only changes its own worktree registration and a
