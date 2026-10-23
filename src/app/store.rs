@@ -170,7 +170,7 @@ pub fn sync_baseline(
         baseline,
         exclusions,
         interrupted,
-        last_sync,
+        since: last_sync,
         report: SyncReport::default(),
     };
     sync.check_interrupt()?;
@@ -184,7 +184,7 @@ struct Sync<'a> {
     baseline: &'a Path,
     exclusions: &'a Exclusions,
     interrupted: &'a AtomicBool,
-    last_sync: Option<i128>,
+    since: Option<i128>,
     report: SyncReport,
 }
 
@@ -214,7 +214,7 @@ impl Sync<'_> {
         };
         let dst = self.baseline.join(rel);
         let held = self.fs.stat_within(self.baseline, rel)?;
-        let action = sync_action(&source, held.as_ref(), self.last_sync);
+        let action = sync_action(&source, held.as_ref(), self.since);
         match action {
             SyncAction::Keep => self.report.unchanged += 1,
             SyncAction::Create | SyncAction::Update => {}

@@ -207,32 +207,45 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         );
     }
     // After the fix: a crashed run's symlink is gone by now and is not reported twice.
-    match &store_state {
+    store_findings_of(
+        env,
+        &repo,
+        &store_state,
+        &worktrees,
+        &claimed,
+        request.fix,
+        &mut report,
+    );
+    Ok(report)
+}
+
+/// What the store adds to the report: why it cannot be used, or the checks that need it.
+fn store_findings_of(
+    env: &Env<'_>,
+    repo: &RepoInfo,
+    store_state: &StoreState,
+    worktrees: &[WorktreeEntry],
+    claimed: &[PathBuf],
+    fix: bool,
+    report: &mut DoctorReport,
+) {
+    match store_state {
         StoreState::Unavailable { root, reason } => {
             report.findings.push(Finding::StoreUnavailable {
                 path: root.clone(),
                 reason: reason.clone(),
             });
-            unreachable_worktrees(env, root, &worktrees, &mut report);
+            unreachable_worktrees(env, root, worktrees, report);
         }
         StoreState::Available(store) => {
-            check_store(
-                env,
-                &repo,
-                store,
-                &worktrees,
-                &claimed,
-                request.fix,
-                &mut report,
-            );
+            check_store(env, repo, store, worktrees, claimed, fix, report);
         }
         StoreState::NotConfigured => {
             if let Some(root) = env.store {
-                unreachable_worktrees(env, root, &worktrees, &mut report);
+                unreachable_worktrees(env, root, worktrees, report);
             }
         }
     }
-    Ok(report)
 }
 
 /// Worktrees git lists inside the store at `root`, which cannot be reached: a `git

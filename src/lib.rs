@@ -18,6 +18,7 @@ pub mod signals;
 pub mod sys;
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -221,11 +222,12 @@ fn unreachable_detail(root: &Path, worktrees: &[PathBuf], unlocked: &[PathBuf]) 
         list(worktrees)
     );
     if !unlocked.is_empty() {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "; these are not locked and would be forgotten ({}): lock each with `git worktree \
              lock <path>`",
             list(unlocked)
-        ));
+        );
     }
     text
 }
