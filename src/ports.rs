@@ -289,9 +289,17 @@ pub trait Host {
     fn create_dir(&self, path: &Path, mode: u32, owner: Owner) -> Result<()>;
     /// Write a file (replacing), with the mode and owner given.
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32, owner: Owner) -> Result<()>;
-    /// Create the image file (mode 0600, root): `ftruncate` to `bytes`, or `fallocate`
-    /// the whole size with `preallocate`.
-    fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()>;
+    /// Create the image file, empty, exclusively (mode 0600, root's): an existing file
+    /// (or link) is an error.
+    fn create_image(&self, path: &Path) -> Result<()>;
+    /// Give the image its size: `ftruncate` up to `bytes` (a sparse file; never smaller
+    /// than it is), and with `preallocate` `fallocate` the whole size. Idempotent, so a run
+    /// that stopped half way is finished by running it again.
+    fn size_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()>;
+    /// Run `f` with SIGINT, SIGTERM and SIGHUP held back: a signal that arrives meanwhile
+    /// is delivered after `f` returns. For the few moments a Ctrl-C would leave something
+    /// half done that matters.
+    fn with_signals_deferred(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()>;
     fn image_usage(&self, path: &Path) -> Result<ImageUsage>;
     /// After `chattr +i` on `dir`: removing `image` and creating entries beside it fail
     /// with `EPERM` (renaming goes through the same two checks) while opening the image

@@ -329,13 +329,8 @@ fn create(host: &dyn Host, places: &Places, request: &SetupRequest) -> Result<Se
         verify_mount(host, places)?;
     }
 
-    // A directory that already protects other images cannot take a new one.
-    let lifted = !image_present && host.is_immutable(Path::new(STATE_DIR));
-    if lifted {
-        host.run("chattr", &["-i", STATE_DIR])?;
-    }
     let mut progress = Progress::default();
-    let built = build(
+    build(
         host,
         places,
         request,
@@ -345,12 +340,7 @@ fn create(host: &dyn Host, places: &Places, request: &SetupRequest) -> Result<Se
             mounted,
         },
         &mut progress,
-    );
-    if built.is_err() && lifted && !host.is_immutable(Path::new(STATE_DIR)) {
-        // Whatever stopped the run, the images already there stay protected.
-        let _ = host.run("chattr", &["+i", STATE_DIR]);
-    }
-    built?;
+    )?;
 
     let summary = places.summary(host)?;
     Ok(if progress.built {
@@ -378,19 +368,25 @@ fn build(
 ) -> Result<()> {
     // The image: created when missing, formatted when it holds no filesystem at all
     // (an earlier run stopped before `mkfs`), never touched when it holds one.
-    if !existing.image {
-        host.create_dir(Path::new(STATE_DIR), 0o700, None)?;
-        host.create_image(&places.image, request.size, request.preallocate)?;
+    let created = !existing.image;
+    if created {
+        new_image(host, places)?;
         progress.built = true;
     }
-    // A mounted image is in use - and has a filesystem, whatever `blkid` makes of it.
+    // A mounted image is in use - and has a filesystem, whatever `blkid` makes of it. One
+    // just made, or that an interrupted run left empty, has none.
     let found = if existing.mounted {
         Some("btrfs".to_owned())
+    } else if created || host.image_usage(&places.image)?.apparent == 0 {
+        None
     } else {
         host.filesystem_of(&places.image)?
     };
     match found {
         None => {
+            // Sized now, with the directory protected again: preallocating a big image
+            // takes long, and it can be done to a file in an immutable directory.
+            host.size_image(&places.image, request.size, request.preallocate)?;
             let label = format!("parhel-{}", places.user.name);
             let image = places.image.to_string_lossy();
             host.run("mkfs.btrfs", &["-q", "-L", &label, &image])?;
@@ -491,6 +487,46 @@ fn verify_mount(host: &dyn Host, places: &Places) -> Result<()> {
             ),
         )),
     }
+}
+
+/// Make the image file, exclusively. `/var/lib/parhel` is immutable once there is an
+/// image, which forbids creating entries even for root: when it protects other users'
+/// images it is opened for this one call and closed again at once, with SIGINT, SIGTERM
+/// and SIGHUP held back for the moment (a Ctrl-C there would leave every image
+/// unprotected). Sizing and formatting come after, with the directory protected.
+fn new_image(host: &dyn Host, places: &Places) -> Result<()> {
+    let state_dir = Path::new(STATE_DIR);
+    let make = || {
+        host.create_dir(state_dir, 0o700, None)
+            .and_then(|()| host.create_image(&places.image))
+    };
+    if !host.is_immutable(state_dir) {
+        // The first image: nothing to protect yet, the protection comes at the end.
+        return make();
+    }
+    host.with_signals_deferred(&mut || {
+        host.run("chattr", &["-i", STATE_DIR])?;
+        let made = make();
+        // Whatever happened.
+        host.run("chattr", &["+i", STATE_DIR])
+            .map_err(|e| lost_protection(&e.message))?;
+        made
+    })?;
+    host.verify_immutable(state_dir, &places.image)
+        .map_err(|e| lost_protection(&e.message))
+}
+
+/// The immutable directory that holds the other users' images could not be made immutable
+/// again after a new image was added: all of them can be deleted until it is.
+fn lost_protection(why: &str) -> Error {
+    Error::new(
+        ErrorCode::Io,
+        format!(
+            "{STATE_DIR} is NOT protected from deletion any more, and the images in it are not \
+             either: {why}. Run `sudo chattr +i {STATE_DIR}` yourself, then run `git parhel \
+             setup` again"
+        ),
+    )
 }
 
 /// A unit that exists must be this user's: never overwrite somebody's.
@@ -799,7 +835,8 @@ mod tests {
     fn expected_setup() -> Vec<&'static str> {
         vec![
             "mkdir /var/lib/parhel",
-            "image /var/lib/parhel/alice.img 107374182400 sparse",
+            "create-image /var/lib/parhel/alice.img",
+            "size-image /var/lib/parhel/alice.img 107374182400 sparse",
             "run mkfs.btrfs -q -L parhel-alice /var/lib/parhel/alice.img",
             "mkdir /parhel",
             "mkdir /parhel/alice",
@@ -1134,7 +1171,8 @@ mod tests {
         };
         setup(&h, &req).unwrap();
         assert!(
-            h.lines().contains(&format!("image {IMG} {bytes} {kind}")),
+            h.lines()
+                .contains(&format!("size-image {IMG} {bytes} {kind}")),
             "{:?}",
             h.lines()
         );
@@ -1182,7 +1220,7 @@ mod tests {
         assert!(
             !lines
                 .iter()
-                .any(|l| l.starts_with("image ") || l.contains("mkfs")),
+                .any(|l| l.starts_with("create-image ") || l.contains("mkfs")),
             "{lines:?}"
         );
         assert!(lines.contains(&"run systemctl enable --now parhel-alice.mount".to_owned()));
@@ -1285,33 +1323,36 @@ mod tests {
         );
     }
 
-    // U-SET-22: a second user's image goes into the directory that protects the first
-    // one: lifted for the new image, protected again after.
-    #[test]
-    fn a_second_users_store_lifts_and_restores_the_protection() {
+    /// The machine after alice's store, with the user bob to set up next.
+    fn alice_is_set_up() -> (FakeHost, SetupRequest) {
         let h = FakeHost::default();
         installed(&h);
         let req = SetupRequest {
             user: Some("bob".into()),
             ..request()
         };
+        (h, req)
+    }
+
+    // U-SET-22: a second user's image goes into the directory that protects the first
+    // one: lifted for the creation of the new image, and put back at once.
+    #[test]
+    fn a_second_users_store_lifts_and_restores_the_protection() {
+        let (h, req) = alice_is_set_up();
         assert!(matches!(setup(&h, &req).unwrap(), SetupOutcome::Created(_)));
         let lines = h.lines();
-        assert_eq!(
-            lines.first().map(String::as_str),
-            Some("run chattr -i /var/lib/parhel")
-        );
-        let at = |line: &str| lines.iter().position(|l| l == line).unwrap();
+        let at = |line: &str| {
+            lines
+                .iter()
+                .position(|l| l == line)
+                .unwrap_or_else(|| panic!("no `{line}` in {lines:#?}"))
+        };
+        assert!(at("run chattr -i /var/lib/parhel") < at("create-image /var/lib/parhel/bob.img"));
+        assert!(at("create-image /var/lib/parhel/bob.img") < at("run chattr +i /var/lib/parhel"));
+        // The new image is checked for protection too, not only the first one.
         assert!(
-            at("run chattr -i /var/lib/parhel")
-                < at("image /var/lib/parhel/bob.img 107374182400 sparse")
-        );
-        assert_eq!(
-            &lines[lines.len() - 2..],
-            [
-                "run chattr +i /var/lib/parhel",
-                "verify-immutable /var/lib/parhel /var/lib/parhel/bob.img"
-            ]
+            lines.contains(&"verify-immutable /var/lib/parhel /var/lib/parhel/bob.img".to_owned()),
+            "{lines:#?}"
         );
         assert!(h.immutable.borrow().contains(Path::new("/var/lib/parhel")));
         assert!(
@@ -1321,7 +1362,8 @@ mod tests {
         assert!(h.is_mount_point(Path::new(ROOT)));
     }
 
-    // U-SET-22b: ... also when the second store fails half way.
+    // U-SET-22b: ... also when the second store fails half way: the images were already
+    // protected again before anything slow ran.
     #[test]
     fn a_failed_run_does_not_leave_the_images_unprotected() {
         let h = FakeHost::default().failing("mkfs.btrfs", ErrorCode::Io);
@@ -1331,11 +1373,137 @@ mod tests {
             ..request()
         };
         setup(&h, &req).unwrap_err();
+        assert!(h.immutable.borrow().contains(Path::new("/var/lib/parhel")));
+        let lines = h.lines();
+        let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix)).unwrap();
+        assert!(at("run chattr +i") < at("size-image"), "{lines:#?}");
+        assert!(at("run chattr +i") < at("run mkfs.btrfs"), "{lines:#?}");
+    }
+
+    // U-SET-22c: the directory is open only for the exclusive creation of the new image:
+    // nothing between the two chattr runs but the creation (the directory itself, the
+    // image), signals held back all that time, and sizing - which can take long when the
+    // image is preallocated - and mkfs come after.
+    #[rstest]
+    #[case::sparse(false, "sparse")]
+    #[case::preallocated(true, "allocated")]
+    fn the_protection_is_off_only_around_the_creation(
+        #[case] preallocate: bool,
+        #[case] kind: &str,
+    ) {
+        let (h, mut req) = alice_is_set_up();
+        req.preallocate = preallocate;
+        setup(&h, &req).unwrap();
         assert_eq!(
-            h.lines().last().map(String::as_str),
-            Some("run chattr +i /var/lib/parhel")
+            &h.lines()[..6],
+            [
+                "signals held back",
+                "run chattr -i /var/lib/parhel",
+                "mkdir /var/lib/parhel",
+                "create-image /var/lib/parhel/bob.img",
+                "run chattr +i /var/lib/parhel",
+                "signals let through",
+            ]
+        );
+        let lines = h.lines();
+        let size = lines
+            .iter()
+            .position(|l| *l == format!("size-image /var/lib/parhel/bob.img 107374182400 {kind}"))
+            .expect("sized");
+        let mkfs = lines
+            .iter()
+            .position(|l| l.starts_with("run mkfs.btrfs"))
+            .expect("formatted");
+        assert!(5 < size && size < mkfs, "{lines:#?}");
+    }
+
+    // U-SET-22d: an image that cannot be created does not leave the protection off, and
+    // does not leave the signals held back.
+    #[test]
+    fn a_creation_that_fails_still_restores_the_protection_and_the_signals() {
+        let (h, req) = alice_is_set_up();
+        h.fail_create_image.set(true);
+        let err = setup(&h, &req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
+        assert_eq!(
+            h.lines(),
+            vec![
+                "signals held back",
+                "run chattr -i /var/lib/parhel",
+                "mkdir /var/lib/parhel",
+                "create-image /var/lib/parhel/bob.img",
+                "run chattr +i /var/lib/parhel",
+                "signals let through",
+            ]
         );
         assert!(h.immutable.borrow().contains(Path::new("/var/lib/parhel")));
+    }
+
+    // U-SET-22e: the protection that cannot be put back is an error that says so, loudly,
+    // naming the command: every other image is unprotected until it is.
+    #[test]
+    fn a_protection_that_cannot_be_restored_is_reported() {
+        let h = FakeHost {
+            chattr_does_nothing: true,
+            ..FakeHost::default()
+        };
+        installed(&h);
+        let req = SetupRequest {
+            user: Some("bob".into()),
+            ..request()
+        };
+        let err = setup(&h, &req).unwrap_err();
+        assert!(
+            err.message.contains("chattr +i /var/lib/parhel"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("NOT protected"), "{}", err.message);
+    }
+
+    // U-SET-22f: the first user's directory is not protected yet: nothing is lifted, no
+    // signal is held back for it, and the protection comes at the end as before.
+    #[test]
+    fn the_first_store_has_no_window() {
+        let h = FakeHost::default();
+        setup(&h, &request()).unwrap();
+        let lines = h.lines();
+        assert!(!lines.iter().any(|l| l.starts_with("signals")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l == "run chattr -i /var/lib/parhel"));
+    }
+
+    // U-SET-22g: an interrupted run leaves a blank image (created, not sized, or sized and
+    // not formatted): the next one finishes it - sized again, never recreated.
+    #[test]
+    fn a_blank_image_from_an_interrupted_run_is_sized_and_formatted() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.files.borrow_mut().remove(&p(UNIT_FILE));
+        h.mounted.borrow_mut().clear();
+        h.immutable.borrow_mut().clear();
+        h.formatted.borrow_mut().clear();
+        h.images.borrow_mut().insert(
+            p(IMG),
+            ImageUsage {
+                apparent: 0,
+                allocated: 0,
+            },
+        );
+        assert!(matches!(
+            setup(&h, &request()).unwrap(),
+            SetupOutcome::Created(_)
+        ));
+        let lines = h.lines();
+        assert!(
+            !lines.iter().any(|l| l.starts_with("create-image ")),
+            "{lines:?}"
+        );
+        let size = lines
+            .iter()
+            .position(|l| l.starts_with("size-image "))
+            .unwrap();
+        let mkfs = lines.iter().position(|l| l.contains("mkfs")).unwrap();
+        assert!(size < mkfs);
     }
 
     // U-SET-23: an image without any signature is what an interrupted setup leaves: it
@@ -1354,7 +1522,10 @@ mod tests {
         ));
         let lines = h.lines();
         assert!(lines.contains(&format!("run mkfs.btrfs -q -L parhel-alice {IMG}")));
-        assert!(!lines.iter().any(|l| l.starts_with("image ")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("create-image ")),
+            "{lines:?}"
+        );
 
         let h = FakeHost::default();
         installed(&h);
