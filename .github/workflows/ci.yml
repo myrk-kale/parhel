@@ -108,7 +108,8 @@ jobs:
         run: |
           id
           echo "PID 1: $(ps -p 1 -o comm=)"
-          systemctl --version | head -n 1
+          # sed, not head: with pipefail a reader that quits early fails the step.
+          systemctl --version | sed -n 1p
           sudo -n true
           sudo modprobe loop btrfs || true
           grep -w btrfs /proc/filesystems
