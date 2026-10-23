@@ -96,6 +96,8 @@ pub fn fs_type(path: &Path) -> String {
 /// Name of the filesystem holding `path` from its `f_type` magic (`"btrfs"`,
 /// `"xfs"`, `"ext4"`, `"tmpfs"`, ...), or the magic in hex when unknown.
 #[cfg(not(target_os = "macos"))]
+// `f_type` is a `c_ulong` on musl and a signed word on glibc.
+#[allow(clippy::useless_conversion)]
 pub fn fs_type(path: &Path) -> String {
     let magic = u64::try_from(statfs(path).f_type).unwrap();
     match magic {
@@ -118,7 +120,8 @@ pub fn free_bytes(path: &Path) -> u64 {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[allow(clippy::cast_sign_loss)]
+// `f_bsize` is unsigned on musl and signed on glibc.
+#[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
 pub fn free_bytes(path: &Path) -> u64 {
     let st = statfs(path);
     st.f_bavail * st.f_bsize as u64
