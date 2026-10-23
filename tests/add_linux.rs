@@ -1190,3 +1190,132 @@ fn il45_inherited_acls_do_not_widen_access() {
         assert_eq!(acl_of(&dest, acl::DEFAULT), None, "worktree root ({label})");
     }
 }
+
+// ------------------------------------------------------------ what the kernel decides
+
+/// A btrfs subvolume in the btrfs test mount: another `st_dev`, the same filesystem.
+/// Deleted on drop when the unprivileged user is allowed to (otherwise it stays in the
+/// throwaway test filesystem).
+struct Subvolume(PathBuf);
+
+impl Subvolume {
+    fn create() -> Option<Self> {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = test_mount(MountedFs::Btrfs)?;
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = base.join(format!("parhel-subvol-{}-{n}", std::process::id()));
+        let out = Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(&path)
+            .output()
+            .expect("btrfs-progs is needed for the subvolume tests");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(Self(path))
+    }
+}
+
+impl Drop for Subvolume {
+    fn drop(&mut self) {
+        let _ = Command::new("btrfs")
+            .args(["subvolume", "delete", "--commit-after"])
+            .arg(&self.0)
+            .output();
+    }
+}
+
+// I-L46: a source whose top directory is read-only (0555) on XFS still clones: the
+// reflink probe cannot create its anonymous files there, but the destination's
+// directory is writable and on the same filesystem, so its probe answers.
+#[test]
+fn il46_read_only_source_directory_does_not_hide_reflink_support() {
+    let Some(sb) = sandbox_on(MountedFs::Xfs) else {
+        return;
+    };
+    let src = project_with_blobs(&sb);
+    let _restore = RestoreMode(src.root.clone(), 0o755);
+    src.chmod("", 0o555);
+    let dest = sb.path("cow");
+    let out = add(&src, &sb, &dest, &[]);
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("copy-on-write worktree"),
+        "{}",
+        stdout(&out)
+    );
+    assert_all_shared(&src, &dest);
+    let doctor = parhel(&sb.env, &src.root, &["doctor"]);
+    assert_success(&doctor);
+    assert!(stdout(&doctor).contains("no issues"), "{}", stdout(&doctor));
+}
+
+// I-L47: btrfs subvolumes have a device number each but share one filesystem, and
+// reflinks work between them: a worktree in another subvolume is cloned, not refused
+// as `cross-volume`.
+#[test]
+fn il47_btrfs_subvolumes_share_storage() {
+    let (Some(a), Some(b)) = (Subvolume::create(), Subvolume::create()) else {
+        return;
+    };
+    assert_ne!(
+        fs::metadata(&a.0).unwrap().dev(),
+        fs::metadata(&b.0).unwrap().dev(),
+        "different st_dev"
+    );
+    let sb = Sandbox::new_in(&a.0);
+    let src = project_with_blobs(&sb);
+    let dest = b.0.join("dest");
+    let out = add(&src, &sb, &dest, &[]);
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("copy-on-write worktree"),
+        "{}",
+        stdout(&out)
+    );
+    assert_all_shared(&src, &dest);
+    TestRepo::open(&sb.env, &dest).assert_clean();
+    let _ = fs::remove_dir_all(&dest);
+}
+
+// I-L48: btrfs refuses to share the extents of a NOCOW file (`chattr +C`, kept for
+// databases and VM images) with the COW file the clone creates: a clear error naming
+// the file and the two ways out, never a bare `Invalid argument` and never a silent
+// full copy.
+#[test]
+fn il48_nocow_file_fails_with_a_hint() {
+    let Some(sb) = sandbox_on(MountedFs::Btrfs) else {
+        return;
+    };
+    let src = project(&sb);
+    src.ignore(&["vm/"]);
+    src.mkdir("vm");
+    let st = Command::new("chattr")
+        .arg("+C")
+        .arg(src.path("vm"))
+        .status()
+        .expect("chattr (e2fsprogs) is needed for this test");
+    assert!(st.success());
+    write_blob(&src.path("vm/disk.img"), MIB, 7);
+    let dest = sb.path("cow");
+    let out = add(&src, &sb, &dest, &[]);
+    assert_error(&out, "clone-failed");
+    let err = stderr(&out);
+    assert!(err.contains("vm/disk.img"), "{err}");
+    assert!(err.contains("NOCOW") || err.contains("chattr +C"), "{err}");
+    assert!(
+        err.contains("--copy") && err.contains(".parhelignore"),
+        "{err}"
+    );
+    assert!(!dest.exists());
+    assert_no_staging(&[&sb.root]);
+
+    // The offered way out works.
+    assert_success(&add(&src, &sb, &dest, &["--copy"]));
+    assert_eq!(
+        fs::read(dest.join("vm/disk.img")).unwrap(),
+        fs::read(src.path("vm/disk.img")).unwrap()
+    );
+}

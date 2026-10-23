@@ -78,7 +78,16 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         .discover(&paths::resolve_destination(env.cwd, &request.from))?;
     let mut report = DoctorReport::default();
 
-    let volume = env.fs.volume(&repo.toplevel)?;
+    let mut volume = env.fs.volume(&repo.toplevel)?;
+    if !volume.cow {
+        // A read-only top directory cannot be probed for reflink support; the git
+        // directory on the same filesystem can.
+        if let Ok(git) = env.fs.volume(&repo.git_dir) {
+            if git.cow && git.filesystem == volume.filesystem {
+                volume = git;
+            }
+        }
+    }
     if !volume.cow {
         report.findings.push(Finding::NotCow {
             path: repo.toplevel.clone(),
@@ -448,6 +457,7 @@ mod tests {
                     fs_type: "hfs".into(),
                     cow: false,
                     device: 1,
+                    filesystem: 1,
                 },
             )],
             ..World::default()

@@ -47,10 +47,13 @@ impl CowFs for ApfsFs {
             .map(|&c| c.to_ne_bytes()[0])
             .collect();
         let fs_type = String::from_utf8_lossy(&name).into_owned();
+        // Clones do not cross APFS volumes, whatever container they share.
+        let device = unix::device_of(path)?;
         Ok(VolumeInfo {
             cow: fs_type == "apfs",
             fs_type,
-            device: unix::device_of(path)?,
+            device,
+            filesystem: device,
         })
     }
 

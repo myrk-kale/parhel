@@ -72,14 +72,16 @@ pub(crate) fn transfer(root: &Path, rel: &Path, dst: &Path, data: Data) -> Resul
             }
             Data::Reflink(_) => ("clone", ErrorCode::CloneFailed),
         };
-        Error::new(
-            code,
-            format!(
-                "cannot {verb} `{}`: {}",
-                failure.path.display(),
-                failure.error
-            ),
-        )
+        let mut message = format!(
+            "cannot {verb} `{}`: {}",
+            failure.path.display(),
+            failure.error
+        );
+        if let Some(hint) = failure.hint {
+            message.push_str("; ");
+            message.push_str(hint);
+        }
+        Error::new(code, message)
     })
 }
 
@@ -87,7 +89,17 @@ pub(crate) fn transfer(root: &Path, rel: &Path, dst: &Path, data: Data) -> Resul
 struct Failure {
     path: PathBuf,
     error: io::Error,
+    /// What the user can do about it, when we know.
+    hint: Option<&'static str>,
 }
+
+/// `FICLONE` answering `EINVAL` for a regular file: the filesystem knows reflinks but
+/// not for this file. On btrfs that is a NOCOW file (`chattr +C`: databases, VM
+/// images), whose extents cannot be shared with the ordinary file the clone is.
+const NOT_SHAREABLE: &str = "the filesystem cannot share this file's storage (on btrfs, a \
+                             NOCOW file, `chattr +C`, cannot be reflinked); pass --copy to \
+                             copy every file in full, or list the file in .parhelignore to \
+                             leave it out";
 
 type Step = std::result::Result<(), Failure>;
 
@@ -95,6 +107,7 @@ fn at<T>(path: &Path, result: io::Result<T>) -> std::result::Result<T, Failure> 
     result.map_err(|error| Failure {
         path: path.to_path_buf(),
         error,
+        hint: None,
     })
 }
 
@@ -337,7 +350,12 @@ fn copy_file(
             .open(dst),
     )?;
     let filled = match data {
-        Data::Reflink(clone) => at(shown, clone(&input, &output)),
+        Data::Reflink(clone) => at(shown, clone(&input, &output)).map_err(|mut failure| {
+            if failure.error.raw_os_error() == Some(libc::EINVAL) {
+                failure.hint = Some(NOT_SHAREABLE);
+            }
+            failure
+        }),
         Data::Copy => at(shown, copy_data(&input, &output, md.size, buf)),
     };
     drop(output);
@@ -549,8 +567,27 @@ pub(crate) fn copy_acls_at(parent: RawFd, name: &CStr, dst: &Path) -> io::Result
         return Ok(());
     }
     let held = anchor::open_node_at(parent, name)?;
-    acl::copy(held.as_raw_fd(), &cstr(dst)?, kind == Kind::Dir)
+    let target = cstr(dst)?;
+    // The clone carries the source's BSD flags: an immutable file takes no ACL.
+    let flags = Meta::new(&anchor::stat_at(libc::AT_FDCWD, &target)?).flags;
+    let locked = flags & (UF_IMMUTABLE | UF_APPEND);
+    if locked != 0 {
+        // SAFETY: valid C string.
+        unsafe { libc::lchflags(target.as_ptr(), flags & !locked) };
+    }
+    let done = acl::copy(held.as_raw_fd(), &target, kind == Kind::Dir);
+    if locked != 0 {
+        // SAFETY: valid C string.
+        unsafe { libc::lchflags(target.as_ptr(), flags) };
+    }
+    done
 }
+
+/// BSD flags: `uchg` and `uappnd`.
+#[cfg(target_os = "macos")]
+const UF_IMMUTABLE: u32 = 0x0000_0002;
+#[cfg(target_os = "macos")]
+const UF_APPEND: u32 = 0x0000_0004;
 
 /// Extended attributes of an entry itself (never of a symlink's target).
 mod xattr {
