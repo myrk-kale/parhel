@@ -297,11 +297,16 @@ fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
             ),
         )
     };
-    Ok(if !source.cow {
+    Ok(if source.filesystem == dest.filesystem {
+        // One filesystem: the destination's parent, where the run creates its staging
+        // directory, is writable, so what the adapter learned there is the answer. The
+        // source directory may well be read-only, and then it can only guess.
+        (!dest.cow).then(|| not_cow(&plan.parent, &dest.fs_type))
+    } else if !source.cow {
         Some(not_cow(&plan.repo.toplevel, &source.fs_type))
     } else if !dest.cow {
         Some(not_cow(&plan.parent, &dest.fs_type))
-    } else if source.device != dest.device {
+    } else {
         Some(Error::new(
             ErrorCode::CrossVolume,
             format!(
@@ -312,8 +317,6 @@ fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
                 plan.parent.display()
             ),
         ))
-    } else {
-        None
     })
 }
 
@@ -561,8 +564,9 @@ fn clone_tree(
     for rel in created.into_iter().rev() {
         fs.copy_mode(&source.join(rel), &staged.join(rel))?;
     }
-    // `git worktree add` created the root with default permissions.
-    fs.copy_mode(source, staged)
+    // The root (created by `git worktree add` with default permissions) takes the
+    // source's once the worktree is published: see `publish`.
+    Ok(())
 }
 
 /// Walk the staged worktree's untracked files (tracked files and submodules are
@@ -702,6 +706,15 @@ fn publish(
                 ),
             )
         })?;
+    // Last, because the root may be read-only: it could not be renamed (Linux wants
+    // write access to a directory moved into another one) nor repaired before.
+    if let Err(e) = env.fs.copy_mode(&plan.repo.toplevel, &plan.destination) {
+        warnings.push(format!(
+            "could not give `{}` the permissions of the source's root: {}",
+            plan.destination.display(),
+            e.message
+        ));
+    }
     if let Err(e) = env.fs.remove_dir_all(staging) {
         warnings.push(format!(
             "could not remove `{}`: {}",
@@ -1154,6 +1167,7 @@ mod tests {
                         fs_type: "hfs".into(),
                         cow: false,
                         device: 2,
+                        filesystem: 2,
                     },
                 ),
             ],
@@ -1176,7 +1190,8 @@ mod tests {
                     VolumeInfo {
                         fs_type: "apfs".into(),
                         cow: false,
-                        device: 1,
+                        device: 2,
+                        filesystem: 2,
                     },
                 ),
             ],
@@ -1196,6 +1211,7 @@ mod tests {
                         fs_type: "exfat".into(),
                         cow: false,
                         device: 2,
+                        filesystem: 2,
                     },
                 ),
                 (p("/w/repo"), apfs(1)),
@@ -1265,6 +1281,7 @@ mod tests {
                     fs_type: "hfs".into(),
                     cow: false,
                     device: 1,
+                    filesystem: 1,
                 },
             )],
             ..World::default()
@@ -1322,6 +1339,7 @@ mod tests {
                     fs_type: "hfs".into(),
                     cow: false,
                     device: 1,
+                    filesystem: 1,
                 },
             )],
             ..World::default()
@@ -2024,7 +2042,8 @@ mod tests {
     }
 
     // U-TXN-72: directories parhel creates (the worktree root, ancestors of excluded
-    // paths) get the source's permission bits, never the defaults.
+    // paths) get the source's permission bits, never the defaults. (The root's, after
+    // publishing: U-TXN-94.)
     #[test]
     fn created_directories_copy_the_source_mode() {
         let mut w = World::default();
@@ -2042,7 +2061,7 @@ mod tests {
             .insert(p("/w/repo/wt"), vec![OsString::from("other")]);
         run(&w, &new_branch()).unwrap();
         for (from, to) in [
-            ("/w/repo", STAGED_WT.to_owned()),
+            ("/w/repo", DEST.to_owned()),
             ("/w/repo/wt", format!("{STAGED_WT}/wt")),
         ] {
             assert_eq!(
@@ -2056,7 +2075,11 @@ mod tests {
                 w.calls()
             );
         }
-        let mode = w.position(|c| matches!(c, Call::CopyMode { .. })).unwrap();
+        let mode = w
+            .position(
+                |c| matches!(c, Call::CopyMode { to, .. } if *to == p(&format!("{STAGED_WT}/wt"))),
+            )
+            .unwrap();
         let rename = w.position(|c| matches!(c, Call::Rename { .. })).unwrap();
         assert!(mode < rename);
     }
@@ -2194,6 +2217,16 @@ mod tests {
             fs_type: fs_type.into(),
             cow,
             device,
+            filesystem: device,
+        }
+    }
+
+    /// Like [`volume`], on a filesystem of its own naming (a btrfs subvolume: another
+    /// device, the same filesystem).
+    fn volume_on(fs_type: &str, cow: bool, device: u64, filesystem: u64) -> VolumeInfo {
+        VolumeInfo {
+            filesystem,
+            ..volume(fs_type, cow, device)
         }
     }
 
@@ -2452,7 +2485,7 @@ mod tests {
     // what each costs. Platform-neutral wording: no mention of APFS.
     #[rstest]
     #[case::source_not_cow(
-        vec![(p("/"), apfs(1)), (p("/w/repo"), volume("ext4", false, 1))],
+        vec![(p("/"), apfs(1)), (p("/w/repo"), volume("ext4", false, 2))],
         ErrorCode::NotCow
     )]
     #[case::destination_not_cow(
@@ -2474,6 +2507,64 @@ mod tests {
         assert!(err.message.contains("--fallback"), "{}", err.message);
         assert!(!err.message.contains("APFS"), "{}", err.message);
         assert_no_mutation(&w);
+    }
+
+    // U-TXN-92: on one filesystem the destination's probe decides. A source directory
+    // the probe could not run in (read-only) is not a reason to refuse.
+    #[test]
+    fn same_filesystem_is_judged_by_the_destination() {
+        let w = World {
+            volumes: vec![(p("/"), apfs(1)), (p("/w/repo"), volume("xfs", false, 1))],
+            ..World::default()
+        };
+        assert_eq!(
+            run(&w, &new_branch()).unwrap().strategy,
+            Strategy::CopyOnWrite
+        );
+    }
+
+    // ... and the destination's refusal names the destination.
+    #[test]
+    fn same_filesystem_without_cow_names_the_destination() {
+        let w = World {
+            volumes: vec![(p("/"), volume("ext4", false, 1))],
+            ..World::default()
+        };
+        let err = run(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotCow);
+        assert!(err.message.contains("`/w`"), "{}", err.message);
+    }
+
+    // U-TXN-93: two devices of one filesystem (btrfs subvolumes) can share storage.
+    #[test]
+    fn subvolumes_of_one_filesystem_are_not_cross_volume() {
+        let w = World {
+            volumes: vec![
+                (p("/"), volume_on("btrfs", true, 5, 100)),
+                (p("/w/repo"), volume_on("btrfs", true, 6, 100)),
+            ],
+            ..World::default()
+        };
+        assert_eq!(
+            run(&w, &new_branch()).unwrap().strategy,
+            Strategy::CopyOnWrite
+        );
+    }
+
+    // ... while another filesystem is, whatever the devices say.
+    #[test]
+    fn distinct_filesystems_are_cross_volume_even_on_one_device_number() {
+        let w = World {
+            volumes: vec![
+                (p("/"), volume_on("btrfs", true, 5, 100)),
+                (p("/w/repo"), volume_on("btrfs", true, 5, 200)),
+            ],
+            ..World::default()
+        };
+        assert_eq!(
+            run(&w, &new_branch()).unwrap_err().code,
+            ErrorCode::CrossVolume
+        );
     }
 
     // U-TXN-91: a source directory that is an ancestor of an exclusion is recreated
@@ -2517,8 +2608,7 @@ mod tests {
             mode_at(&format!("{STAGED_WT}/wt/deep")),
             mode_at(&format!("{STAGED_WT}/wt")),
         );
-        let root = mode_at(STAGED_WT);
-        assert!(deep < wt && wt < root, "deepest first: {calls:#?}");
+        assert!(deep < wt, "deepest first: {calls:#?}");
         // Every entry created or filled below a directory precedes its mode.
         for (i, call) in calls.iter().enumerate() {
             let below = |dir: &str| match call {
@@ -2533,6 +2623,28 @@ mod tests {
             );
             assert!(!below("wt") || i < wt, "{call:?} after the mode of wt");
         }
+    }
+
+    // U-TXN-94: the worktree's root takes the source's mode once it is published and
+    // repaired, not before: a read-only root cannot be moved (Linux wants write access
+    // to a directory to rename it into another one) nor have its `.git` file rewritten.
+    #[rstest::rstest]
+    fn root_mode_is_applied_after_publishing(#[values(false, true)] copy: bool) {
+        let w = World::default();
+        let mut req = new_branch();
+        req.copy = copy;
+        run(&w, &req).unwrap();
+        let calls = w.calls();
+        let position = |wanted: &dyn Fn(&Call) -> bool| calls.iter().position(wanted);
+        let rename = position(&|c| matches!(c, Call::Rename { .. })).unwrap();
+        let repoint = position(&|c| matches!(c, Call::Repair { .. })).unwrap();
+        let mode = position(&|c| matches!(c, Call::CopyMode { to, .. } if *to == p(DEST)))
+            .unwrap_or_else(|| panic!("the destination root got no mode: {calls:#?}"));
+        assert!(rename < repoint && repoint < mode, "{calls:#?}");
+        assert!(
+            position(&|c| matches!(c, Call::CopyMode { to, .. } if *to == p(STAGED_WT))).is_none(),
+            "the staged root keeps its writable mode until then: {calls:#?}"
+        );
     }
 
     // U-TXN-90: without --copy nothing changes: still clones, still reports

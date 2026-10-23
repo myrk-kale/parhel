@@ -108,6 +108,10 @@ pub struct VolumeInfo {
     pub cow: bool,
     /// `st_dev` of the path.
     pub device: u64,
+    /// Identity of the filesystem that holds the path, equal for two paths that can
+    /// share storage even when their `device` differs (btrfs subvolumes have one
+    /// `st_dev` each). Where the adapter cannot tell better it is the `device`.
+    pub filesystem: u64,
 }
 
 /// Everything parhel asks of the filesystem.

@@ -88,6 +88,44 @@ fn reflink_probe(dir: &Path) -> Option<bool> {
     }
 }
 
+/// `BTRFS_IOC_FS_INFO`: `_IOR(0x94, 31, struct btrfs_ioctl_fs_info_args)`, a
+/// 1024-byte structure whose `fsid` (the filesystem's UUID) starts at byte 16.
+const BTRFS_IOC_FS_INFO: u64 = 0x8400_941f;
+
+/// The UUID of the btrfs filesystem holding `path`, folded to 64 bits. Subvolumes
+/// of one filesystem have it in common (and a `st_dev` and an `f_fsid` each).
+fn btrfs_uuid(path: &Path) -> Option<u64> {
+    let dir = File::open(path).ok()?;
+    let mut info = [0u8; 1024];
+    // SAFETY: valid open fd; the request fills a buffer of the size it encodes.
+    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_FS_INFO as _, info.as_mut_ptr()) };
+    let uuid: [u8; 16] = info[16..32].try_into().ok()?;
+    (rc == 0 && uuid != [0; 16]).then(|| {
+        let (a, b) = uuid.split_at(8);
+        u64::from_le_bytes(a.try_into().expect("8 bytes"))
+            ^ u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    })
+}
+
+/// What two paths must have in common to share storage: the filesystem's identity
+/// (not the device number: btrfs gives every subvolume its own, and reflinks work
+/// between them). btrfs: its UUID; elsewhere `f_fsid`; a filesystem that reports
+/// none: the device.
+fn filesystem_id(path: &Path, st: &libc::statfs, magic: u64, device: u64) -> u64 {
+    if magic == BTRFS_MAGIC {
+        // `f_fsid` is mixed with the subvolume's id there.
+        if let Some(uuid) = btrfs_uuid(path) {
+            return uuid;
+        }
+    }
+    // SAFETY: `fsid_t` is two 32-bit integers.
+    let [a, b]: [u32; 2] = unsafe { std::mem::transmute(st.f_fsid) };
+    match (u64::from(a) << 32) | u64::from(b) {
+        0 => device,
+        id => id,
+    }
+}
+
 /// Clone only where the filesystem is known to reflink (probe unavailable).
 fn reflinks_by_name(magic: u64) -> bool {
     matches!(magic, BTRFS_MAGIC | BCACHEFS_MAGIC)
@@ -123,10 +161,12 @@ impl CowFs for LinuxFs {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let magic = u64::from(st.f_type as u32);
         let cow = reflink_probe(path).unwrap_or_else(|| reflinks_by_name(magic));
+        let device = unix::device_of(path)?;
         Ok(VolumeInfo {
             fs_type: fs_name(magic),
             cow,
-            device: unix::device_of(path)?,
+            device,
+            filesystem: filesystem_id(path, &st, magic, device),
         })
     }
 
@@ -396,6 +436,10 @@ mod tests {
         Some(Scratch {
             dir: tempfile::tempdir_in(base).unwrap(),
         })
+    }
+
+    fn configured(kind: Kind) -> bool {
+        std::env::var_os(kind.var()).is_some_and(|v| !v.is_empty())
     }
 
     /// Run `body` once per configured filesystem among `kinds`.
@@ -1323,6 +1367,55 @@ mod tests {
             vec![std::ffi::OsString::from("journal")],
             "no temp files"
         );
+    }
+
+    // U-LFS-43: the filesystem's identity is the same all over one filesystem, even
+    // across btrfs subvolumes (a `st_dev` each, and an `f_fsid` mixed with the subvolume),
+    // and differs between filesystems.
+    #[test]
+    fn filesystem_identity_spans_subvolumes_and_tells_filesystems_apart() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        on_each(&REFLINKING, |kind, dir| {
+            fs::create_dir(dir.join("a")).unwrap();
+            let (a, b) = (
+                LinuxFs.volume(dir).unwrap(),
+                LinuxFs.volume(&dir.join("a")).unwrap(),
+            );
+            assert_eq!(a.filesystem, b.filesystem, "{}", kind.name());
+            seen.borrow_mut().push(a.filesystem);
+        });
+        let mut seen = seen.into_inner();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            REFLINKING.iter().filter(|k| configured(**k)).count()
+        );
+
+        let Some(s) = scratch_on(Kind::Btrfs) else {
+            return;
+        };
+        let sub = s.path().join("subvol");
+        let made = std::process::Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(&sub)
+            .output()
+            .expect("btrfs-progs is needed for this test");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let (outer, inner) = (
+            LinuxFs.volume(s.path()).unwrap(),
+            LinuxFs.volume(&sub).unwrap(),
+        );
+        assert_ne!(outer.device, inner.device, "a subvolume has its own st_dev");
+        assert_eq!(outer.filesystem, inner.filesystem);
+        let _ = std::process::Command::new("btrfs")
+            .args(["subvolume", "delete"])
+            .arg(&sub)
+            .output();
     }
 
     // U-LFS-42: the platform-independent operations are wired to the shared helpers.

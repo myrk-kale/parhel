@@ -192,6 +192,7 @@ pub fn apfs(device: u64) -> VolumeInfo {
         fs_type: "apfs".into(),
         cow: true,
         device,
+        filesystem: device,
     }
 }
 
