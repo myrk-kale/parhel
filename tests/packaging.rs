@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn render(version: &str) -> std::process::Output {
-    let sha = |n: u8| format!("{:0>64}", n);
+    let sha = |n: u8| format!("{n:0>64}");
     Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/render-formula.sh"))
         .args([version, &sha(1), &sha(2), &sha(3)])
         .output()
