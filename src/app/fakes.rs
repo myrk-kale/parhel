@@ -221,6 +221,9 @@ pub struct World {
     pub unwritable: RefCell<HashSet<PathBuf>>,
     /// Longest-prefix match: path prefix -> filesystem space.
     pub spaces: RefCell<Vec<(PathBuf, Space)>>,
+    /// How many times `flush` was called, and whether it reports a full disk.
+    pub flushes: Cell<usize>,
+    pub fail_flush: Cell<bool>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -308,6 +311,8 @@ impl Default for World {
             meta: RefCell::default(),
             unwritable: RefCell::default(),
             spaces: RefCell::default(),
+            flushes: Cell::new(0),
+            fail_flush: Cell::new(false),
         }
     }
 }
@@ -961,6 +966,18 @@ impl CowFs for World {
             .or_default()
             .extend_from_slice(bytes);
         self.add_entry(path);
+        Ok(())
+    }
+
+    /// Not logged: a flush changes nothing a test could observe (see `flushed`).
+    fn flush(&self, _: &Path) -> Result<()> {
+        self.flushes.set(self.flushes.get() + 1);
+        if self.fail_flush.get() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                "No space left on device (os error 28)",
+            ));
+        }
         Ok(())
     }
 
