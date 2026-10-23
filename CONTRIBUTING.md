@@ -15,6 +15,9 @@ cargo test --lib                   # fast unit tests only
 Integration tests create throwaway disk images with `hdiutil` (no root) and run
 real git in hermetic sandboxes (their own `HOME` and global config).
 
+To run the suite on Linux from a Mac, use `scripts/linux-test.sh` (Docker, with
+btrfs, XFS and ext4 loop mounts; extra arguments go to `cargo test`).
+
 ## Workflow
 
 1. Open an issue first for behavior changes, so we can agree on the expected outcome.
