@@ -211,6 +211,16 @@ pub(crate) fn list_dir(path: &Path) -> Result<Vec<OsString>> {
         .map_err(|e| io_error(path, &e))
 }
 
+/// Entries of the directory `root/rel`; `None` when it is not a directory (symlinks
+/// are not followed) or does not exist.
+pub(crate) fn list_dir_within(root: &Path, rel: &Path) -> Result<Option<Vec<OsString>>> {
+    let path = root.join(rel);
+    if !is_dir_no_follow(&path) {
+        return Ok(None);
+    }
+    list_dir(&path).map(Some)
+}
+
 pub(crate) fn create_dir(path: &Path) -> Result<()> {
     fs::create_dir(path).map_err(|e| io_error(path, &e))
 }

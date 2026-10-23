@@ -91,7 +91,12 @@ impl CowFs for ApfsFs {
         unix::create_dir(path)
     }
 
-    fn clone_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+    fn list_dir_within(&self, root: &Path, rel: &Path) -> Result<Option<Vec<OsString>>> {
+        unix::list_dir_within(root, rel)
+    }
+
+    fn clone_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+        let src = &root.join(rel);
         let (cs, cd) = (c_path(src)?, c_path(dst)?);
         // SAFETY: valid C strings.
         if unsafe { libc::clonefile(cs.as_ptr(), cd.as_ptr(), CLONE_NOFOLLOW) } == 0 {
@@ -114,8 +119,8 @@ impl CowFs for ApfsFs {
     }
 
     /// A plain recursive copy: `--copy` must copy, never `clonefile`.
-    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
-        tree::transfer(src, dst, Data::Copy)
+    fn copy_within(&self, root: &Path, rel: &Path, dst: &Path) -> Result<()> {
+        tree::transfer(root, rel, dst, Data::Copy)
     }
 
     fn rename_exclusive(&self, from: &Path, to: &Path) -> Result<()> {
@@ -189,6 +194,7 @@ mod tests {
 
     use super::*;
     use crate::domain::ErrorCode;
+    use crate::fs::CowFsExt as _;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 

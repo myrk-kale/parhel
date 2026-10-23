@@ -548,8 +548,8 @@ fn clone_tree(
                 fs.create_dir(&staged.join(rel))?;
                 created.push(rel);
             }
-            CloneOp::Clone(rel) if copy => fs.copy_entry(&source.join(rel), &staged.join(rel))?,
-            CloneOp::Clone(rel) => fs.clone_entry(&source.join(rel), &staged.join(rel))?,
+            CloneOp::Clone(rel) if copy => fs.copy_within(source, rel, &staged.join(rel))?,
+            CloneOp::Clone(rel) => fs.clone_within(source, rel, &staged.join(rel))?,
         }
         if i == 0 {
             crate::failpoint!("mid_clone");
@@ -771,16 +771,12 @@ struct Lister<'a> {
 
 impl DirLister for Lister<'_> {
     fn list(&self, relative: &Path) -> io::Result<Vec<OsString>> {
-        let path = self.root.join(relative);
         // No-follow: a symlink is cloned as a link, never descended into.
-        match self.fs.is_dir_no_follow(&path) {
-            Ok(true) => {}
-            Ok(false) => return Err(io::Error::from(io::ErrorKind::NotADirectory)),
-            Err(e) => return Err(io::Error::other(e.to_string())),
+        match self.fs.list_dir_within(self.root, relative) {
+            Ok(Some(names)) => Ok(names),
+            Ok(None) => Err(io::Error::from(io::ErrorKind::NotADirectory)),
+            Err(e) => Err(io::Error::other(e.to_string())),
         }
-        self.fs
-            .list_dir(&path)
-            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 
