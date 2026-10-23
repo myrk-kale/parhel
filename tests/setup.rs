@@ -943,12 +943,9 @@ fn iset22_prune_while_the_unit_is_stopped_keeps_the_registration() {
     assert_success(&add_default(&sb, &src, &dest, "f1"));
     let real = fs::read_link(&dest).unwrap();
     fs::write(real.join("uncommitted.txt"), "do not lose me").unwrap();
-    let listed = src.git(&["worktree", "list", "--porcelain"]);
-    assert!(
-        listed
-            .lines()
-            .any(|l| l == format!("locked parhel store: {}", store_root().display())),
-        "{listed}"
+    assert_eq!(
+        src.lock_reason(&real).as_deref(),
+        Some(format!("parhel store: {}", store_root().display()).as_str())
     );
 
     assert!(shell_ok(&format!("systemctl stop {}", unit())));

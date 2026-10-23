@@ -39,6 +39,27 @@ impl GitCli {
 
     /// The repository's common git dir, absolute. `--git-common-dir` may answer
     /// relative to `worktree` (`--path-format=absolute` needs git 2.31).
+    /// The reason in each lock file (`<common dir>/worktrees/<id>/locked`), by the `.git`
+    /// file path of the worktree the admin directory belongs to. `None` when the admin
+    /// directory cannot be found.
+    fn lock_files(&self, repo: &Path) -> Option<std::collections::HashMap<PathBuf, String>> {
+        let admin_root = self.common_dir(repo).ok()?.join("worktrees");
+        let mut locks = std::collections::HashMap::new();
+        for entry in fs::read_dir(admin_root).ok()?.flatten() {
+            let Ok(reason) = fs::read(entry.path().join("locked")) else {
+                continue;
+            };
+            let Ok(gitdir) = fs::read(entry.path().join("gitdir")) else {
+                continue;
+            };
+            locks.insert(
+                PathBuf::from(OsStr::from_bytes(gitdir.trim_ascii_end())),
+                String::from_utf8_lossy(&reason).trim_end().to_owned(),
+            );
+        }
+        Some(locks)
+    }
+
     fn common_dir(&self, worktree: &Path) -> Result<PathBuf> {
         let dir = PathBuf::from(self.stdout(worktree, &["rev-parse", "--git-common-dir"])?);
         Ok(if dir.is_absolute() {
@@ -365,17 +386,27 @@ impl Git for GitCli {
         let out = self
             .runner
             .output(repo, &["worktree", "list", "--porcelain", "-z"])?;
-        if out.status.success() {
-            return parse::parse_worktree_list(&out.stdout);
+        let mut entries = if out.status.success() {
+            parse::parse_worktree_list(&out.stdout)?
+        } else {
+            // git < 2.36 has no `-z`: newline-separated, same structure.
+            let out = self.run(repo, &["worktree", "list", "--porcelain"])?;
+            let z: Vec<u8> = out
+                .stdout
+                .iter()
+                .map(|&b| if b == b'\n' { 0 } else { b })
+                .collect();
+            parse::parse_worktree_list(&z)?
+        };
+        // git < 2.31 does not say which worktrees are locked: read the lock files.
+        if let Some(locks) = self.lock_files(repo) {
+            for entry in &mut entries {
+                if entry.locked.is_none() {
+                    entry.locked = locks.get(&entry.path.join(".git")).cloned();
+                }
+            }
         }
-        // git < 2.36 has no `-z`: newline-separated, same structure.
-        let out = self.run(repo, &["worktree", "list", "--porcelain"])?;
-        let z: Vec<u8> = out
-            .stdout
-            .iter()
-            .map(|&b| if b == b'\n' { 0 } else { b })
-            .collect();
-        parse::parse_worktree_list(&z)
+        Ok(entries)
     }
 
     fn tracked_files(&self, worktree: &Path) -> Result<Vec<PathBuf>> {
