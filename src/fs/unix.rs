@@ -2,10 +2,8 @@
 //! shared by the macOS and Linux adapters: path and metadata queries, staging
 //! directories, the relocation scan, `flock`-based locks and plain file helpers.
 //! Only the copy-on-write primitives (clone, exclusive rename, filesystem
-//! identity, durable sync, unlocking immutable files) live in the adapters.
-
-// Until the Linux adapter exists, nothing uses these on Linux.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+//! identity, durable sync, unlocking immutable files) live in the adapters; the
+//! tree walk both of them use to clone or copy is in [`super::tree`].
 
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -40,7 +38,8 @@ pub(crate) fn io_error(path: &Path, e: &io::Error) -> Error {
 }
 
 /// First entry under `root` that cannot be read (to name the culprit when a
-/// whole-directory clone fails with `EACCES`).
+/// whole-directory `clonefile` fails with `EACCES`).
+#[cfg(target_os = "macos")]
 pub(crate) fn find_unreadable(root: &Path) -> Option<PathBuf> {
     let md = fs::symlink_metadata(root).ok()?;
     if md.is_dir() {
@@ -227,6 +226,24 @@ pub(crate) fn remove_dir_all(path: &Path, make_removable: fn(&Path)) -> Result<(
     }
     make_removable(path);
     fs::remove_dir_all(path).map_err(|e| io_error(path, &e))
+}
+
+/// Make `path` and every directory below it readable and writable by its owner
+/// (never following symlinks), calling `each` on every entry first. What a removal
+/// needs after a clone carried read-only directories over.
+pub(crate) fn make_dirs_writable(path: &Path, each: &dyn Fn(&Path)) {
+    let Ok(md) = fs::symlink_metadata(path) else {
+        return;
+    };
+    each(path);
+    if md.is_dir() {
+        let _ = fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_dirs_writable(&entry.path(), each);
+            }
+        }
+    }
 }
 
 /// Write `contents` to `path`, then make them durable with `sync` (the

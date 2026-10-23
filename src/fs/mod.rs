@@ -4,6 +4,9 @@
 pub mod apfs;
 #[cfg(target_os = "linux")]
 pub mod linux;
+/// Clone or copy a directory tree, shared by the macOS and Linux adapters.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod tree;
 /// Platform-independent Unix helpers shared by the macOS and Linux adapters.
 #[cfg(unix)]
 pub mod unix;

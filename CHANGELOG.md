@@ -12,10 +12,20 @@ All notable changes to this project are documented here. The format follows
   `not-cow`, and their messages no longer mention APFS ("copy-on-write is not
   available on <fs> at `<path>`"). Scripts that match `not-apfs` must match
   `not-cow`. Whether a volume supports copy-on-write is now decided by the
-  filesystem adapter, not by comparing the filesystem's name.
+  filesystem adapter, not by comparing the filesystem's name. The refusal now
+  names `--copy` and `--fallback` as the ways out.
 
 ### Added
 
+- Linux support. On Btrfs, XFS (with reflink), bcachefs and ZFS 2.2+, `add`
+  clones each file with `ioctl(FICLONE)` and publishes with
+  `renameat2(RENAME_NOREPLACE)`. Whether a directory can reflink is found by a
+  probe with two anonymous temporary files, not by the filesystem's name. Linux
+  binaries are not released yet; install with `cargo install parhel`.
+- `--copy`: copy every file in full instead of cloning it. It works on any
+  filesystem and across volumes (ext4, tmpfs, NFS, another disk), goes through
+  the same staging, journal, rollback and path rewriting as a clone, and is
+  reported as a `full-copy` worktree. It cannot be combined with `--fallback`.
 - An agent skill (`npx skills add myrk-kale/parhel`) that teaches coding agents
   when to use parhel and the workflow that keeps copies away from shared
   services and ignored data from being lost.
