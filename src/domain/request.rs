@@ -180,7 +180,7 @@ mod tests {
         assert!(err.message.contains("--size"), "{}", err.message);
     }
 
-    // U-CLI-26: the user name ends up in paths, a unit file and an image name, so it is
+    // U-CLI-27: the user name ends up in paths, a unit file and an image name, so it is
     // held to what accounts are on the systems that matter.
     #[rstest]
     #[case("alice")]
