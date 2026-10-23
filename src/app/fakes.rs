@@ -385,6 +385,7 @@ impl World {
                 kind: EntryKind::File,
                 size,
                 mtime_ns,
+                ctime_ns: 0,
                 mode: 0o644,
                 link_target: None,
             },
@@ -433,6 +434,7 @@ impl World {
                 kind: EntryKind::Symlink,
                 size: 0,
                 mtime_ns: 0,
+                ctime_ns: 0,
                 mode: 0o777,
                 link_target: Some(target.clone()),
             });
@@ -442,6 +444,7 @@ impl World {
                 kind: EntryKind::Dir,
                 size: 0,
                 mtime_ns: 0,
+                ctime_ns: 0,
                 mode: 0o755,
                 link_target: None,
             });
@@ -450,6 +453,7 @@ impl World {
             kind: EntryKind::File,
             size: self.files.borrow().get(path).map_or(0, |b| b.len() as u64),
             mtime_ns: 0,
+            ctime_ns: 0,
             mode: 0o644,
             link_target: None,
         })
