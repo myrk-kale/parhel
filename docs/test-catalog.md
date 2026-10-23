@@ -395,6 +395,7 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-STO-46 / 47 | Lock and `meta` (`source=`) next to the baseline; clones come from the baseline tree, never copies | `src/app/add.rs` |
 | U-STO-48 / 49 | The journal records the link and the real destination before the symlink exists; `links` registry line `<link>\t<target>` appended first | `src/app/add.rs` |
 | U-STO-50 / 51 | Symlink cannot be created → `dest-exists`, nothing removed from the destination; lost exclusive rename → our symlink removed | `src/app/add.rs` |
+| U-STO-50b | A rival link to the very same real path (same destination and name raced) is never removed by the loser's rollback: found by I-S09a on CI, fixed by forgetting the journaled link when its creation fails | `src/app/add.rs` |
 | U-STO-52 | Real name suffixes `-2`, `-3` (first free); the requested path is unchanged | `src/app/add.rs` |
 | U-STO-53 | Relocation rewrites to the real path | `src/app/add.rs` |
 | U-STO-54…58 | Failure at every step, failing sync, Ctrl-C during/after the sync, source changed, existing branch: no symlink, no registration, branch only if ours, staging removed last, baseline untouched | `src/app/add.rs` |

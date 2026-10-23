@@ -224,6 +224,9 @@ pub struct World {
     /// How many times `flush` was called, and whether it reports a full disk.
     pub flushes: Cell<usize>,
     pub fail_flush: Cell<bool>,
+    /// A symlink another run creates at the moment `symlink_exclusive` is called
+    /// (link, target): the race that `symlink_exclusive` exists to lose cleanly.
+    pub rival_link: RefCell<Option<(PathBuf, PathBuf)>>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -313,6 +316,7 @@ impl Default for World {
             spaces: RefCell::default(),
             flushes: Cell::new(0),
             fail_flush: Cell::new(false),
+            rival_link: RefCell::default(),
         }
     }
 }
@@ -941,6 +945,10 @@ impl CowFs for World {
             },
             Step::Symlink,
         )?;
+        if let Some((rival, target)) = self.rival_link.borrow_mut().take() {
+            self.links.borrow_mut().insert(rival.clone(), target);
+            self.add_entry(&rival);
+        }
         if self.exists_no_follow(link)? {
             return Err(Error::new(
                 ErrorCode::DestExists,

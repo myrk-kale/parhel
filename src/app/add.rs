@@ -842,7 +842,12 @@ fn claim_link(
     line.extend_from_slice(route.real.as_os_str().as_encoded_bytes());
     line.push(b'\n');
     fs.append_file(&route.links, &line)?;
-    fs.symlink_exclusive(&route.real, &plan.destination)?;
+    if let Err(e) = fs.symlink_exclusive(&route.real, &plan.destination) {
+        // Nothing of ours is there. What is may be another run's link to this very
+        // target (the same destination and name, raced): it is not ours to take back.
+        journal.store_link = None;
+        return Err(e);
+    }
     crate::failpoint!("after_link");
     check_interrupt(env)
 }
@@ -3850,6 +3855,34 @@ mod tests {
         assert!(
             mirrored.contains(&baseline().join(".worktrees/unrelated")),
             "{mirrored:?}"
+        );
+    }
+
+    // U-STO-50b: another run got the same path first, and by the same name its link points
+    // at the very same real path. The loser's rollback must not take that link for its own.
+    #[test]
+    fn a_rival_link_to_the_same_target_is_never_removed() {
+        let w = store_world();
+        *w.rival_link.borrow_mut() = Some((p(DEST), real("feat")));
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::DestExists, "{err}");
+        assert_eq!(
+            w.links.borrow().get(&p(DEST)),
+            Some(&real("feat")),
+            "still there"
+        );
+        assert_eq!(
+            w.count(|c| matches!(c, Call::RemoveFile(path) | Call::RemoveDirAll(path) if *path == p(DEST))),
+            0,
+            "{:#?}",
+            w.calls()
+        );
+        assert_eq!(
+            w.count(|c| *c
+                == Call::RemoveForce {
+                    path: p(STORE_STAGED_WT)
+                }),
+            1
         );
     }
 }
