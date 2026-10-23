@@ -743,9 +743,10 @@ fn staging_of(path: &Path) -> Option<PathBuf> {
 /// The destination is the journaled `publish_to`, or else the staging dir's sibling
 /// with the staged worktree's name (staging is always created next to the
 /// destination). Without a journal entry the disk must prove it: the destination's
-/// `.git` file points to an admin dir whose `gitdir` still names `staged`, i.e. the
-/// worktree was moved but `git worktree repair` never ran. The journal alone is not
-/// trusted to be on disk after a power loss.
+/// `.git` file points to an admin dir whose `gitdir` names `staged` (the worktree was
+/// moved but `git worktree repair` never ran) or the destination itself (it ran, and the
+/// run died before it removed the staging dir). The journal alone is not trusted to be on
+/// disk after a power loss.
 fn published_dest(
     env: &Env<'_>,
     staging: &Path,
@@ -771,7 +772,11 @@ fn published_dest(
         .to_owned();
     let backlink = env.fs.read_file(&Path::new(&admin).join("gitdir")).ok()?;
     let backlink = String::from_utf8_lossy(&backlink).trim().to_owned();
-    (Path::new(&backlink) == staged.join(".git")).then_some(dest)
+    // Still pointing at the staged copy (killed before the repair), or already at the
+    // destination (killed after it, before the staging directory was removed): published
+    // either way.
+    let at = Path::new(&backlink);
+    (at == staged.join(".git") || at == dest.join(".git")).then_some(dest)
 }
 
 /// Finish what the crashed run was doing: point the registration at the destination,
@@ -2070,6 +2075,48 @@ mod tests {
             1,
             "{:#?}",
             w.calls()
+        );
+    }
+
+    // U-STO-102: killed after the registration was repaired but before the staging
+    // directory was removed: the worktree is published and registered at its real path.
+    // `doctor --fix` finishes (the lock, the cleanup); it does not take the run for one
+    // that never published and undo it - the user's symlink stays.
+    #[test]
+    fn fix_finishes_a_publication_that_was_repaired_before_the_crash() {
+        let mut w = crashed_store_run(true, Some(("/w/feat", real().to_str().unwrap())));
+        w.files.borrow_mut().insert(
+            p("/w/repo/.git/worktrees/feat/gitdir"),
+            format!("{}/.git\n", real().display()).into_bytes(),
+        );
+        for entry in &mut w.worktrees {
+            if entry
+                .path
+                .starts_with("/store/worktrees/.parhel-staging-dead")
+            {
+                entry.path = real();
+            }
+        }
+        let report = run_store(&w, true);
+        assert!(report.healthy(), "{report:#?}");
+        assert_eq!(
+            w.count(|c| matches!(
+                c,
+                Call::RemoveFile(_) | Call::RemoveForce { .. } | Call::BranchDelete(_)
+            )),
+            0,
+            "the published worktree, its branch and its symlink stay: {:#?}",
+            w.calls()
+        );
+        assert_eq!(
+            w.calls().last(),
+            Some(&Call::RemoveDirAll(p(
+                "/store/worktrees/.parhel-staging-dead"
+            )))
+        );
+        assert_eq!(
+            w.count(|c| matches!(c, Call::WorktreeLock { path, .. } if *path == real())),
+            1
         );
     }
 
