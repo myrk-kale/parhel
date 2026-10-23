@@ -73,6 +73,9 @@ pub struct SetupRequest {
     pub user: Option<String>,
     /// `--remove`: take the store down instead of creating it.
     pub remove: bool,
+    /// `--discard-contents` (with `--remove`): delete the image even when its contents
+    /// could not be looked at or are not all parhel's. Worktrees still block the removal.
+    pub discard_contents: bool,
 }
 
 /// Default image size: 100 GiB, sparse (nothing is allocated until used).

@@ -105,8 +105,13 @@ usable and the command fails saying the image is not protected.
 
 Safe to re-run: a healthy store is left as it is, a stopped one is started, a missing \
 protection is added. An image that holds a filesystem is never formatted. With --remove \
-the store is taken down: refused (store-in-use) while worktrees live in it, otherwise \
-the unit, the image and the mount point are deleted.
+the store is taken down, after looking inside it (an image whose unit was deleted is \
+mounted read-only for that): refused (store-in-use) while worktrees live in it or it \
+holds files that are not the store's, and refused (store-unavailable) when it cannot be \
+looked into or is not this user's, saying that nothing was deleted; otherwise the unit, \
+the image and the mount point are deleted, after listing the symlinks that will be left \
+dangling. --discard-contents deletes an image that could not be checked or that holds \
+other files; worktrees still block it.
 
 The image is one file. Commits are safe in each repository's own .git, but uncommitted \
 work in a store worktree is not: push what you cannot lose.",
@@ -114,9 +119,11 @@ work in a store worktree is not: push what you cannot lose.",
   sudo git parhel setup
   sudo git parhel setup --size 200G --user alice
   sudo git parhel setup --remove
+  sudo git parhel setup --remove --discard-contents
 
-Needs: mkfs.btrfs (btrfs-progs), chattr (e2fsprogs), a kernel with btrfs, systemd.
-Errors: not-root, missing-tool, unsupported-platform, store-in-use, usage."
+Needs: mkfs.btrfs (btrfs-progs), blkid and mount (util-linux), chattr (e2fsprogs), a kernel \
+with btrfs, systemd.
+Errors: not-root, missing-tool, unsupported-platform, store-unavailable, store-in-use, usage."
     )]
     Setup(SetupArgs),
 }
@@ -194,6 +201,11 @@ pub struct SetupArgs {
     /// worktrees live in it).
     #[arg(long)]
     pub remove: bool,
+    /// With --remove: delete the image even when its contents could not be looked at
+    /// (it does not mount, it holds another filesystem, its marker is not this user's)
+    /// or hold files that are not the store's. Worktrees still block the removal.
+    #[arg(long)]
+    pub discard_contents: bool,
 }
 
 /// What the process should do.
@@ -256,6 +268,12 @@ fn check_name(flag: &str, value: &str) -> Result<()> {
 
 impl SetupArgs {
     fn into_request(self) -> Result<SetupRequest> {
+        if self.discard_contents && !self.remove {
+            return Err(usage(
+                "--discard-contents only applies to --remove: it deletes an image whose \
+                 contents could not be checked",
+            ));
+        }
         if self.remove && (self.size.is_some() || self.preallocate) {
             return Err(usage(
                 "--remove takes the store down; --size and --preallocate only apply when creating it",
@@ -274,6 +292,7 @@ impl SetupArgs {
             preallocate: self.preallocate,
             user: self.user,
             remove: self.remove,
+            discard_contents: self.discard_contents,
         })
     }
 }
@@ -609,6 +628,7 @@ mod tests {
                 preallocate: false,
                 user: None,
                 remove: false,
+                discard_contents: false,
             }
         );
     }
@@ -636,6 +656,20 @@ mod tests {
         let err = setup(args).unwrap_err();
         assert_eq!(err.code, ErrorCode::Usage);
         assert!(err.message.contains("--remove"), "{}", err.message);
+    }
+
+    // U-CLI-22b: `--discard-contents` is a way of insisting on a removal; on its own it means
+    // nothing, and the contradiction is reported.
+    #[test]
+    fn discard_contents_belongs_to_remove() {
+        let err = setup(&["--discard-contents"]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage);
+        assert!(err.message.contains("--remove"), "{}", err.message);
+        let req = setup(&["--remove", "--discard-contents", "--user", "bob"]).unwrap();
+        assert!(req.remove && req.discard_contents);
+        assert!(!setup(&["--remove"]).unwrap().discard_contents);
+        let err = setup(&["--discard-contents", "--size", "1G"]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage);
     }
 
     // U-CLI-23
@@ -670,6 +704,7 @@ mod tests {
             "--preallocate",
             "--user",
             "--remove",
+            "--discard-contents",
         ] {
             assert!(flat.contains(needle), "help lacks `{needle}`: {text}");
         }
