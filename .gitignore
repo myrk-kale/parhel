@@ -30,3 +30,19 @@ rustc-ice-*.txt
 
 # Local tooling
 .serena/
+
+# Operating system and editor files
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
