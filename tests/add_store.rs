@@ -956,3 +956,302 @@ fn is30_sigkill_after_the_link_is_cleaned_up_by_doctor() {
     w.assert_no_trace(&dest);
     assert_eq!(w.src.branch_tip("f"), None);
 }
+
+// I-S31: `--submodules=reinit` through the store. The submodule is not mirrored (it is
+// initialized again with its own git dir in the new worktree), its links name the REAL
+// path, and working in it never reaches the source. Without the flag the run is
+// refused before the store is touched.
+#[test]
+fn is31_submodules_reinit_through_the_store() {
+    let Some(w) = world() else { return };
+    let lib = w.sb.repo("lib");
+    lib.write("lib.rs", "v1\n");
+    lib.commit_all("lib v1");
+    lib.write("lib.rs", "v2\n");
+    lib.commit_all("lib v2");
+    w.src.add_submodule(&lib, "libs/lib");
+    w.src.assert_clean();
+
+    let refused = w.add(&w.sb.path("refused"), "r", &[]);
+    assert_error(&refused, "submodules-present");
+    assert!(stderr(&refused).contains("--submodules=reinit"));
+    assert!(
+        w.store.baselines().is_empty(),
+        "nothing synced before the refusal"
+    );
+
+    let dest = w.sb.path("wt");
+    let out = w.add(&dest, "s", &["--submodules=reinit"]);
+    assert_success(&out);
+    let real = w.store.only_worktree();
+    let wt = w.open(&dest);
+    wt.assert_clean();
+    assert_eq!(wt.read("libs/lib/lib.rs"), "v2\n");
+    assert!(
+        !w.baseline("libs/lib").exists(),
+        "the submodule is reinitialized, not mirrored"
+    );
+    assert!(w.baseline("target/ignored.bin").exists());
+
+    let src_sub = TestRepo::open(&w.sb.env, &w.src.path("libs/lib"));
+    let sub = TestRepo::open(&w.sb.env, &real.join("libs/lib"));
+    assert_ne!(sub.git_dir(), src_sub.git_dir(), "its own git dir");
+    assert!(
+        sub.git_dir().starts_with(wt.git_dir()),
+        "{} is not under {}",
+        sub.git_dir().display(),
+        wt.git_dir().display()
+    );
+    assert!(
+        fs::read_to_string(real.join("libs/lib/.git"))
+            .unwrap()
+            .contains(wt.git_dir().to_str().unwrap()),
+        "the submodule's gitfile leads into the new worktree's admin dir"
+    );
+    sub.git(&["checkout", "-q", "HEAD~1"]);
+    assert_eq!(sub.read("lib.rs"), "v1\n");
+    assert_eq!(
+        src_sub.read("lib.rs"),
+        "v2\n",
+        "the source's submodule is unchanged"
+    );
+    w.src.assert_clean();
+}
+
+/// An access ACL naming user 4242 on top of the owner's `owner`.
+fn acl_for(owner: u16, named: u16, mask: u16) -> Vec<u8> {
+    use common::xattr::acl;
+    acl::encode(&[
+        (acl::USER_OBJ, owner, acl::NOBODY),
+        (acl::USER, named, 4242),
+        (acl::GROUP_OBJ, 0, acl::NOBODY),
+        (acl::MASK, mask, acl::NOBODY),
+        (acl::OTHER, 0, acl::NOBODY),
+    ])
+}
+
+// I-S32: extended attributes, POSIX ACLs and nanosecond mtimes of files and directories
+// make it through the mirror (ext4 to the baseline) and through the reflink clone (the
+// baseline to the worktree): the clone of an entry is only as faithful as the baseline.
+#[test]
+fn is32_xattrs_acls_and_mtimes_survive_the_baseline_and_the_clone() {
+    use common::xattr::{self, acl};
+    let Some(w) = world() else { return };
+    w.src.ignore(&["secrets/"]);
+    w.src.write("target/tagged.bin", "t");
+    w.src.mkdir("target/tagged-dir");
+    w.src.write("target/tagged-dir/inner.txt", "i");
+    w.src.write("secrets/.env", "TOKEN=1\n");
+    xattr::set(&w.src.path("target/tagged.bin"), "user.parhel.one", b"1").unwrap();
+    xattr::set(
+        &w.src.path("target/tagged.bin"),
+        "user.parhel.two",
+        b"two words",
+    )
+    .unwrap();
+    xattr::set(&w.src.path("target/tagged-dir"), "user.parhel.dir", b"d").unwrap();
+    let file_acl = acl_for(0o6, 0o4, 0o4);
+    let dir_acl = acl_for(0o7, 0o5, 0o5);
+    xattr::set(&w.src.path("secrets/.env"), acl::ACCESS, &file_acl).unwrap();
+    for dir in ["secrets", "target/tagged-dir"] {
+        xattr::set(&w.src.path(dir), acl::ACCESS, &dir_acl).unwrap();
+        xattr::set(&w.src.path(dir), acl::DEFAULT, &dir_acl).unwrap();
+    }
+    // Directories last: filling one moves its mtime.
+    let when = UNIX_EPOCH + Duration::new(1_600_000_000, 123_456_789);
+    for rel in [
+        "target/tagged.bin",
+        "target/tagged-dir/inner.txt",
+        "secrets/.env",
+    ] {
+        File::open(w.src.path(rel))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+    for rel in ["target/tagged-dir", "secrets", "target"] {
+        File::open(w.src.path(rel))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    let real = w.add_ok(&w.sb.path("wt"), "f");
+    let baseline = w.store.baseline_tree();
+    for (label, copy) in [("baseline", &baseline), ("worktree", &real)] {
+        for rel in [
+            "target/tagged.bin",
+            "target/tagged-dir",
+            "target/tagged-dir/inner.txt",
+            "secrets/.env",
+            "secrets",
+            "target",
+        ] {
+            let (s, c) = (w.src.path(rel), copy.join(rel));
+            assert_eq!(
+                xattr::user_attrs(&c),
+                xattr::user_attrs(&s),
+                "user attributes of `{rel}` in the {label}"
+            );
+            for name in [acl::ACCESS, acl::DEFAULT] {
+                assert_eq!(
+                    xattr::get(&c, name).unwrap(),
+                    xattr::get(&s, name).unwrap(),
+                    "{name} of `{rel}` in the {label}"
+                );
+            }
+            let (sm, cm) = (fs::metadata(&s).unwrap(), fs::metadata(&c).unwrap());
+            assert_eq!(
+                sm.permissions().mode() & 0o7777,
+                cm.permissions().mode() & 0o7777,
+                "mode of `{rel}` in the {label}"
+            );
+            assert_eq!(
+                (sm.mtime(), sm.mtime_nsec()),
+                (cm.mtime(), cm.mtime_nsec()),
+                "mtime of `{rel}` in the {label}"
+            );
+        }
+    }
+    assert_eq!(
+        xattr::get(&real.join("secrets/.env"), acl::ACCESS).unwrap(),
+        Some(file_acl)
+    );
+    // The root of the worktree takes the source's too.
+    assert_eq!(
+        xattr::get(&real, acl::ACCESS).unwrap(),
+        xattr::get(&w.src.root, acl::ACCESS).unwrap()
+    );
+}
+
+// I-S33: the store fills up while the first sync copies (a 128 MiB btrfs, 192 MiB of
+// data): the run fails with the system's words, nothing of it remains, the baseline is
+// left usable, and a smaller source works right after.
+#[test]
+fn is33_a_full_store_fails_cleanly_and_recovers() {
+    let Some(ext4) = test_mount(MountedFs::Ext4) else {
+        return;
+    };
+    let Some(small) = test_mount(MountedFs::SmallBtrfs) else {
+        return;
+    };
+    let sb = Sandbox::new_in(&ext4);
+    let store = TestStore::new(&small);
+    let src = project(&sb);
+    src.ignore(&["blobs/"]);
+    for i in 0..3 {
+        write_blob(&src.path(format!("blobs/b{i}.bin")), 64 * MIB, i);
+    }
+    let dest = sb.path("wt");
+    let args = add_args(&dest, &["--new-branch", "f"]);
+    let out = parhel_store(&sb.env, &src.root, &args, &store);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("No space left on device"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fs::symlink_metadata(&dest).is_err());
+    assert_eq!(src.worktree_paths(), vec![src.root.clone()]);
+    assert_eq!(src.branch_tip("f"), None);
+    assert_eq!(store.worktrees(), Vec::<PathBuf>::new());
+    store.assert_no_staging();
+    assert_no_staging(&[&sb.root]);
+
+    // Less to copy: the earlier blobs in the baseline that are gone from the source are
+    // removed by the sync, which is what makes room.
+    fs::remove_dir_all(src.path("blobs")).unwrap();
+    assert_success(&parhel_store(&sb.env, &src.root, &args, &store));
+    TestRepo::open(&sb.env, &dest).assert_clean();
+    assert!(!store.baseline_tree().join("blobs").exists());
+}
+
+// I-S34: a second `add` for the same repository while the first is still syncing waits
+// for it (the baseline is one) instead of failing, and both succeed.
+#[test]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn is34_a_second_add_waits_for_the_first_to_finish_with_the_baseline() {
+    let Some(w) = world() else { return };
+    let barrier = Barrier::new(&w.sb.root, "lock");
+    let (a_dest, b_dest) = (w.sb.path("a"), w.sb.path("b"));
+    let mut a = spawn_parhel_store(
+        &w.sb.env,
+        &w.src.root,
+        &add_args(&a_dest, &["--new-branch", "fa"]),
+        &w.store,
+        Some(&barrier.spec("sync_entry:target/debug/app")),
+    );
+    barrier.wait_reached(&mut a);
+    let mut b = spawn_parhel_store(
+        &w.sb.env,
+        &w.src.root,
+        &add_args(&b_dest, &["--new-branch", "fb"]),
+        &w.store,
+        None,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        b.try_wait().unwrap().is_none(),
+        "the second run should be waiting for the baseline"
+    );
+    assert!(!b_dest.exists());
+    barrier.release();
+    assert_success(&finish_within(a, 120));
+    assert_success(&finish_within(b, 120));
+    assert_eq!(w.store.worktrees().len(), 2);
+    w.open(&a_dest).assert_clean();
+    w.open(&b_dest).assert_clean();
+    assert_same_content(&w.src, &fs::canonicalize(&b_dest).unwrap());
+}
+
+// I-S35: the store's registry is tab separated lines: a destination with a tab or a
+// newline in its path is refused before anything is created.
+#[rstest]
+#[case::tab("tab\there")]
+#[case::newline("new\nline")]
+fn is35_destinations_the_registry_cannot_hold_are_refused(#[case] name: &str) {
+    let Some(w) = world() else { return };
+    let dest = w.sb.path(name);
+    let out = w.add(&dest, "f", &[]);
+    assert_error(&out, "usage");
+    assert!(
+        stderr(&out).contains("tab or a newline"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(w.store.baselines(), Vec::<PathBuf>::new());
+    w.assert_no_trace(&dest);
+}
+
+// I-S36: a baseline whose last sync died without a word (marked `state=syncing`) is not
+// trusted, because the sync compares metadata only: a file with the right size and
+// mtime and wrong data (what a power loss leaves) is replaced, not kept.
+#[test]
+fn is36_an_unfinished_baseline_is_mirrored_again() {
+    let Some(w) = world() else { return };
+    w.add_ok(&w.sb.path("a"), "fa");
+    let victim = w.baseline("target/ignored.bin");
+    let (len, mtime) = {
+        let md = fs::metadata(&victim).unwrap();
+        (md.len(), md.modified().unwrap())
+    };
+    fs::write(&victim, vec![0u8; usize::try_from(len).unwrap()]).unwrap();
+    File::options()
+        .write(true)
+        .open(&victim)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(mtime))
+        .unwrap();
+    let meta = w.store.baselines().remove(0).join("meta");
+    let text = fs::read_to_string(&meta).unwrap();
+    assert!(text.contains("state=synced"), "{text}");
+    fs::write(&meta, text.replace("state=synced", "state=syncing")).unwrap();
+
+    let b = w.add_ok(&w.sb.path("b"), "fb");
+    assert_same_content(&w.src, &b);
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        fs::read(w.src.path("target/ignored.bin")).unwrap()
+    );
+    assert!(fs::read_to_string(&meta).unwrap().contains("state=synced"));
+}

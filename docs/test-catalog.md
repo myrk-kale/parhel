@@ -13,12 +13,11 @@ The Linux backend (btrfs/XFS reflink) and `--copy` were developed the same way: 
 tests (U-TXN-80…90, U-LFS-*, `add_copy.rs`, `add_linux.rs`) were committed first, against a
 `LinuxFs` skeleton and a `copy_entry` stub that fail with `not-implemented`.
 
-The store (phase 2: worktrees of sources without copy-on-write, `git parhel setup`) is being
+The store (phase 2: worktrees of sources without copy-on-write, `git parhel setup`) was
 built the same way, and the section [Store](#store--worktrees-without-copy-on-write) lists
-its tests. Until it is implemented they are **red on purpose**: they fail against stubs that
-answer `not-implemented` (or `todo!()`), or because `add` still answers `not-cow`; the
-parts that are pure data (the journal's link field, size parsing, the command line, the
-platform guard of `setup`) are real and their tests pass.
+its tests. They were red on purpose against stubs (`not-implemented`, `todo!()`) until the
+store was implemented; what is still red is `git parhel setup` (U-SET-* and the gated
+`tests/setup.rs`), which is the next step.
 
 Spec changes made while implementing (each one a wrong assumption in the test, not a
 weakened guarantee):
@@ -43,7 +42,8 @@ no root needed), `chflags`, `mkfifo`. Optional: `git-lfs` (I-124). Tests that mo
 
 Requirements, Linux: `git` ≥ 2.29, `python3` with `venv`, `mkfifo`, `$TMPDIR` on a reflink
 filesystem (btrfs or XFS with `reflink=1`) and three mounts announced by
-`PARHEL_TEST_BTRFS`, `PARHEL_TEST_XFS` and `PARHEL_TEST_EXT4`, writable by the (non-root)
+`PARHEL_TEST_BTRFS`, `PARHEL_TEST_XFS` and `PARHEL_TEST_EXT4` (plus
+`PARHEL_TEST_BTRFS_SMALL`, a 128 MiB btrfs, for I-S33), writable by the (non-root)
 user running the tests. `scripts/linux-test.sh` builds all of that in a privileged Docker
 container (`scripts/mount-test-filesystems.sh` is the part CI shares); extra arguments go to
 `cargo test`. A test that needs a mount whose variable is unset prints `SKIPPED: ...` and
@@ -363,13 +363,13 @@ requested destination becomes a symlink to the real worktree. `git worktree remo
 <symlink>` was tried with real git: it resolves the link, removes the real worktree and its
 registration, and leaves the symlink dangling (I-S16; `doctor` finds and removes it).
 
-Status: **red** (step A of the store work: tests and stubs). Green today, on purpose: the
-real parts (U-CLI-20…26, U-STO-60…62 for the journal's link field, U-SET-01, I-SET14 on
-macOS, the gated I-SET tests that skip) and guard rails that hold trivially while nothing is
-implemented, so they will start meaning something later: the cases of U-STO-20 that must
-*not* take the store, U-STO-21b, U-STO-23, U-STO-24, U-STO-58, U-STO-64…66 (nothing is
-removed), the "quiet" cases of U-STO-70/71/74/77/79, the retargeted/forged cases of U-STO-82,
-and I-S13b, I-S14, I-S15.
+Status: the store route, discovery, the baseline sync, the journal link and the `doctor`
+findings are implemented and green (U-STO-*, U-FS-24…32, `tests/add_store.rs`); `git parhel
+setup` is not (U-SET-02…37 and `tests/setup.rs` are red on purpose until it is). Fixes to
+the tests of the first step, each a wrong assumption in the test: the fixture of U-STO-30
+had an empty baseline tree that is, correctly, "unchanged" (a first sync finds no tree and
+creates it, root included); the helper behind U-STO-54 expected a staging directory to
+remove after the injected failure of its own creation.
 
 ### Unit tests with fakes
 `World` (recording fake of git and the filesystem) gained `with_store()`, `stat_within`,
@@ -383,6 +383,7 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-STO-05 | Store path: `PARHEL_STORE` wins, empty is ignored, default `/parhel/<user>` | `src/domain/store.rs` |
 | U-STO-06 | Repository id = first 16 bytes of SHA-256 of the path bytes (known vectors, non-UTF-8) | `src/domain/store.rs` |
 | U-STO-07 | Sync decision table: unchanged, new, size, mtime to the nanosecond, mode, kind changes, symlink target, FIFO, directory mtime ignored but directory mode compared | `src/domain/store.rs` |
+| U-FS-24…32 | The adapter on a real filesystem (macOS and Linux): `stat_within` (kinds, size, mtime in ns, mode, symlink target; absent and swapped components), `mirror_entry` (data, mode, ns mtime, user xattrs, replaced in one rename without a leftover temporary name; symlinks, FIFOs, owner-only directories finished by `mirror_dir_meta`, read-only directories that still take entries; failures name the entry), `symlink_exclusive`, `read_link`, `append_file`, `is_writable`, `space` (nearest searchable ancestor), `flush` | `src/fs/tree.rs`, `src/fs/unix.rs` |
 | U-STO-10…16 | Discovery: not configured, available, no marker, other format, garbage, store without copy-on-write, not writable; never mutates | `src/app/store.rs` |
 | U-STO-30…44 | Sync: first sync creates parents first and sets directory metadata last, nothing changed → no call, changed file alone (+ its directory's metadata), mode-only change, new file, deleted file, deleted directory in one removal, file ↔ directory replaced (remove then create), symlinks by target, exclusions never copied and removed when new, Ctrl-C, failing copy, half-synced baseline repaired | `src/app/store.rs` |
 | U-STO-20 | When the store is taken: ext4 source and destination, copy-on-write source with an ext4 destination, ext4 source with a cow destination, two cow filesystems; not when the source can clone, when the store shares the source's filesystem, or with `--copy` / `--fallback` | `src/app/add.rs` |
@@ -398,6 +399,13 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-STO-53 | Relocation rewrites to the real path | `src/app/add.rs` |
 | U-STO-54…58 | Failure at every step, failing sync, Ctrl-C during/after the sync, source changed, existing branch: no symlink, no registration, branch only if ours, staging removed last, baseline untouched | `src/app/add.rs` |
 | U-STO-59 | Second run for the same repository copies nothing | `src/app/add.rs` |
+| U-STO-22c | The message of an unusable store names `git parhel doctor` and `systemctl status`, with the mount unit when the marker still says which | `src/app/add.rs` |
+| U-STO-85 | A baseline whose sync never reported its end (`state=syncing` in `meta`) is removed and mirrored again; a finished one, or one without a state, is only updated | `src/app/add.rs` |
+| U-STO-86 | The sync is flushed (`syncfs`) before the baseline counts as finished; a flush that fails (a full disk shows itself only there) fails the run, publishes nothing, and leaves the baseline `syncing` | `src/app/add.rs` |
+| U-STO-87 | A full store while mirroring, cloning or writing the registry: the system's message, nothing left | `src/app/add.rs` |
+| U-STO-88 | A destination with a tab or a newline is refused before anything is created (the registry is tab separated lines); in-place copy-on-write has no such limit | `src/app/add.rs` |
+| U-STO-89 | A registered symlink inside the source is not mirrored; one that no longer points where it was registered is | `src/app/add.rs` |
+| U-STO-90 / 90b | The first sync announces itself above 1 GiB with the size (counted by `stat`, exclusions left out); later syncs say nothing; the threshold is a GiB, exclusive | `src/app/store.rs` |
 | U-STO-60…62 | Journal link field: round trip (hostile paths), decodes journals without it, a link without a target is corruption | `src/app/rollback.rs` |
 | U-STO-63…67 | Rollback removes the symlink only while it points at the recorded target; keeps a retargeted link, a directory or file in its place, or nothing; names it when it cannot remove it | `src/app/rollback.rs` |
 | U-STO-70…72 | Doctor: healthy store silent; no store configured → no store findings; unavailable store is one finding with its reason (deeper checks skipped) | `src/app/doctor.rs` |
@@ -449,6 +457,12 @@ command gets a `PARHEL_STORE` that does not exist, so a developer's real store n
 | I-S22 / I-S23 | `.parhelignore` paths and nested worktrees are not mirrored |
 | I-S24…S28 | `doctor`: quiet on a healthy store; dangling link (report, `--fix`); orphan directory (never deleted); stale baseline (`--fix` deletes it only); unavailable store |
 | I-S29 / I-S30 | SIGKILL after the rename: `doctor --fix` repairs, keeps worktree, branch and link; SIGKILL after the link: `doctor --fix` removes link, registration, branch, staging |
+| I-S31 | `--submodules=reinit`: refused by default before the store is touched; the submodule is reinitialized (not mirrored), has its own git dir under the new worktree's admin dir, its links name the real path, and the source's submodule is unchanged |
+| I-S32 | Extended attributes, POSIX ACLs and nanosecond mtimes of files and directories survive the baseline and the clone, and the worktree root takes the source's ACL |
+| I-S33 | A full store (128 MiB btrfs, 192 MiB of data): fails with "No space left on device", leaves no worktree, symlink, registration, branch or staging; a smaller source works right after |
+| I-S34 | A second `add` on the same repository waits for the first to finish with the baseline; both succeed |
+| I-S35 | A destination with a tab or a newline is refused with `usage`, before anything is created |
+| I-S36 | A baseline marked `state=syncing` is not trusted: a file with the right size and mtime and wrong data is replaced |
 
 ### Setup — `tests/setup.rs` (needs sudo, systemd, btrfs-progs; `PARHEL_TEST_SETUP=1`, CI job `setup (Linux)`)
 Without the variable every test prints `SKIPPED: PARHEL_TEST_SETUP=1 is not set ...` and
