@@ -547,8 +547,11 @@ fn store_transaction(
     crate::failpoint!("after_sync");
     check_interrupt(env)?;
 
-    let real = free_name(fs, &real_dir, name)?;
+    let names_dir = baseline_dir.join("names");
+    ensure_dir(fs, &names_dir)?;
+    let (real, reservation) = reserve_name(fs, &names_dir, &real_dir, name)?;
     let route = StoreRun {
+        _reservation: reservation,
         root: store.root.clone(),
         baseline,
         worktrees_dir,
@@ -631,17 +634,48 @@ fn ensure_dir(fs: &dyn CowFs, dir: &Path) -> Result<()> {
         .or_else(|e| if fs.is_dir(dir)? { Ok(()) } else { Err(e) })
 }
 
-/// `dir/name`, or the first of `dir/name-2`, `dir/name-3`... that is free.
-fn free_name(fs: &dyn CowFs, dir: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
-    let mut candidate = dir.join(name);
-    let mut n = 2u32;
-    while fs.exists_no_follow(&candidate)? {
-        let mut suffixed = name.to_os_string();
-        suffixed.push(format!("-{n}"));
-        candidate = dir.join(suffixed);
+/// Reserve the real name of the worktree: `dir/name`, or the first of `dir/name-2`,
+/// `dir/name-3`... that nobody has and nobody is about to have.
+///
+/// Looking at the path is not enough: a run that picked `feat` and is still building
+/// its worktree has made nothing there yet, and a second run that only looked would pick
+/// `feat` too and lose the publishing rename after all its work. So each name is also a
+/// lock (a file in `names_dir`, locked with `flock`), taken here and held by the caller
+/// until the worktree is published or rolled back; a name is taken when its lock is
+/// held by a live run or something already is at its path. The lock files stay, empty:
+/// a lock nobody holds says nothing, and removing it would let two runs hold "the same"
+/// lock on different files.
+fn reserve_name(
+    fs: &dyn CowFs,
+    names_dir: &Path,
+    dir: &Path,
+    name: &std::ffi::OsStr,
+) -> Result<(PathBuf, FileLock)> {
+    let mut n = 1u32;
+    loop {
+        let mut candidate_name = name.to_os_string();
+        if n > 1 {
+            candidate_name.push(format!("-{n}"));
+        }
         n += 1;
+        let marker = names_dir.join(&candidate_name);
+        let lock = match fs.lock_exclusive(&marker) {
+            Ok(lock) => lock,
+            // Held by another run: that name is theirs.
+            Err(e) if fs.is_locked(&marker).unwrap_or(false) => {
+                let _ = e;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        // The lock says nobody is publishing under this name now; whoever did before
+        // left the worktree - or something else - at the path.
+        let candidate = dir.join(&candidate_name);
+        if !fs.exists_no_follow(&candidate)? {
+            return Ok((candidate, lock));
+        }
+        drop(lock);
     }
-    Ok(candidate)
 }
 
 /// The exclusive lock of a baseline. Another run of the same repository holds it while
@@ -673,6 +707,8 @@ fn lock_baseline(env: &Env<'_>, path: &Path) -> Result<FileLock> {
 /// What a store run adds to the transaction: where the worktree is cloned from and where
 /// it ends up.
 struct StoreRun {
+    /// The lock that keeps `real`'s name for this run, held until the run is over.
+    _reservation: FileLock,
     /// The store's root, named in the lock reason of the worktree.
     root: PathBuf,
     /// `<store>/baselines/<id>/tree`: the clone source instead of the live source.
@@ -851,7 +887,21 @@ fn assemble(
     } else {
         fs.write_file(&journal_path, &journal.encode())?;
     }
-    fs.rename_exclusive(&staged, final_path)?;
+    fs.rename_exclusive(&staged, final_path).map_err(|e| {
+        if route.is_some() && e.code == ErrorCode::DestExists {
+            Error::new(
+                ErrorCode::DestExists,
+                format!(
+                    "cannot create `{}`: its place in the store, `{}`, was taken while the \
+                     worktree was being built; run the command again",
+                    plan.destination.display(),
+                    final_path.display()
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
     Ok(report)
 }
 
@@ -3567,6 +3617,63 @@ mod tests {
             1
         );
         assert_eq!(w.count(|c| *c == Call::Repair { path: real(want) }), 1);
+    }
+
+    // U-STO-95: a real name is reserved, not merely looked for. Another run that has
+    // picked `feat` and is still building its worktree has made nothing at the path yet;
+    // a run that only looked at the path would pick `feat` too and lose the publishing
+    // rename. The reservation is a lock per name next to the baseline, held until the
+    // worktree is published or rolled back.
+    #[rstest]
+    #[case::the_first_is_reserved(&["feat"], "feat-2")]
+    #[case::two_reserved(&["feat", "feat-2"], "feat-3")]
+    #[case::a_reserved_gap(&["feat-2"], "feat")]
+    fn a_name_another_run_is_building_under_is_taken(
+        #[case] reserved: &[&str],
+        #[case] want: &str,
+    ) {
+        let w = store_world();
+        for name in reserved {
+            w.locked
+                .borrow_mut()
+                .insert(p(&format!("{BASELINE_DIR}/names/{name}")));
+        }
+        let out = run_store(&w, &new_branch()).unwrap();
+        assert_eq!(out.real_path, Some(real(want)));
+        // This run holds the lock of the name it took, from before it stages anything
+        // to the end.
+        let lock = w
+            .position(|c| *c == Call::Lock(p(&format!("{BASELINE_DIR}/names/{want}"))))
+            .expect("the name is reserved");
+        let staging = w
+            .position(|c| matches!(c, Call::CreateStaging { .. }))
+            .unwrap();
+        assert!(lock < staging, "{:#?}", w.calls());
+    }
+
+    // U-STO-95b: a name whose reservation is free but whose path exists (a worktree
+    // published earlier, a directory somebody made) is taken too, and the reservation
+    // that was tried is let go.
+    #[test]
+    fn an_existing_path_is_taken_whoever_holds_the_reservation() {
+        let w = store_world();
+        w.put_dir(&real("feat"));
+        let out = run_store(&w, &new_branch()).unwrap();
+        assert_eq!(out.real_path, Some(real("feat-2")));
+    }
+
+    // U-STO-96: when the publishing rename is lost anyway (somebody put something at the
+    // worktree's place in the store), the error names the destination the user asked
+    // for, not a path in the store they never heard of, and nothing is left behind.
+    #[test]
+    fn a_lost_publishing_rename_names_the_requested_destination() {
+        let w = store_world().failing(Step::Rename, ErrorCode::DestExists);
+        *w.fail_message.borrow_mut() =
+            format!("destination `{}` already exists", real("feat").display());
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::DestExists, "{err}");
+        assert!(err.message.contains(DEST), "{}", err.message);
+        assert_store_run_undone(&w, Some("feat"));
     }
 
     // U-STO-53: references to the source are rewritten to the REAL path: it is valid

@@ -358,7 +358,14 @@ fn iset05_the_store_survives_stopping_and_starting_the_unit() {
     assert_success(&add_default(&sb, &src, &dest, "f1"));
     let real = fs::read_link(&dest).unwrap();
     // Nothing is using the store, so it can be stopped: detach the worktree first.
-    src.git(&["worktree", "remove", "--force", real.to_str().unwrap()]);
+    // (A store worktree is locked: two forces remove it without unlocking first.)
+    src.git(&[
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        real.to_str().unwrap(),
+    ]);
     let _ = fs::remove_file(&dest);
 
     assert!(shell_ok(&format!("systemctl stop {}", unit())));
@@ -411,7 +418,13 @@ fn iset06_remove_refuses_with_a_worktree_and_succeeds_without() {
         "nothing was removed"
     );
 
-    src.git(&["worktree", "remove", "--force", dest.to_str().unwrap()]);
+    src.git(&[
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        dest.to_str().unwrap(),
+    ]);
     let out = setup(&["--remove"]);
     assert_success(&out);
 }

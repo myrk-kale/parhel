@@ -622,14 +622,34 @@ fn is15_refusals_create_nothing_in_the_store() {
     assert!(!w.sb.path("wt").exists());
 }
 
-// I-S16: `git worktree remove` given the symlink removes the real worktree (git
-// resolves the path) and leaves the symlink dangling; `doctor --fix` clears it and the
-// path can be used again. This is the documented way to remove a store worktree.
+// I-S16: removing a store worktree: it is locked (see I-S39), so `git worktree remove`
+// refuses until it is unlocked; then it works given the symlink (git resolves the path),
+// removes the real worktree and leaves the symlink dangling; `doctor --fix` clears it and
+// the path can be used again. This is the documented way to remove a store worktree.
 #[test]
 fn is16_git_worktree_remove_through_the_symlink() {
     let Some(w) = world() else { return };
     let dest = w.sb.path("wt");
     let real = w.add_ok(&dest, "f");
+    let refused = w
+        .src
+        .git_output(&["worktree", "remove", "--force", dest.to_str().unwrap()]);
+    assert!(!refused.status.success(), "a locked worktree was removed");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        said.contains("locked") && said.contains("parhel store"),
+        "{said}"
+    );
+    assert!(real.exists());
+
+    let unlocked = w
+        .src
+        .git_output(&["worktree", "unlock", dest.to_str().unwrap()]);
+    assert!(
+        unlocked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unlocked.stderr)
+    );
     let out = w
         .src
         .git_output(&["worktree", "remove", "--force", dest.to_str().unwrap()]);
@@ -652,6 +672,31 @@ fn is16_git_worktree_remove_through_the_symlink() {
         "doctor removed the dangling link"
     );
     assert_success(&w.add(&dest, "f2", &[]));
+}
+
+// I-S16b: ... or in one step, with git's own override for a locked worktree.
+#[test]
+fn is16b_remove_with_two_forces_needs_no_unlock() {
+    let Some(w) = world() else { return };
+    let dest = w.sb.path("wt");
+    let real = w.add_ok(&dest, "f");
+    let out = w.src.git_output(&[
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!real.exists());
+    assert_eq!(w.src.worktree_paths(), vec![w.src.root.clone()]);
+    let out = parhel_store(&w.sb.env, &w.src.root, &["doctor", "--fix"], &w.store);
+    assert_success(&out);
+    assert!(fs::symlink_metadata(&dest).is_err());
 }
 
 // I-S17: two worktrees with one name get distinct real paths; each requested path
@@ -838,8 +883,13 @@ fn is25_doctor_reports_and_fixes_a_dangling_link() {
     let Some(w) = world() else { return };
     let dest = w.sb.path("wt");
     let real = w.add_ok(&dest, "f");
-    w.src
-        .git(&["worktree", "remove", "--force", real.to_str().unwrap()]);
+    w.src.git(&[
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        real.to_str().unwrap(),
+    ]);
     let out = parhel_store(&w.sb.env, &w.src.root, &["doctor"], &w.store);
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
     assert!(
@@ -1512,4 +1562,49 @@ fn is39_pruning_while_the_store_is_down_keeps_the_registrations() {
         "an unlocked one should be pruned"
     );
     down.up();
+}
+
+// I-S40: two runs for one repository whose destinations have the same name (`a/feat` and
+// `b/feat`) must not both take `feat` in the store. B has chosen its real name and is
+// frozen just before the publishing rename (its worktree is built but nothing is at the
+// path yet); A runs to the end meanwhile; then B goes on. Looking at the path alone,
+// both pick `feat`, A publishes it and B loses its rename, after all its work.
+#[test]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn is40_two_runs_with_one_name_get_distinct_places_in_the_store() {
+    let Some(w) = world() else { return };
+    let (a_dir, b_dir) = (w.sb.path("a"), w.sb.path("b"));
+    fs::create_dir(&a_dir).unwrap();
+    fs::create_dir(&b_dir).unwrap();
+    let (a_dest, b_dest) = (a_dir.join("feat"), b_dir.join("feat"));
+    let barrier = Barrier::new(&w.sb.root, "b");
+    let mut b = spawn_parhel_store(
+        &w.sb.env,
+        &w.src.root,
+        &add_args(&b_dest, &["--new-branch", "from-b"]),
+        &w.store,
+        Some(&barrier.spec("before_rename")),
+    );
+    barrier.wait_reached(&mut b);
+    assert!(w.store.worktrees().is_empty(), "nothing is published yet");
+
+    assert_success(&w.add(&a_dest, "from-a", &[]));
+    barrier.release();
+    let out = finish(b);
+    assert_success(&out);
+
+    let mut real: Vec<PathBuf> = w.store.worktrees();
+    real.sort();
+    assert_eq!(real.len(), 2, "{real:?}");
+    let names: Vec<_> = real
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["feat", "feat-2"]);
+    // B chose first and kept `feat`; A, who ran while B held it, is `feat-2`.
+    assert_eq!(fs::read_link(&b_dest).unwrap(), real[0]);
+    assert_eq!(fs::read_link(&a_dest).unwrap(), real[1]);
+    w.open(&a_dest).assert_clean();
+    w.open(&b_dest).assert_clean();
+    w.store.assert_no_staging();
 }
