@@ -15,12 +15,13 @@ pub mod fs;
 pub mod git;
 pub mod ports;
 pub mod signals;
+pub mod sys;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use app::{AddOutcome, DoctorReport, Env, Finding};
+use app::{AddOutcome, DoctorReport, Env, Finding, SetupOutcome, StoreSummary};
 use cli::Invocation;
 use domain::{Error, ErrorCode};
 
@@ -45,6 +46,7 @@ where
     };
     let git = git::GitCli::default();
     let fs = fs::PlatformFs;
+    let store = store_path();
     match invocation {
         Invocation::Help(text) | Invocation::Version(text) => {
             print!("{text}");
@@ -57,6 +59,7 @@ where
                 fs: &fs,
                 cwd: &cwd,
                 interrupted,
+                store: store.as_deref(),
             };
             match app::add(&env, &request) {
                 Ok(outcome) => {
@@ -66,6 +69,13 @@ where
                 Err(e) => fail(&e),
             }
         }
+        Invocation::Setup(request) => match app::setup(&sys::SystemHost, &request) {
+            Ok(outcome) => {
+                report_setup(&outcome);
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
         Invocation::Doctor(request) => {
             let interrupted = signals::install();
             let env = Env {
@@ -73,6 +83,7 @@ where
                 fs: &fs,
                 cwd: &cwd,
                 interrupted,
+                store: store.as_deref(),
             };
             match app::doctor(&env, &request) {
                 Ok(report) => print_doctor(&report),
@@ -80,6 +91,16 @@ where
             }
         }
     }
+}
+
+/// Where the user's store lives, if stores exist here.
+///
+/// TDD: only `PARHEL_STORE` is honored for now; the default `/parhel/<user>` is wired
+/// together with store discovery.
+fn store_path() -> Option<PathBuf> {
+    std::env::var_os("PARHEL_STORE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn fail(error: &Error) -> ExitCode {
@@ -100,6 +121,7 @@ fn report_added(outcome: &AddOutcome) {
         app::Strategy::CopyOnWrite => "copy-on-write",
         app::Strategy::Fallback => "regular",
         app::Strategy::Copy => "full-copy",
+        app::Strategy::Store => "copy-on-write (store)",
     };
     println!(
         "Created {how} worktree at {}",
@@ -129,7 +151,21 @@ fn print_doctor(report: &DoctorReport) -> ExitCode {
             Finding::OrphanStaging { path }
             | Finding::OrphanRegistration { path }
             | Finding::ForeignGitfile { path }
-            | Finding::InProgress { path } => describe(path),
+            | Finding::InProgress { path }
+            | Finding::StoreOrphan { path }
+            | Finding::StoreStaleBaseline { path } => describe(path),
+            Finding::StoreUnavailable { path, reason } => {
+                format!("{}: {reason}", describe(path))
+            }
+            Finding::StoreImageDeleted { path, image } => {
+                format!("{} is backed by {image}", describe(path))
+            }
+            Finding::StoreLowSpace { path, free, total } => {
+                format!("{} has {free} of {total} bytes free", describe(path))
+            }
+            Finding::StoreDanglingLink { link, target } => {
+                format!("{} -> {}", describe(link), describe(target))
+            }
         };
         let status = if report.fixed.contains(finding) {
             " (fixed)"
@@ -144,5 +180,34 @@ fn print_doctor(report: &DoctorReport) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+fn report_setup(outcome: &SetupOutcome) {
+    let show = |summary: &StoreSummary| {
+        println!("store   {}", summary.store.display());
+        println!("image   {}", summary.image.display());
+        println!(
+            "size    {} bytes ({} allocated)",
+            summary.apparent, summary.allocated
+        );
+        println!("unit    {}", summary.unit);
+    };
+    match outcome {
+        SetupOutcome::Created(summary) => {
+            println!("Created the store for {}", summary.user);
+            show(summary);
+        }
+        SetupOutcome::AlreadySetUp(summary) => {
+            println!("The store for {} is already set up", summary.user);
+            show(summary);
+        }
+        SetupOutcome::Removed(summary) => {
+            println!("Removed the store for {}", summary.user);
+            show(summary);
+        }
+        SetupOutcome::NothingToRemove { user } => {
+            println!("No store for {user}: nothing to remove");
+        }
     }
 }

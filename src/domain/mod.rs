@@ -6,6 +6,7 @@ pub mod exclusions;
 pub mod paths;
 pub mod relocate;
 pub mod request;
+pub mod store;
 
 pub use error::{Error, ErrorCode, Result};
-pub use request::{AddRequest, BranchMode, DoctorRequest, SubmodulePolicy};
+pub use request::{AddRequest, BranchMode, DoctorRequest, SetupRequest, SubmodulePolicy};

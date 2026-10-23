@@ -34,6 +34,15 @@ pub const ADD_FAILPOINTS: &[&str] = &[
     "before_rename",
 ];
 
+/// Failpoints of the store route of `add`, in execution order: after the baseline sync,
+/// and after the symlink was claimed at the requested destination (both before the
+/// publishing rename). Each also applies to [`ADD_FAILPOINTS`] steps the route shares.
+pub const STORE_FAILPOINTS: &[&str] = &["after_sync", "after_link"];
+
+/// Failpoint of the baseline sync, evaluated as `sync_entry:<path>` just before each
+/// entry below the source root is compared (the sync's twin of [`WALK_FAILPOINT`]).
+pub const SYNC_FAILPOINT: &str = "sync_entry";
+
 /// Failpoint of the tree walk (clone or copy), evaluated as `walk_entry:<path>` just
 /// before each entry below the source root is opened.
 pub const WALK_FAILPOINT: &str = "walk_entry";

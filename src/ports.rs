@@ -6,7 +6,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{BranchMode, Result};
+use crate::domain::store::EntryMeta;
+use crate::domain::{BranchMode, Error, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
 
 /// Facts about the source worktree, discovered from `--from`.
@@ -174,6 +175,118 @@ pub trait CowFs {
     fn lock_exclusive(&self, path: &Path) -> Result<FileLock>;
     /// Whether another live process holds the lock on `path`.
     fn is_locked(&self, path: &Path) -> Result<bool>;
+
+    // --- the store (Linux): sync of the baseline, the symlink at the destination.
+    //
+    // TDD stubs: these defaults answer `not-implemented`; the adapters override them
+    // when the store work is implemented, and the defaults go away with it.
+
+    /// `lstat` of the entry `root/rel` (`rel` empty: `root` itself), reached from
+    /// `root` without following any symlink; `None` when it does not exist.
+    fn stat_within(&self, _root: &Path, _rel: &Path) -> Result<Option<EntryMeta>> {
+        Err(Error::not_implemented("stat_within"))
+    }
+    /// Make `dst` a copy of the source entry `root/rel`, replacing what `dst` holds
+    /// when it is of the same kind: files are copied in full (never reflinked: the
+    /// baseline is on another filesystem) through a temporary name and renamed over
+    /// `dst`; symlinks and FIFOs are recreated; a directory is created empty when
+    /// missing (its children are separate calls). Returns the bytes copied.
+    /// Metadata that depends on the children (directory mtime) is left to
+    /// [`mirror_dir_meta`](Self::mirror_dir_meta).
+    fn mirror_entry(&self, _root: &Path, _rel: &Path, _dst: &Path) -> Result<u64> {
+        Err(Error::not_implemented("mirror_entry"))
+    }
+    /// Give the directory `dst` the mode, ownership-independent metadata (xattrs,
+    /// ACLs, mtime) of the source directory `root/rel`; called once its children are
+    /// in place.
+    fn mirror_dir_meta(&self, _root: &Path, _rel: &Path, _dst: &Path) -> Result<()> {
+        Err(Error::not_implemented("mirror_dir_meta"))
+    }
+    /// `symlink(target, link)` that never replaces anything. Errors: `dest-exists`
+    /// when `link` exists (even as a dangling symlink).
+    fn symlink_exclusive(&self, _target: &Path, _link: &Path) -> Result<()> {
+        Err(Error::not_implemented("symlink_exclusive"))
+    }
+    /// Target of the symlink at `path`; `None` when it is not a symlink or is gone.
+    fn read_link(&self, _path: &Path) -> Result<Option<PathBuf>> {
+        Err(Error::not_implemented("read_link"))
+    }
+    /// Append `bytes` to `path` (created if missing) and sync it.
+    fn append_file(&self, _path: &Path, _bytes: &[u8]) -> Result<()> {
+        Err(Error::not_implemented("append_file"))
+    }
+    /// Whether the current user can create entries in the directory `path`.
+    fn is_writable(&self, _path: &Path) -> Result<bool> {
+        Err(Error::not_implemented("is_writable"))
+    }
+    /// Free and total space of the filesystem holding `path` (`statvfs`).
+    fn space(&self, _path: &Path) -> Result<Space> {
+        Err(Error::not_implemented("space"))
+    }
+}
+
+/// Space of a filesystem, in bytes (what an unprivileged user can use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    pub total: u64,
+    pub free: u64,
+}
+
+/// A local account, as `setup` needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInfo {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Owner of something `setup` creates: `None` is root.
+pub type Owner = Option<(u32, u32)>;
+
+/// Size of an image file: what it claims and what it occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageUsage {
+    pub apparent: u64,
+    pub allocated: u64,
+}
+
+/// Everything `git parhel setup` asks of the machine: privileged system calls,
+/// programs, systemd. Reads are separate from mutations so a fake can log only the
+/// latter.
+pub trait Host {
+    fn is_linux(&self) -> bool;
+    fn is_root(&self) -> bool;
+    /// An environment variable of the process (`SUDO_USER`).
+    fn env_var(&self, name: &str) -> Option<String>;
+    /// `getpwnam`.
+    fn user(&self, name: &str) -> Result<Option<UserInfo>>;
+    /// Whether `tool` is found in the directories root searches.
+    fn tool_exists(&self, tool: &str) -> bool;
+    /// Whether systemd is PID 1 (`systemctl` can manage units).
+    fn systemd_running(&self) -> bool;
+    /// Contents of a text file (`/proc/filesystems`, a unit, the marker); `None` when missing.
+    fn read_text(&self, path: &Path) -> Result<Option<String>>;
+    /// `lstat` succeeds.
+    fn exists(&self, path: &Path) -> bool;
+    /// Names in a directory; empty when it does not exist.
+    fn list_dir(&self, path: &Path) -> Result<Vec<OsString>>;
+    fn is_mount_point(&self, path: &Path) -> bool;
+    /// Run a program to completion, returning its stdout. Errors carry its stderr.
+    fn run(&self, program: &str, args: &[&str]) -> Result<String>;
+    /// Create the directory when missing; either way set its mode and owner.
+    fn create_dir(&self, path: &Path, mode: u32, owner: Owner) -> Result<()>;
+    /// Write a file (replacing), with the mode and owner given.
+    fn write_file(&self, path: &Path, contents: &[u8], mode: u32, owner: Owner) -> Result<()>;
+    /// Create the image file (mode 0600, root): `ftruncate` to `bytes`, or `fallocate`
+    /// the whole size with `preallocate`.
+    fn create_image(&self, path: &Path, bytes: u64, preallocate: bool) -> Result<()>;
+    fn image_usage(&self, path: &Path) -> Result<ImageUsage>;
+    /// After `chattr +i` on `dir`: `unlink` and `rename` of `image` fail with `EPERM`
+    /// while writing to it still works.
+    fn verify_immutable(&self, dir: &Path, image: &Path) -> Result<()>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    /// Remove an empty directory.
+    fn remove_dir(&self, path: &Path) -> Result<()>;
 }
 
 /// Guard of [`CowFs::lock_exclusive`].

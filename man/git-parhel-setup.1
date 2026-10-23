@@ -1,0 +1,32 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH git-parhel-setup 1  "parhel 0.3.0" "Git Manual"
+.SH NAME
+git\-parhel\-setup \- Linux: create the store that gives filesystems without copy\-on\-write (ext4) cheap worktrees
+.SH SYNOPSIS
+\fBgit parhel setup\fR [\fB\-\-size\fR] [\fB\-\-preallocate\fR] [\fB\-\-user\fR] [\fB\-\-remove\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Create a per\-user btrfs image (the store) mounted at /parhel/<user> through a systemd mount unit, so `add` can create worktrees from sources on filesystems without copy\-on\-write, such as ext4. The worktree lives in the store and the requested destination becomes a symlink to it. Needs root (run it with sudo); the store belongs to the user who ran sudo, or to \-\-user.
+.PP
+Safe to re\-run: a healthy store is left as it is. With \-\-remove the store is taken down (refused while worktrees live in it).
+.SH OPTIONS
+.TP
+\fB\-\-size\fR \fI<size>\fR
+Size of the store image: a number with an optional K, M, G or T suffix. The image is sparse, so it takes disk space only as it fills
+.TP
+\fB\-\-preallocate\fR
+Allocate the whole image now instead of letting it grow
+.TP
+\fB\-\-user\fR \fI<name>\fR
+Whose store to create (default: the user who ran sudo)
+.TP
+\fB\-\-remove\fR
+Take the store down: unmount, remove the unit and the image
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH EXTRA
+Examples:
+  sudo git parhel setup
+  sudo git parhel setup \-\-size 200G \-\-user alice
+  sudo git parhel setup \-\-remove

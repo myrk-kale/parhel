@@ -31,6 +31,9 @@ pub struct Env<'a> {
     pub cwd: &'a Path,
     /// Set by the SIGINT handler; checked between steps.
     pub interrupted: &'a AtomicBool,
+    /// Where the user's store lives (`PARHEL_STORE`, else `/parhel/<user>` on Linux);
+    /// `None` where stores do not exist (macOS), so nothing is looked up or suggested.
+    pub store: Option<&'a Path>,
 }
 
 impl std::fmt::Debug for Env<'_> {
@@ -48,6 +51,8 @@ pub enum Strategy {
     Fallback,
     /// Every file copied in full (`--copy`): same transaction, no copy-on-write.
     Copy,
+    /// A reflink clone of the store's baseline; the destination is a symlink to it.
+    Store,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +65,8 @@ pub struct AddOutcome {
     pub warnings: Vec<String>,
     /// Copied files and symlinks whose references to the source path were rewritten.
     pub relocated: usize,
+    /// Store runs: where the worktree really lives (`destination` is a symlink to it).
+    pub real_path: Option<PathBuf>,
 }
 
 /// What relocation changed in the staged worktree.
@@ -340,6 +347,7 @@ fn fallback(
         head: env.git.head(&plan.destination)?,
         strategy: Strategy::Fallback,
         relocated: 0,
+        real_path: None,
         warnings: vec![format!(
             "copy-on-write unavailable ({}); created a regular worktree instead",
             problem.message
@@ -773,6 +781,7 @@ fn publish(
         },
         warnings,
         relocated: report.rewritten + report.relinked,
+        real_path: None,
     })
 }
 
@@ -796,7 +805,7 @@ impl DirLister for Lister<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fakes::{Call, FAKE_STAGING, SHA_A, SHA_B, Step, World, apfs, p};
+    use crate::app::fakes::{Call, FAKE_STAGING, SHA_A, SHA_B, Step, World, apfs, btrfs, ext4, p};
     use crate::app::rollback::{JOURNAL_FILE, Journal};
     use crate::domain::{BranchMode, ErrorCode, SubmodulePolicy};
     use crate::git::parse::{GitVersion, WorktreeEntry};
@@ -833,6 +842,7 @@ mod tests {
             fs: w,
             cwd: Path::new("/w/repo"),
             interrupted: &w.interrupted,
+            store: None,
         };
         add(&env, req)
     }
@@ -929,6 +939,7 @@ mod tests {
                 strategy: Strategy::CopyOnWrite,
                 warnings: vec![],
                 relocated: 0,
+                real_path: None,
             }
         );
     }
@@ -2253,6 +2264,7 @@ mod tests {
                 strategy: Strategy::Copy,
                 warnings: vec![],
                 relocated: 0,
+                real_path: None,
             }
         );
         assert_eq!(w.count(|c| matches!(c, Call::Rename { .. })), 1);
@@ -2655,5 +2667,665 @@ mod tests {
         let out = run(&w, &new_branch()).unwrap();
         assert_eq!(out.strategy, Strategy::CopyOnWrite);
         assert_eq!(w.count(|c| matches!(c, Call::Copy { .. })), 0);
+    }
+
+    // ------------------------------------------------------------ the store
+
+    const BASELINE_DIR: &str = "/store/baselines/7005185596c2e32bd0688ebe72725f92";
+    const STORE_STAGING: &str = "/store/worktrees/.parhel-staging-test";
+    const STORE_STAGED_WT: &str = "/store/worktrees/.parhel-staging-test/feat";
+
+    /// Where the worktree called `name` really lives.
+    fn real(name: &str) -> PathBuf {
+        p(&format!(
+            "/store/worktrees/7005185596c2e32bd0688ebe72725f92/{name}"
+        ))
+    }
+
+    fn baseline() -> PathBuf {
+        p(&format!("{BASELINE_DIR}/tree"))
+    }
+
+    fn store_world() -> World {
+        World::default().with_store()
+    }
+
+    /// `add` with the store at `/store` configured.
+    fn run_store(w: &World, req: &AddRequest) -> Result<AddOutcome> {
+        run_with(w, req, Some(Path::new("/store")))
+    }
+
+    fn run_with(w: &World, req: &AddRequest, store: Option<&Path>) -> Result<AddOutcome> {
+        let env = Env {
+            git: w,
+            fs: w,
+            cwd: Path::new("/w/repo"),
+            interrupted: &w.interrupted,
+            store,
+        };
+        add(&env, req)
+    }
+
+    fn journal_path() -> PathBuf {
+        p(&format!("{STORE_STAGING}/{JOURNAL_FILE}"))
+    }
+
+    // U-STO-20: when the store is taken and when the normal path (or an error)
+    // applies. The store is for sources that cannot clone into the destination.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Route {
+        Store,
+        Clone,
+        Copy,
+        Fallback,
+        Refuse(ErrorCode),
+    }
+
+    #[rstest]
+    #[case::source_and_destination_on_ext4(
+        vec![(p("/"), ext4(1)), (p("/store"), btrfs(2))], "../feat", false, false, Route::Store)]
+    #[case::cow_source_and_destination_on_one_filesystem(
+        vec![(p("/"), btrfs(3)), (p("/store"), btrfs(2))], "../feat", false, false, Route::Clone)]
+    #[case::cow_source_destination_without_cow(
+        vec![(p("/"), ext4(1)), (p("/w/repo"), btrfs(3)), (p("/store"), btrfs(2))],
+        "../feat", false, false, Route::Store)]
+    #[case::source_without_cow_destination_with_cow(
+        vec![(p("/"), ext4(1)), (p("/d"), btrfs(3)), (p("/store"), btrfs(2))],
+        "/d/feat", false, false, Route::Store)]
+    #[case::two_cow_filesystems(
+        vec![(p("/"), btrfs(3)), (p("/d"), btrfs(4)), (p("/store"), btrfs(2))],
+        "/d/feat", false, false, Route::Store)]
+    // The store on the source's own filesystem would not help: the normal answer.
+    #[case::store_on_the_sources_filesystem(
+        vec![(p("/"), btrfs(3)), (p("/d"), btrfs(4)), (p("/store"), btrfs(3))],
+        "/d/feat", false, false, Route::Refuse(ErrorCode::CrossVolume))]
+    #[case::copy_bypasses_the_store(
+        vec![(p("/"), ext4(1)), (p("/store"), btrfs(2))], "../feat", true, false, Route::Copy)]
+    #[case::fallback_bypasses_the_store(
+        vec![(p("/"), ext4(1)), (p("/store"), btrfs(2))], "../feat", false, true, Route::Fallback)]
+    fn decision_table_for_taking_the_store(
+        #[case] volumes: Vec<(PathBuf, VolumeInfo)>,
+        #[case] destination: &str,
+        #[case] copy: bool,
+        #[case] fallback: bool,
+        #[case] want: Route,
+    ) {
+        let mut w = store_world();
+        w.volumes = volumes;
+        w.put_dir(Path::new("/d"));
+        let req = AddRequest {
+            destination: p(destination),
+            copy,
+            fallback,
+            ..new_branch()
+        };
+        let result = run_store(&w, &req);
+        let linked = p(destination);
+        match want {
+            Route::Store => {
+                let out = result.unwrap();
+                assert_eq!(out.strategy, Strategy::Store);
+                assert_eq!(
+                    out.destination,
+                    linked.canonicalize_like(),
+                    "requested path"
+                );
+                assert_eq!(out.real_path, Some(real("feat")));
+                assert_eq!(
+                    w.links.borrow().get(&out.destination),
+                    Some(&real("feat")),
+                    "the requested path is a symlink to the real worktree"
+                );
+            }
+            Route::Clone | Route::Copy | Route::Fallback => {
+                let out = result.unwrap();
+                assert_eq!(
+                    out.strategy,
+                    match want {
+                        Route::Clone => Strategy::CopyOnWrite,
+                        Route::Copy => Strategy::Copy,
+                        _ => Strategy::Fallback,
+                    }
+                );
+                assert_eq!(out.real_path, None);
+                assert!(!w.touched(Path::new("/store")), "{:#?}", w.calls());
+                assert!(w.links.borrow().is_empty());
+            }
+            Route::Refuse(code) => {
+                assert_eq!(result.unwrap_err().code, code);
+                assert_no_mutation(&w);
+            }
+        }
+    }
+
+    /// `p("../feat")` resolved against `/w/repo`, `p("/d/feat")` as is.
+    trait CanonicalizeLike {
+        fn canonicalize_like(&self) -> PathBuf;
+    }
+
+    impl CanonicalizeLike for PathBuf {
+        fn canonicalize_like(&self) -> PathBuf {
+            if self.is_absolute() {
+                self.clone()
+            } else {
+                p("/w").join(self.strip_prefix("..").unwrap())
+            }
+        }
+    }
+
+    // U-STO-21: no store set up: the usual refusal, plus the way to get one.
+    #[test]
+    fn not_configured_store_adds_the_setup_hint_to_not_cow() {
+        let w = World {
+            volumes: vec![(p("/"), ext4(1))],
+            ..World::default()
+        };
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotCow);
+        for needle in ["sudo git parhel setup", "--copy", "--fallback"] {
+            assert!(
+                err.message.contains(needle),
+                "lacks `{needle}`: {}",
+                err.message
+            );
+        }
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-21b: where stores do not exist (no store path at all) nothing is suggested.
+    #[test]
+    fn without_a_store_path_nothing_is_suggested() {
+        let w = World {
+            volumes: vec![(p("/"), ext4(1))],
+            ..World::default()
+        };
+        let err = run_with(&w, &new_branch(), None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotCow);
+        assert!(!err.message.contains("setup"), "{}", err.message);
+    }
+
+    // U-STO-22: a store that exists but cannot be used is an error of its own, never
+    // a silent fallback to a regular worktree or a full copy.
+    #[rstest]
+    #[case::marker_missing(|w: &World| { w.files.borrow_mut().remove(&p("/store/.parhel-store")); })]
+    #[case::marker_unreadable(|w: &World| { w.files.borrow_mut().insert(p("/store/.parhel-store"), b"???".to_vec()); })]
+    #[case::not_writable(|w: &World| { w.unwritable.borrow_mut().insert(p("/store")); })]
+    fn configured_but_unavailable_store_is_an_error(#[case] break_it: fn(&World)) {
+        let w = store_world();
+        break_it(&w);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        assert!(err.message.contains("git parhel doctor"), "{}", err.message);
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-22b: ... including a store on a filesystem that cannot clone.
+    #[test]
+    fn store_without_cow_is_unavailable() {
+        let mut w = store_world();
+        w.volumes = vec![(p("/"), ext4(1)), (p("/store"), ext4(2))];
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-23: the escape hatches do not look at the store at all.
+    #[rstest]
+    #[case::copy(true, false, Strategy::Copy)]
+    #[case::fallback(false, true, Strategy::Fallback)]
+    fn escape_hatches_ignore_an_unavailable_store(
+        #[case] copy: bool,
+        #[case] fallback: bool,
+        #[case] strategy: Strategy,
+    ) {
+        let w = store_world();
+        w.files.borrow_mut().remove(&p("/store/.parhel-store"));
+        let req = AddRequest {
+            fallback,
+            copy,
+            ..new_branch()
+        };
+        assert_eq!(run_store(&w, &req).unwrap().strategy, strategy);
+        assert!(!w.touched(Path::new("/store")), "{:#?}", w.calls());
+    }
+
+    // U-STO-24: every refusal about the source or the destination is decided before
+    // the store is touched: no lock, no sync.
+    #[rstest]
+    #[case::dirty_source(|w: &mut World| w.dirty = true, ErrorCode::DirtySource)]
+    #[case::operation_in_progress(|w: &mut World| w.operation = Some("merge".into()), ErrorCode::OperationInProgress)]
+    #[case::sparse(|w: &mut World| w.sparse = true, ErrorCode::SparseCheckout)]
+    #[case::destination_exists(|w: &mut World| { w.existing.borrow_mut().insert(p("/w/feat")); }, ErrorCode::DestExists)]
+    #[case::destination_is_a_dangling_symlink(|w: &mut World| { w.links.borrow_mut().insert(p("/w/feat"), p("/gone")); }, ErrorCode::DestExists)]
+    #[case::parent_missing(|w: &mut World| drop(w.tree.borrow_mut().remove(&p("/w"))), ErrorCode::DestParentMissing)]
+    fn refusals_come_before_the_store(#[case] change: fn(&mut World), #[case] code: ErrorCode) {
+        let mut w = store_world();
+        change(&mut w);
+        assert_eq!(run_store(&w, &new_branch()).unwrap_err().code, code);
+        assert_no_mutation(&w);
+    }
+
+    // U-STO-45: the store route, step by step.
+    #[test]
+    fn store_route_runs_steps_in_order() {
+        let w = store_world();
+        let out = run_store(&w, &new_branch()).unwrap();
+        assert_eq!(
+            out,
+            AddOutcome {
+                destination: p(DEST),
+                head: SHA_A.into(),
+                strategy: Strategy::Store,
+                warnings: vec![],
+                relocated: 0,
+                real_path: Some(real("feat")),
+            }
+        );
+        let pos = |pred: &dyn Fn(&Call) -> bool| {
+            w.position(|c| pred(c))
+                .unwrap_or_else(|| panic!("missing call in {:#?}", w.calls()))
+        };
+        let lock = pos(&|c| *c == Call::Lock(p(&format!("{BASELINE_DIR}/lock"))));
+        let first_mirror = pos(&|c| matches!(c, Call::Mirror { .. }));
+        let last_mirror = w
+            .calls()
+            .iter()
+            .rposition(|c| matches!(c, Call::Mirror { .. } | Call::MirrorDirMeta { .. }))
+            .unwrap();
+        let staging = pos(&|c| {
+            *c == Call::CreateStaging {
+                parent: p("/store/worktrees"),
+            }
+        });
+        let add = pos(&|c| {
+            *c == Call::WorktreeAdd(WorktreeAddSpec {
+                path: p(STORE_STAGED_WT),
+                branch: BranchMode::New("feat".into()),
+                reference: None,
+                no_checkout: true,
+            })
+        });
+        let first_clone = pos(&|c| matches!(c, Call::Clone { .. }));
+        let index = pos(&|c| matches!(c, Call::ResetIndex { .. }));
+        let registry = pos(&|c| *c == Call::Append(p("/store/links")));
+        let symlink = pos(&|c| {
+            *c == Call::Symlink {
+                target: real("feat"),
+                link: p(DEST),
+            }
+        });
+        let rename = pos(&|c| {
+            *c == Call::Rename {
+                from: p(STORE_STAGED_WT),
+                to: real("feat"),
+            }
+        });
+        let repair = pos(&|c| *c == Call::Repair { path: real("feat") });
+        let cleanup = pos(&|c| *c == Call::RemoveDirAll(p(STORE_STAGING)));
+        assert!(
+            lock < first_mirror,
+            "locked before the first baseline write"
+        );
+        assert!(
+            last_mirror < staging,
+            "the baseline is complete before the clone starts"
+        );
+        assert!(staging < add && add < first_clone && first_clone < index);
+        assert!(index < registry && registry < symlink && symlink < rename);
+        assert!(rename < repair && repair < cleanup);
+        assert_eq!(
+            w.count(|c| matches!(c, Call::RemoveForce { .. } | Call::BranchDelete(_))),
+            0
+        );
+        // The worktree's directory exists in the store before the exclusive rename.
+        let parent = pos(&|c| *c == Call::CreateDir(real("feat").parent().unwrap().to_path_buf()));
+        assert!(parent < rename);
+    }
+
+    // U-STO-46: the lock lives next to the baseline it protects; the metadata names the source.
+    #[test]
+    fn baseline_has_a_lock_and_a_meta_naming_its_source() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        assert_eq!(
+            w.count(|c| *c == Call::Lock(p(&format!("{BASELINE_DIR}/lock")))),
+            1
+        );
+        let meta = w.files.borrow()[&p(&format!("{BASELINE_DIR}/meta"))].clone();
+        let meta = String::from_utf8(meta).unwrap();
+        assert!(meta.lines().any(|l| l == "source=/w/repo"), "{meta}");
+    }
+
+    // U-STO-47: the worktree is cloned from the baseline, never from the live source,
+    // and never copied in full: that is what makes it cheap.
+    #[test]
+    fn worktree_is_cloned_from_the_baseline() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        let clones: Vec<_> = w
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Clone { .. } | Call::Copy { .. }))
+            .collect();
+        assert_eq!(
+            clones,
+            vec![
+                Call::Clone {
+                    src: baseline().join("node_modules"),
+                    dst: p(&format!("{STORE_STAGED_WT}/node_modules")),
+                },
+                Call::Clone {
+                    src: baseline().join("src"),
+                    dst: p(&format!("{STORE_STAGED_WT}/src")),
+                },
+            ]
+        );
+    }
+
+    // U-STO-48: the journal knows the link and the real destination.
+    #[test]
+    fn journal_records_the_link_and_the_real_destination() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        let j = Journal::decode(&w.files.borrow()[&journal_path()]).unwrap();
+        assert_eq!(j.publish_to, Some(real("feat")));
+        assert_eq!(j.worktree, Some(p(STORE_STAGED_WT)));
+        assert_eq!(
+            j.store_link,
+            Some(crate::app::rollback::StoreLink {
+                path: p(DEST),
+                target: real("feat"),
+            })
+        );
+    }
+
+    // U-STO-49: the link is journaled and registered before it is created: a crash
+    // between the two leaves a record, never a symlink nobody knows about.
+    #[test]
+    fn link_is_journaled_and_registered_before_it_is_created() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        let symlink = w.position(|c| matches!(c, Call::Symlink { .. })).unwrap();
+        let journal_write = w
+            .calls()
+            .iter()
+            .rposition(|c| *c == Call::WriteFile(journal_path()))
+            .unwrap();
+        let registry = w
+            .position(|c| *c == Call::Append(p("/store/links")))
+            .unwrap();
+        assert!(
+            journal_write < symlink && registry < symlink,
+            "{:#?}",
+            w.calls()
+        );
+        // One line per link: where it is and where it points.
+        let registry = String::from_utf8(w.files.borrow()[&p("/store/links")].clone()).unwrap();
+        assert_eq!(registry, format!("/w/feat\t{}\n", real("feat").display()));
+    }
+
+    // U-STO-50: somebody took the requested path since the checks: `dest-exists`, and
+    // since this run never created anything there, nothing is removed from there.
+    #[test]
+    fn symlink_that_cannot_be_created_is_dest_exists_and_rolls_back() {
+        let w = store_world().failing(Step::Symlink, ErrorCode::DestExists);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::DestExists);
+        assert_eq!(w.count(|c| matches!(c, Call::Rename { .. })), 0);
+        assert_eq!(w.count(|c| *c == Call::RemoveFile(p(DEST))), 0);
+        assert_eq!(
+            w.count(|c| *c
+                == Call::RemoveForce {
+                    path: p(STORE_STAGED_WT)
+                }),
+            1
+        );
+        assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
+        assert_eq!(
+            w.calls().last(),
+            Some(&Call::RemoveDirAll(p(STORE_STAGING)))
+        );
+    }
+
+    // U-STO-51: the exclusive rename loses a race: the symlink this run made goes away.
+    #[test]
+    fn failed_publish_removes_the_symlink() {
+        let w = store_world().failing(Step::Rename, ErrorCode::DestExists);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::DestExists);
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p(DEST))),
+            1,
+            "{:#?}",
+            w.calls()
+        );
+        assert!(!w.links.borrow().contains_key(&p(DEST)));
+        assert_eq!(
+            w.count(|c| *c
+                == Call::RemoveForce {
+                    path: p(STORE_STAGED_WT)
+                }),
+            1
+        );
+        assert_eq!(
+            w.calls().last(),
+            Some(&Call::RemoveDirAll(p(STORE_STAGING)))
+        );
+    }
+
+    // U-STO-52: two worktrees with one name in the same repository get distinct real
+    // paths; the requested path is always the one the user asked for.
+    #[rstest]
+    #[case::free(&[], "feat")]
+    #[case::taken(&["feat"], "feat-2")]
+    #[case::two_taken(&["feat", "feat-2"], "feat-3")]
+    #[case::gap_is_filled_from_the_start(&["feat", "feat-3"], "feat-2")]
+    #[case::only_a_suffixed_one(&["feat-2"], "feat")]
+    fn real_name_gets_a_suffix_when_taken(#[case] existing: &[&str], #[case] want: &str) {
+        let w = store_world();
+        for name in existing {
+            w.put_dir(&real(name));
+        }
+        let out = run_store(&w, &new_branch()).unwrap();
+        assert_eq!(out.destination, p(DEST));
+        assert_eq!(out.real_path, Some(real(want)));
+        assert_eq!(w.links.borrow().get(&p(DEST)), Some(&real(want)));
+        assert_eq!(
+            w.count(|c| *c
+                == Call::Rename {
+                    from: p(STORE_STAGED_WT),
+                    to: real(want)
+                }),
+            1
+        );
+        assert_eq!(w.count(|c| *c == Call::Repair { path: real(want) }), 1);
+    }
+
+    // U-STO-53: references to the source are rewritten to the REAL path: it is valid
+    // however the user reaches the worktree, and survives the symlink being replaced.
+    #[test]
+    fn relocation_points_at_the_real_path() {
+        let w = World {
+            staged_files: vec![(p("env/bin/tool"), b"#!/w/repo/env/bin/python\n".to_vec())],
+            staged_links: vec![(p("env/link"), p("/w/repo/env/bin"))],
+            ..store_world()
+        };
+        let out = run_store(&w, &new_branch()).unwrap();
+        let tool = p(&format!("{STORE_STAGED_WT}/env/bin/tool"));
+        let expected = format!("#!{}/env/bin/python\n", real("feat").display());
+        assert_eq!(w.files.borrow()[&tool], expected.as_bytes());
+        assert_eq!(
+            w.count(|c| *c
+                == Call::Relink {
+                    path: p(&format!("{STORE_STAGED_WT}/env/link")),
+                    target: real("feat").join("env/bin"),
+                }),
+            1
+        );
+        assert_eq!(out.relocated, 2);
+    }
+
+    /// Whatever failed, nothing of this run remains: no symlink, no registration, no
+    /// branch, no staging, and the baseline was not touched by the rollback.
+    fn assert_store_run_undone(w: &World, created_branch: Option<&str>) {
+        let calls = w.calls();
+        assert!(
+            !w.links.borrow().contains_key(&p(DEST)),
+            "symlink left: {calls:#?}"
+        );
+        let created_link = calls.iter().any(|c| matches!(c, Call::Symlink { .. }))
+            && !w.fail.borrow().contains_key(&Step::Symlink);
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveFile(p(DEST))),
+            usize::from(created_link),
+            "{calls:#?}"
+        );
+        let registered = calls.iter().any(|c| matches!(c, Call::WorktreeAdd(_)))
+            && !w.fail.borrow().contains_key(&Step::WorktreeAdd);
+        assert_eq!(
+            w.count(|c| *c
+                == Call::RemoveForce {
+                    path: p(STORE_STAGED_WT)
+                }),
+            usize::from(registered),
+            "{calls:#?}"
+        );
+        match created_branch {
+            Some(b) if registered => {
+                assert_eq!(
+                    w.count(|c| *c == Call::BranchDelete(b.into())),
+                    1,
+                    "{calls:#?}"
+                );
+            }
+            _ => assert_eq!(
+                w.count(|c| matches!(c, Call::BranchDelete(_))),
+                0,
+                "{calls:#?}"
+            ),
+        }
+        if calls
+            .iter()
+            .any(|c| matches!(c, Call::CreateStaging { .. }))
+        {
+            assert_eq!(
+                calls.last(),
+                Some(&Call::RemoveDirAll(p(STORE_STAGING))),
+                "{calls:#?}"
+            );
+        }
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                Call::RemoveDirAll(path) | Call::RemoveFile(path) if path.starts_with("/store/baselines")
+            )),
+            "the baseline was not touched by the rollback: {calls:#?}"
+        );
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveDirAll(p(DEST))),
+            0,
+            "dest never deleted"
+        );
+    }
+
+    // U-STO-54: a failure at any step of the store route leaves no trace.
+    #[rstest]
+    #[case::create_staging(Step::CreateStaging, ErrorCode::Io)]
+    #[case::journal(Step::WriteJournal, ErrorCode::Io)]
+    #[case::worktree_add(Step::WorktreeAdd, ErrorCode::GitFailed)]
+    #[case::clone(Step::Clone, ErrorCode::CloneFailed)]
+    #[case::index(Step::ResetIndex, ErrorCode::GitFailed)]
+    #[case::registry(Step::Append, ErrorCode::Io)]
+    #[case::symlink(Step::Symlink, ErrorCode::DestExists)]
+    #[case::rename(Step::Rename, ErrorCode::Io)]
+    fn failure_at_each_step_leaves_no_trace(#[case] step: Step, #[case] code: ErrorCode) {
+        let w = store_world().failing(step, code);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, code, "{err}");
+        assert_store_run_undone(&w, Some("feat"));
+    }
+
+    // U-STO-55: a sync that fails stops the run before anything is registered, and the
+    // baseline stays as the sync left it (the next sync repairs it).
+    #[test]
+    fn failing_sync_registers_nothing() {
+        let w = store_world().failing(Step::Mirror, ErrorCode::CloneFailed);
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::CloneFailed);
+        assert_eq!(
+            w.count(|c| matches!(
+                c,
+                Call::CreateStaging { .. } | Call::WorktreeAdd(_) | Call::Symlink { .. }
+            )),
+            0
+        );
+        assert_store_run_undone(&w, None);
+    }
+
+    // U-STO-56: Ctrl-C during the sync and later: rolled back, never half-published.
+    #[rstest]
+    #[case::during_sync(Step::Mirror)]
+    #[case::after_registration(Step::WorktreeAdd)]
+    #[case::after_clone(Step::Clone)]
+    #[case::after_index(Step::ResetIndex)]
+    fn interrupt_in_the_store_route_rolls_back(#[case] step: Step) {
+        let w = store_world();
+        w.interrupt_after.set(Some(step));
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Interrupted, "{err}");
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Symlink { .. } | Call::Rename { .. })),
+            0
+        );
+        assert_store_run_undone(&w, Some("feat"));
+    }
+
+    // U-STO-57: the source moved while the worktree was cloned from the baseline:
+    // the check runs against the live source, as in the normal route.
+    #[test]
+    fn source_changed_during_the_run_is_refused_without_a_trace() {
+        let w = World {
+            source_head_after_clone: Some(SHA_B.into()),
+            ..store_world()
+        };
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SourceChanged);
+        assert_eq!(w.count(|c| matches!(c, Call::Symlink { .. })), 0);
+        assert_store_run_undone(&w, Some("feat"));
+    }
+
+    // U-STO-58: a branch that existed before is never removed by the rollback.
+    #[test]
+    fn existing_branch_survives_a_failed_store_run() {
+        let w = store_world().failing(Step::Rename, ErrorCode::Io);
+        w.branches.borrow_mut().insert("topic".into());
+        let req = request(BranchMode::Existing("topic".into()));
+        run_store(&w, &req).unwrap_err();
+        assert_store_run_undone(&w, None);
+    }
+
+    // U-STO-59: the same repository twice reuses its baseline: the second run's sync
+    // finds nothing to copy.
+    #[test]
+    fn second_run_for_the_same_repository_copies_nothing() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        let first = w.count(|c| matches!(c, Call::Mirror { .. }));
+        assert!(first > 0);
+        let again = AddRequest {
+            destination: p("../feat2"),
+            branch: BranchMode::New("feat2".into()),
+            ..new_branch()
+        };
+        run_store(&w, &again).unwrap();
+        assert_eq!(
+            w.count(|c| matches!(c, Call::Mirror { .. })),
+            first,
+            "no entry copied the second time"
+        );
+        assert_eq!(
+            w.count(|c| *c == Call::Lock(p(&format!("{BASELINE_DIR}/lock")))),
+            2
+        );
     }
 }
