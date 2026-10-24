@@ -9,14 +9,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::domain::store::{EntryKind, EntryMeta};
+use crate::domain::store::{EntryKind, EntryMeta, REMOVING_MARK};
 use crate::domain::{BranchMode, Error, ErrorCode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
 use crate::ports::{
-    CowFs, FileLock, Git, Host, ImageUsage, MountBacking, Owner, RepoInfo, Scan, Space, ToolState,
-    UserInfo, VolumeInfo, WorktreeAddSpec,
+    CowFs, FileLock, Git, Host, ImageUsage, MountBacking, Owner, RepoInfo, Scan, SharedLock, Space,
+    ToolState, UserInfo, VolumeInfo, WorktreeAddSpec,
 };
 
 pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -86,6 +87,10 @@ pub enum Call {
     RemoveDirAll(PathBuf),
     WriteFile(PathBuf),
     Lock(PathBuf),
+    /// The store-wide lock taken in shared mode (the attempt, whatever came of it).
+    StoreLock(PathBuf),
+    /// ... and let go of (the guard dropped).
+    StoreUnlock(PathBuf),
     /// `mirror_entry`: one entry copied into the baseline.
     Mirror {
         src: PathBuf,
@@ -124,6 +129,8 @@ impl Call {
             | Call::RemoveDirAll(path)
             | Call::WriteFile(path)
             | Call::Append(path)
+            | Call::StoreLock(path)
+            | Call::StoreUnlock(path)
             | Call::Lock(path) => vec![path],
             Call::Symlink { link, .. } => vec![link],
             Call::CreateStaging { parent } => vec![parent],
@@ -157,13 +164,14 @@ pub enum Step {
     Mirror,
     Symlink,
     Append,
+    StoreLock,
 }
 
 /// Configurable fake world. Defaults describe a healthy repo at `/w/repo` on APFS,
 /// HEAD `SHA_A` on `main`, containing `src/` and `node_modules/`.
 #[derive(Debug)]
 pub struct World {
-    pub log: RefCell<Vec<Call>>,
+    pub log: Rc<RefCell<Vec<Call>>>,
     pub fail: RefCell<HashMap<Step, ErrorCode>>,
     /// Raise the interrupt flag right after the first successful call of this kind.
     pub interrupt_after: Cell<Option<Step>>,
@@ -240,6 +248,11 @@ pub struct World {
     pub link_tampered_at_rename: RefCell<Option<(PathBuf, Option<PathBuf>)>>,
     /// `space` fails (a path that cannot be measured).
     pub space_unavailable: Cell<bool>,
+    /// How many shared holds of the store-wide lock are alive right now.
+    pub store_locks_held: Rc<Cell<usize>>,
+    /// Mutations inside the store made while no hold of the store-wide lock was alive
+    /// (what the lock exists to prevent; tests of the order assert it is empty).
+    pub lock_violations: RefCell<Vec<Call>>,
 }
 
 pub fn apfs(device: u64) -> VolumeInfo {
@@ -272,7 +285,7 @@ impl Default for World {
             (p("/w/repo/node_modules"), vec![OsString::from("big")]),
         ]);
         Self {
-            log: RefCell::default(),
+            log: Rc::default(),
             fail: RefCell::default(),
             interrupt_after: Cell::new(None),
             interrupted: AtomicBool::new(false),
@@ -332,6 +345,8 @@ impl Default for World {
             rival_link: RefCell::default(),
             link_tampered_at_rename: RefCell::default(),
             space_unavailable: Cell::new(false),
+            store_locks_held: Rc::default(),
+            lock_violations: RefCell::default(),
         }
     }
 }
@@ -514,6 +529,14 @@ impl World {
     }
 
     fn record(&self, call: Call, step: Step) -> Result<()> {
+        let in_store = !matches!(call, Call::StoreLock(_) | Call::StoreUnlock(_))
+            && call
+                .touched_paths()
+                .iter()
+                .any(|path| path.starts_with(STORE));
+        if in_store && self.store_locks_held.get() == 0 {
+            self.lock_violations.borrow_mut().push(call.clone());
+        }
         self.log.borrow_mut().push(call);
         if let Some(code) = self.fail.borrow().get(&step) {
             let message = self.fail_message.borrow();
@@ -881,6 +904,36 @@ impl CowFs for World {
         Ok(self.locked.borrow().contains(path))
     }
 
+    fn lock_store_shared(&self, path: &Path) -> Result<SharedLock> {
+        self.record(Call::StoreLock(path.into()), Step::StoreLock)?;
+        // `locked`: a removal holds it exclusively. A sealed store says so in the file.
+        if self.locked.borrow().contains(path) {
+            return Ok(SharedLock::Removing);
+        }
+        let sealed = self
+            .files
+            .borrow()
+            .get(path)
+            .is_some_and(|text| text.starts_with(REMOVING_MARK.as_bytes()));
+        if sealed {
+            return Ok(SharedLock::Sealed);
+        }
+        if !self.files.borrow().contains_key(path) {
+            self.files.borrow_mut().insert(path.into(), Vec::new());
+            self.add_entry(path);
+        }
+        self.store_locks_held.set(self.store_locks_held.get() + 1);
+        let (log, held, path) = (
+            Rc::clone(&self.log),
+            Rc::clone(&self.store_locks_held),
+            path.to_path_buf(),
+        );
+        Ok(SharedLock::Held(FileLock::released_by(move || {
+            held.set(held.get() - 1);
+            log.borrow_mut().push(Call::StoreUnlock(path));
+        })))
+    }
+
     fn replace_contents(&self, path: &Path, contents: &[u8]) -> Result<()> {
         self.record(Call::Rewrite(path.into()), Step::Clone)?;
         self.files
@@ -1147,6 +1200,18 @@ pub enum HostCall {
     Umount(PathBuf),
     /// Something said to the person ahead of the result.
     Notice(String),
+    /// The store-wide lock taken exclusively (the attempt, whatever came of it).
+    LockStore {
+        path: PathBuf,
+        owner: Owner,
+    },
+    /// ... and let go of.
+    UnlockStore(PathBuf),
+    /// The lock file marked as sealed (`true`) or cleared.
+    SetStoreSealed {
+        path: PathBuf,
+        sealed: bool,
+    },
 }
 
 impl HostCall {
@@ -1177,6 +1242,13 @@ impl HostCall {
             Self::MountReadonly(image) => format!("mount-ro {}", image.display()),
             Self::Umount(path) => format!("umount {}", path.display()),
             Self::Notice(text) => format!("notice {text}"),
+            Self::LockStore { path, .. } => format!("lock-store {}", path.display()),
+            Self::UnlockStore(path) => format!("unlock-store {}", path.display()),
+            Self::SetStoreSealed { path, sealed: true } => format!("seal-store {}", path.display()),
+            Self::SetStoreSealed {
+                path,
+                sealed: false,
+            } => format!("unseal-store {}", path.display()),
         }
     }
 }
@@ -1192,7 +1264,7 @@ pub const UNIT_DIR: &str = "/etc/systemd/system";
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct FakeHost {
-    pub log: RefCell<Vec<HostCall>>,
+    pub log: Rc<RefCell<Vec<HostCall>>>,
     pub linux: bool,
     pub root: bool,
     pub env: HashMap<String, String>,
@@ -1230,6 +1302,13 @@ pub struct FakeHost {
     pub fail_create_image: Cell<bool>,
     /// Sizing an image fails.
     pub fail_size_image: Cell<bool>,
+    /// Another process holds the store-wide lock (an `add` or a `doctor --fix` is running).
+    pub store_busy: Cell<bool>,
+    /// Marking the lock file as sealed fails.
+    pub fail_seal: Cell<bool>,
+    /// A run starts using the store the moment the lock file is sealed (so that taking the
+    /// lock again, to undo it, finds it taken).
+    pub busy_once_sealed: Cell<bool>,
 }
 
 impl Default for FakeHost {
@@ -1250,7 +1329,7 @@ impl Default for FakeHost {
             "umount",
         ];
         Self {
-            log: RefCell::default(),
+            log: Rc::default(),
             linux: true,
             root: true,
             env: HashMap::from([("SUDO_USER".to_owned(), "alice".to_owned())]),
@@ -1282,6 +1361,9 @@ impl Default for FakeHost {
             unreadable: RefCell::default(),
             fail_create_image: Cell::new(false),
             fail_size_image: Cell::new(false),
+            store_busy: Cell::new(false),
+            fail_seal: Cell::new(false),
+            busy_once_sealed: Cell::new(false),
         }
     }
 }
@@ -1746,5 +1828,48 @@ impl Host for FakeHost {
 
     fn notice(&self, message: &str) {
         self.log(HostCall::Notice(message.to_owned()));
+    }
+
+    fn lock_store(&self, path: &Path, owner: Owner) -> Result<Option<FileLock>> {
+        self.log(HostCall::LockStore {
+            path: path.into(),
+            owner,
+        });
+        if self.store_busy.get() {
+            return Ok(None);
+        }
+        if !self.files.borrow().contains_key(path) {
+            self.guard(path, true)?;
+            self.files.borrow_mut().insert(path.into(), String::new());
+            self.remember(path, 0o600, owner);
+        }
+        let (log, path) = (Rc::clone(&self.log), path.to_path_buf());
+        Ok(Some(FileLock::released_by(move || {
+            log.borrow_mut().push(HostCall::UnlockStore(path));
+        })))
+    }
+
+    fn set_store_sealed(&self, path: &Path, sealed: bool) -> Result<()> {
+        self.log(HostCall::SetStoreSealed {
+            path: path.into(),
+            sealed,
+        });
+        if self.fail_seal.get() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                "fake: cannot write the lock file",
+            ));
+        }
+        if !self.files.borrow().contains_key(path) {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!("{}: no such file", path.display()),
+            ));
+        }
+        self.files.borrow_mut().insert(
+            path.into(),
+            if sealed { REMOVING_MARK } else { "" }.to_owned(),
+        );
+        Ok(())
     }
 }

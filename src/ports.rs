@@ -179,6 +179,12 @@ pub trait CowFs {
     fn lock_exclusive(&self, path: &Path) -> Result<FileLock>;
     /// Whether another live process holds the lock on `path`.
     fn is_locked(&self, path: &Path) -> Result<bool>;
+    /// Take the store-wide lock `path` (`<store>/.parhel-store.lock`) in shared mode,
+    /// without waiting, creating the file (the user's, mode 0600) when it is missing. The
+    /// path is opened without following a link and must be a regular file. See
+    /// [`SharedLock`] for the answers. Released when the guard drops, or by the kernel if
+    /// the process dies.
+    fn lock_store_shared(&self, path: &Path) -> Result<SharedLock>;
 
     // --- the store (Linux): sync of the baseline, the symlink at the destination.
 
@@ -213,6 +219,17 @@ pub trait CowFs {
     fn is_writable(&self, path: &Path) -> Result<bool>;
     /// Free and total space of the filesystem holding `path` (`statvfs`).
     fn space(&self, path: &Path) -> Result<Space>;
+}
+
+/// What asking for the store-wide lock in shared mode came to.
+#[derive(Debug)]
+pub enum SharedLock {
+    /// Taken: the store may be used until the guard drops.
+    Held(FileLock),
+    /// A removal of the store holds the lock exclusively right now.
+    Removing,
+    /// A removal sealed the store (it is going away) and let go of the lock to unmount it.
+    Sealed,
 }
 
 /// Space of a filesystem, in bytes (what an unprivileged user can use).
@@ -334,25 +351,67 @@ pub trait Host {
     /// Unmount `mount_point`; a directory made by [`mount_readonly`](Self::mount_readonly)
     /// is removed with it.
     fn umount(&self, mount_point: &Path) -> Result<()>;
+    /// Take the store-wide lock `path` exclusively, without waiting: `None` when somebody
+    /// holds it (a run is in progress). The file is created when missing and given to
+    /// `owner`; the path is opened without following a link, without blocking, and must be a
+    /// regular file (it is in a directory the user owns, and this is root).
+    fn lock_store(&self, path: &Path, owner: Owner) -> Result<Option<FileLock>>;
+    /// Mark the lock file `path` as sealed (`sealed`) or clear the mark: what
+    /// [`CowFs::lock_store_shared`] reports as [`SharedLock::Sealed`]. The caller holds the
+    /// lock. Opened as `lock_store` does, but never created.
+    fn set_store_sealed(&self, path: &Path, sealed: bool) -> Result<()>;
     /// Tell the person running the command something now (stderr), ahead of the result.
     fn notice(&self, message: &str);
 }
 
-/// Guard of [`CowFs::lock_exclusive`].
+/// Guard of [`CowFs::lock_exclusive`] and the store-wide lock.
 #[derive(Debug)]
 pub struct FileLock {
     _file: Option<std::fs::File>,
+    _release: Option<Release>,
+}
+
+/// What runs when a guard drops (fakes use it to log the release).
+struct Release(Option<Box<dyn FnOnce()>>);
+
+impl std::fmt::Debug for Release {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Release")
+    }
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
 }
 
 impl FileLock {
     #[must_use]
     pub fn new(file: std::fs::File) -> Self {
-        Self { _file: Some(file) }
+        Self {
+            _file: Some(file),
+            _release: None,
+        }
     }
 
     /// A guard that holds nothing (fakes, platforms without locking).
     #[must_use]
     pub fn detached() -> Self {
-        Self { _file: None }
+        Self {
+            _file: None,
+            _release: None,
+        }
+    }
+
+    /// A guard that holds nothing but runs `release` when it drops.
+    #[must_use]
+    pub fn released_by(release: impl FnOnce() + 'static) -> Self {
+        Self {
+            _file: None,
+            _release: Some(Release(Some(Box::new(release)))),
+        }
     }
 }

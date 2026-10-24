@@ -860,6 +860,7 @@ mod tests {
     use super::*;
     use crate::app::fakes::{Call, SHA_A, World, btrfs, p};
     use crate::app::rollback::{JOURNAL_FILE, Journal};
+    use crate::domain::store::REMOVING_MARK;
     use crate::git::parse::WorktreeEntry;
     use crate::ports::{CowFs, Space, VolumeInfo};
     use rstest::rstest;
@@ -1841,6 +1842,113 @@ mod tests {
                 "/store/worktrees/.parhel-staging-dead"
             )))
         );
+    }
+
+    fn store_lock() -> PathBuf {
+        p("/store/.parhel-store.lock")
+    }
+
+    // U-STO-110: what `--fix` changes in the store it changes under the store's lock (shared:
+    // `setup --remove` takes it exclusively), taken before the first change and let go of
+    // after the last, so a removal cannot delete the image under a repair. A report only
+    // looks, and takes nothing.
+    #[test]
+    fn fix_holds_the_store_lock_while_it_changes_the_store() {
+        let w = store_world();
+        w.files
+            .borrow_mut()
+            .insert(baseline_dir().join("meta"), b"source=/gone/repo\n".to_vec());
+        run_store(&w, false);
+        assert!(
+            w.calls().is_empty(),
+            "a report only looks: {:#?}",
+            w.calls()
+        );
+
+        let report = run_store(&w, true);
+        assert_eq!(report.fixed.len(), 1, "{report:#?}");
+        let calls = w.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&Call::StoreLock(store_lock())),
+            "{calls:#?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&Call::StoreUnlock(store_lock())),
+            "{calls:#?}"
+        );
+        assert!(
+            calls.contains(&Call::RemoveDirAll(baseline_dir())),
+            "{calls:#?}"
+        );
+        assert_eq!(w.store_locks_held.get(), 0, "let go of");
+        assert!(
+            w.lock_violations.borrow().is_empty(),
+            "{:#?}",
+            w.lock_violations.borrow()
+        );
+    }
+
+    // U-STO-110b: ... the undoing of a store run that crashed is the other thing it does in
+    // the store, and is under the lock as well, rollback to the last step.
+    #[test]
+    fn fix_undoes_a_crashed_store_run_under_the_lock() {
+        let w = crashed_store_run(false, Some(("/w/feat", real().to_str().unwrap())));
+        run_store(&w, true);
+        let calls = w.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&Call::StoreLock(store_lock())),
+            "{calls:#?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&Call::StoreUnlock(store_lock())),
+            "{calls:#?}"
+        );
+        assert_eq!(
+            w.count(|c| *c == Call::RemoveDirAll(p("/store/worktrees/.parhel-staging-dead"))),
+            1,
+            "{calls:#?}"
+        );
+        assert!(
+            w.lock_violations.borrow().is_empty(),
+            "{:#?}",
+            w.lock_violations.borrow()
+        );
+    }
+
+    // U-STO-110c: a store that is being removed (the lock is taken) or that a removal sealed
+    // is left alone: it is reported as unavailable, saying why - not as a store whose
+    // worktrees cannot be reached, which it is not - and nothing in it is changed.
+    #[rstest]
+    #[case::removing(true)]
+    #[case::sealed(false)]
+    fn fix_leaves_a_store_that_is_being_removed_alone(#[case] holding: bool) {
+        let w = crashed_store_run(false, Some(("/w/feat", real().to_str().unwrap())));
+        w.files
+            .borrow_mut()
+            .insert(baseline_dir().join("meta"), b"source=/gone/repo\n".to_vec());
+        if holding {
+            w.locked.borrow_mut().insert(store_lock());
+        } else {
+            w.files
+                .borrow_mut()
+                .insert(store_lock(), REMOVING_MARK.as_bytes().to_vec());
+        }
+        let report = run_store(&w, true);
+        let found = store_findings(&report);
+        assert_eq!(found.len(), 1, "{report:#?}");
+        match found[0] {
+            Finding::StoreUnavailable { path, reason } => {
+                assert_eq!(path, &p("/store"));
+                assert!(reason.contains("being removed"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(report.fixed.is_empty(), "{report:#?}");
+        assert_eq!(w.calls(), vec![Call::StoreLock(store_lock())]);
     }
 
     // U-STO-82: a journal is data in a folder anyone could write: it cannot make

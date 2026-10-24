@@ -11,6 +11,7 @@
 mod common;
 
 use std::fs::{self, File, FileTimes};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -320,6 +321,7 @@ fn is07_existing_worktrees_are_unaffected_by_a_later_sync() {
 #[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
 fn is08_failure_at_every_step_leaves_no_trace(
     #[values(
+        "store_locked",
         "after_validate",
         "after_worktree_add",
         "mid_clone",
@@ -343,7 +345,7 @@ fn is08_failure_at_every_step_leaves_no_trace(
     assert_error(&out, "failpoint");
     w.assert_no_trace(&dest);
     assert_eq!(w.src.branch_tip("f"), None, "the branch was removed");
-    if failpoint == "after_validate" {
+    if matches!(failpoint, "after_validate" | "store_locked") {
         assert!(
             w.store.baselines().is_empty(),
             "nothing is synced before validation ends"
@@ -1799,4 +1801,111 @@ fn is43_doctor_low_space_is_told_not_found_by_luck() {
         said.contains("/var/lib/parhel has 1000 of 1000000"),
         "{said}"
     );
+}
+
+/// The store's lock file, the way `setup --remove` takes it: `flock(LOCK_EX | LOCK_NB)`. The
+/// file when the lock is taken (it is held until the file is dropped), `None` when somebody
+/// holds it - a run that works in the store holds it shared.
+fn removal_lock(store: &TestStore) -> Option<File> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(store.root.join(".parhel-store.lock"))
+        .unwrap();
+    // SAFETY: the descriptor is open for the duration of the call.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    taken.then_some(file)
+}
+
+// I-S44: a removal of the store holds its lock exclusively: an `add` that finds it taken
+// does not start - `store-unavailable`, saying the store is being removed, nothing written,
+// not even a baseline - and works as soon as the lock is free.
+#[test]
+fn is44_add_is_refused_while_the_store_is_being_removed() {
+    let Some(w) = world() else { return };
+    let removal = removal_lock(&w.store).expect("nobody holds it yet");
+    let dest = w.sb.path("wt");
+    let out = w.add(&dest, "f", &[]);
+    assert_error(&out, "store-unavailable");
+    assert!(stderr(&out).contains("being removed"), "{}", stderr(&out));
+    w.assert_no_trace(&dest);
+    assert!(w.store.baselines().is_empty(), "nothing was written");
+    assert_eq!(w.src.branch_tip("f"), None);
+
+    drop(removal);
+    w.add_ok(&dest, "f");
+}
+
+// I-S45: ... and after it let go of the lock to unmount the store, the mark it left in the
+// file says the store is going away: refused the same way, until the mark is taken out
+// (`sudo git parhel setup` does that for a removal that died).
+#[test]
+fn is45_add_is_refused_by_a_store_a_removal_sealed() {
+    let Some(w) = world() else { return };
+    let lock = w.store.root.join(".parhel-store.lock");
+    fs::write(&lock, "removing\n").unwrap();
+    let dest = w.sb.path("wt");
+    let out = w.add(&dest, "f", &[]);
+    assert_error(&out, "store-unavailable");
+    assert!(stderr(&out).contains("being removed"), "{}", stderr(&out));
+    w.assert_no_trace(&dest);
+    assert!(w.store.baselines().is_empty(), "nothing was written");
+    assert_eq!(fs::read_to_string(&lock).unwrap(), "removing\n", "kept");
+
+    fs::write(&lock, "").unwrap();
+    w.add_ok(&dest, "f");
+}
+
+// I-S46: a run holds the store's lock from the moment it decides to use the store until its
+// worktree is published: frozen right after taking it, after the baseline sync, before the
+// publishing rename and after it, a removal cannot take the lock; when the run is over it can.
+#[rstest]
+#[case::right_after_taking_it("store_locked")]
+#[case::after_the_sync("after_sync")]
+#[case::before_the_rename("before_rename")]
+#[case::after_the_rename("after_rename")]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn is46_a_run_holds_the_store_lock_until_it_has_published(#[case] failpoint: &str) {
+    let Some(w) = world() else { return };
+    let barrier = Barrier::new(&w.sb.root, "lock");
+    let dest = w.sb.path("wt");
+    let mut run = spawn_parhel_store(
+        &w.sb.env,
+        &w.src.root,
+        &add_args(&dest, &["--new-branch", "f"]),
+        &w.store,
+        Some(&barrier.spec(failpoint)),
+    );
+    barrier.wait_reached(&mut run);
+    assert!(
+        removal_lock(&w.store).is_none(),
+        "a removal took the lock while a run was at {failpoint}"
+    );
+    barrier.release();
+    assert_success(&finish_within(run, 120));
+    w.open(&dest).assert_clean();
+    // The kernel let go with the process.
+    let free = (0..100).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        removal_lock(&w.store).is_some()
+    });
+    assert!(free, "the lock outlived the run");
+}
+
+// I-S47: the lock file is made by the first run that finds none (a store set up before the
+// lock existed): the user's, private, empty; and left in place, empty, after the run.
+#[test]
+fn is47_the_first_run_makes_the_lock_file() {
+    let Some(w) = world() else { return };
+    let lock = w.store.root.join(".parhel-store.lock");
+    assert!(!lock.exists());
+    w.add_ok(&w.sb.path("wt"), "f");
+    let md = fs::metadata(&lock).unwrap();
+    assert!(md.is_file());
+    assert_eq!(md.permissions().mode() & 0o777, 0o600);
+    assert_eq!(md.len(), 0, "nothing is written into it by a run");
+    // SAFETY: `getuid` has no preconditions.
+    assert_eq!(md.uid(), unsafe { libc::getuid() });
 }

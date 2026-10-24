@@ -1044,6 +1044,7 @@ mod tests {
     use super::*;
     use crate::app::fakes::{FakeHost, HostCall, UNIT_DIR, p};
     use crate::domain::request::DEFAULT_STORE_SIZE;
+    use crate::domain::store::REMOVING_MARK;
     use crate::ports::ImageUsage;
     use rstest::rstest;
     use std::path::Path;
@@ -2510,6 +2511,337 @@ mod tests {
         );
         assert!(h.exists(Path::new(IMG)));
         assert!(!h.is_mount_point(Path::new(ROOT)), "left as it was found");
+    }
+
+    // ------------------------------------------------- the store-wide lock
+
+    const LOCK: &str = "/parhel/alice/.parhel-store.lock";
+
+    fn lock_line() -> String {
+        format!("lock-store {LOCK}")
+    }
+
+    fn unlock_line() -> String {
+        format!("unlock-store {LOCK}")
+    }
+
+    /// The only thing done is taking the lock and letting go of it.
+    fn assert_only_locked(h: &FakeHost) {
+        assert_eq!(h.lines(), vec![lock_line(), unlock_line()]);
+    }
+
+    fn sealed(h: &FakeHost) -> bool {
+        h.text(LOCK).is_some_and(|text| text == REMOVING_MARK)
+    }
+
+    // U-SET-41: a run in the store - an `add`, a `doctor --fix` - holds the store's lock
+    // shared, so `--remove` takes it exclusively, and without waiting, BEFORE it looks at
+    // what is inside: it is asked for first in a store that is mounted, and right after
+    // the unit was started to look in one that is not. (Looking fails here, and the lock is
+    // already behind it.)
+    #[rstest]
+    #[case::mounted(false, vec![lock_line(), unlock_line()])]
+    #[case::started_to_look(true, vec![
+        "run systemctl start parhel-alice.mount".to_owned(),
+        lock_line(),
+        unlock_line(),
+        "run systemctl stop parhel-alice.mount".to_owned(),
+    ])]
+    fn remove_takes_the_store_lock_before_it_looks_inside(
+        #[case] stopped: bool,
+        #[case] want: Vec<String>,
+    ) {
+        let h = FakeHost::default();
+        installed(&h);
+        if stopped {
+            h.mounted.borrow_mut().clear();
+        }
+        h.unreadable
+            .borrow_mut()
+            .insert(p("/parhel/alice/worktrees"));
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "looking failed: {err}");
+        assert_eq!(h.lines(), want);
+        assert!(h.exists(Path::new(IMG)));
+    }
+
+    // U-SET-42: somebody holds the lock - a run is in progress - and the removal does not
+    // wait and does not guess: `store-in-use`, saying a run is in progress, nothing looked
+    // at (worktrees are there, and not named), nothing deleted. The flag that covers files
+    // that are not the store's does not cover this. A unit started to look is stopped again,
+    // after the lock attempt.
+    #[rstest]
+    #[case::mounted(false, false, vec![lock_line()])]
+    #[case::discarding(false, true, vec![lock_line()])]
+    #[case::started_to_look(true, false, vec![
+        "run systemctl start parhel-alice.mount".to_owned(),
+        lock_line(),
+        "run systemctl stop parhel-alice.mount".to_owned(),
+    ])]
+    fn remove_refuses_while_a_run_holds_the_store_lock(
+        #[case] stopped: bool,
+        #[case] discard: bool,
+        #[case] want: Vec<String>,
+    ) {
+        let h = FakeHost::default();
+        installed(&h);
+        if stopped {
+            h.mounted.borrow_mut().clear();
+        }
+        worktree_inside(&h);
+        h.store_busy.set(true);
+        let request = SetupRequest {
+            discard_contents: discard,
+            ..removal()
+        };
+        let err = setup(&h, &request).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreInUse, "{err}");
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        assert!(err.message.contains("add"), "{}", err.message);
+        assert!(!err.message.contains("worktrees/abc"), "{}", err.message);
+        assert!(
+            err.message.contains("nothing was deleted"),
+            "{}",
+            err.message
+        );
+        assert_eq!(h.lines(), want);
+        assert!(h.exists(Path::new(IMG)) && h.exists(Path::new(UNIT_FILE)));
+    }
+
+    // U-SET-43: what the removal does with the lock. It is held through the look; then the
+    // store is sealed - the lock file says it is going away, which an `add` that takes the
+    // lock afterwards reads and does not start - and the lock is let go of BEFORE the unit
+    // is stopped, because an open file keeps a mount busy and `umount` would refuse.
+    #[test]
+    fn remove_seals_the_store_and_lets_go_of_the_lock_before_it_unmounts() {
+        let h = FakeHost::default();
+        installed(&h);
+        setup(&h, &removal()).unwrap();
+        assert_eq!(
+            h.lines(),
+            vec![
+                lock_line(),
+                format!("seal-store {LOCK}"),
+                unlock_line(),
+                "run systemctl disable --now parhel-alice.mount".to_owned(),
+                format!("rm {UNIT_FILE}"),
+                "run systemctl daemon-reload".to_owned(),
+                "run chattr -i /var/lib/parhel".to_owned(),
+                format!("rm {IMG}"),
+                format!("rmdir {ROOT}"),
+            ]
+        );
+        // The same for a mount no unit owns.
+        let h = FakeHost::default();
+        installed(&h);
+        h.files.borrow_mut().remove(&p(UNIT_FILE));
+        setup(&h, &removal()).unwrap();
+        assert_eq!(
+            h.lines()[..4],
+            [
+                lock_line(),
+                format!("seal-store {LOCK}"),
+                unlock_line(),
+                "umount /parhel/alice".to_owned(),
+            ]
+        );
+    }
+
+    // U-SET-44: a removal that refuses leaves the store as it found it: the lock taken and
+    // let go of, nothing sealed - the store keeps working.
+    #[rstest]
+    #[case::worktrees(|h: &FakeHost| worktree_inside(h))]
+    #[case::other_files(|h: &FakeHost| { h.files.borrow_mut().insert(p("/parhel/alice/thesis.tex"), "x".into()); })]
+    fn a_refusal_does_not_seal_the_store(#[case] arrange: fn(&FakeHost)) {
+        let h = FakeHost::default();
+        installed(&h);
+        arrange(&h);
+        setup(&h, &removal()).unwrap_err();
+        assert_only_locked(&h);
+        assert!(!sealed(&h));
+    }
+
+    // U-SET-45: a removal that fails after it sealed the store opens it again: the lock is
+    // taken once more to take the mark out, and the error shown is the real one. When the
+    // lock cannot be had (a run got in meanwhile) the store stays closed to `add`, and the
+    // error says how to bring it back.
+    #[test]
+    fn a_removal_that_fails_after_sealing_reopens_the_store() {
+        let h = FakeHost::default().failing("systemctl", ErrorCode::Io);
+        installed(&h);
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
+        assert!(err.message.contains("systemctl"), "{}", err.message);
+        assert_eq!(
+            h.lines(),
+            vec![
+                lock_line(),
+                format!("seal-store {LOCK}"),
+                unlock_line(),
+                "run systemctl disable --now parhel-alice.mount".to_owned(),
+                lock_line(),
+                format!("unseal-store {LOCK}"),
+                unlock_line(),
+            ]
+        );
+        assert!(!sealed(&h));
+        assert!(h.exists(Path::new(IMG)));
+
+        let h = FakeHost::default().failing("systemctl", ErrorCode::Io);
+        installed(&h);
+        h.busy_once_sealed.set(true);
+        let err = setup(&h, &removal()).unwrap_err();
+        assert!(sealed(&h));
+        assert!(
+            err.message.contains("sudo git parhel setup"),
+            "{}",
+            err.message
+        );
+    }
+
+    // U-SET-45b: ... but not when the store is gone by then (the unit was stopped and a later
+    // step failed): there is no store to open, and nothing is created where it was mounted.
+    #[test]
+    fn a_removal_that_fails_after_the_unmount_does_not_touch_the_lock_file() {
+        let h = FakeHost::default().failing("chattr", ErrorCode::Io);
+        installed(&h);
+        setup(&h, &removal()).unwrap_err();
+        let lines = h.lines();
+        assert_eq!(
+            lines.iter().filter(|l| **l == lock_line()).count(),
+            1,
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("unseal-store")),
+            "{lines:#?}"
+        );
+    }
+
+    // U-SET-45c: a lock file that cannot be written leaves the store as it was: nothing is
+    // stopped or deleted.
+    #[test]
+    fn a_store_that_cannot_be_sealed_is_not_removed() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.fail_seal.set(true);
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
+        assert!(
+            !h.lines()
+                .iter()
+                .any(|l| l.contains("disable") || l.starts_with("rm") || l.starts_with("umount")),
+            "{:?}",
+            h.lines()
+        );
+        assert!(h.exists(Path::new(IMG)));
+    }
+
+    // U-SET-46: an image whose unit is gone is not mounted at the store's place: it is
+    // mounted read-only on a private directory of root's, which no user can enter, and `add`
+    // finds a store by its marker at `/parhel/<user>`, never there. No run can be using it, so
+    // there is nothing to lock - and no lock file is made on a mount point that is not mounted.
+    #[test]
+    fn looking_into_an_unmounted_image_takes_no_lock() {
+        for with_worktree in [false, true] {
+            let h = FakeHost::default();
+            image_without_unit(&h);
+            if with_worktree {
+                worktree_inside(&h);
+            }
+            let _ = setup(&h, &removal());
+            assert!(
+                !h.lines().iter().any(|l| l.contains("lock-store")),
+                "{:?}",
+                h.lines()
+            );
+            assert!(h.text(LOCK).is_none());
+        }
+    }
+
+    // U-SET-47: the lock file is the store's own: not a foreign file that blocks the removal.
+    #[test]
+    fn the_lock_file_is_not_a_foreign_file() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.files.borrow_mut().insert(p(LOCK), String::new());
+        assert!(matches!(
+            setup(&h, &removal()).unwrap(),
+            SetupOutcome::Removed(_)
+        ));
+    }
+
+    // U-SET-48: `setup` makes the lock file, the user's and private, in a store that has
+    // none (a new one, or one set up before the lock existed) - without touching a lock file
+    // that is there: replacing it would put a run that holds the old one outside the lock.
+    #[test]
+    fn setup_makes_the_lock_file_and_never_replaces_one() {
+        let h = FakeHost::default();
+        setup(&h, &request()).unwrap();
+        let made = h
+            .calls()
+            .into_iter()
+            .find(|c| matches!(c, HostCall::LockStore { .. }))
+            .expect("the lock file is made");
+        assert_eq!(
+            made,
+            HostCall::LockStore {
+                path: p(LOCK),
+                owner: Some((1000, 1000))
+            }
+        );
+        assert_eq!(h.text(LOCK).as_deref(), Some(""));
+        assert!(
+            !h.lines().contains(&format!("write {LOCK}")),
+            "{:?}",
+            h.lines()
+        );
+
+        // Older store: made, and said.
+        let h = FakeHost::default();
+        installed(&h);
+        assert!(matches!(
+            setup(&h, &request()).unwrap(),
+            SetupOutcome::Restored(_)
+        ));
+        assert_eq!(h.lines(), vec![lock_line(), unlock_line()]);
+
+        // A store that has it: nothing is done.
+        let h = FakeHost::default();
+        installed(&h);
+        h.files.borrow_mut().insert(p(LOCK), String::new());
+        assert!(matches!(
+            setup(&h, &request()).unwrap(),
+            SetupOutcome::AlreadySetUp(_)
+        ));
+        assert_no_mutation(&h);
+    }
+
+    // U-SET-49: a store whose removal died after sealing it (killed, power lost) is closed to
+    // `add` for good, until `setup` runs: it takes the mark out and says the store was
+    // restored. If a run holds the lock at that moment, it says so and leaves the mark.
+    #[test]
+    fn setup_reopens_a_store_whose_removal_died_after_sealing() {
+        let h = FakeHost::default();
+        installed(&h);
+        h.files.borrow_mut().insert(p(LOCK), REMOVING_MARK.into());
+        assert!(matches!(
+            setup(&h, &request()).unwrap(),
+            SetupOutcome::Restored(_)
+        ));
+        assert_eq!(
+            h.lines(),
+            vec![lock_line(), format!("unseal-store {LOCK}"), unlock_line()]
+        );
+        assert!(!sealed(&h));
+
+        let h = FakeHost::default();
+        installed(&h);
+        h.files.borrow_mut().insert(p(LOCK), REMOVING_MARK.into());
+        h.store_busy.set(true);
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreInUse, "{err}");
+        assert!(sealed(&h));
     }
 
     // U-SET-37: the removal deletes parhel's unit, image and mount point and nothing else
