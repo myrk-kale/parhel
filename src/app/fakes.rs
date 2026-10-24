@@ -15,8 +15,8 @@ use crate::domain::store::{EntryKind, EntryMeta};
 use crate::domain::{BranchMode, Error, ErrorCode, Result};
 use crate::git::parse::{GitVersion, WorktreeEntry};
 use crate::ports::{
-    CowFs, FileLock, Git, Host, ImageUsage, MountBacking, Owner, RepoInfo, Scan, Space, UserInfo,
-    VolumeInfo, WorktreeAddSpec,
+    CowFs, FileLock, Git, Host, ImageUsage, MountBacking, Owner, RepoInfo, Scan, Space, ToolState,
+    UserInfo, VolumeInfo, WorktreeAddSpec,
 };
 
 pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1198,6 +1198,8 @@ pub struct FakeHost {
     pub env: HashMap<String, String>,
     pub users: Vec<UserInfo>,
     pub tools: RefCell<HashSet<String>>,
+    /// Programs that are installed where root does not trust them, by why.
+    pub untrusted_tools: RefCell<HashMap<String, String>>,
     pub systemd: bool,
     /// Text files by path, including `/proc/filesystems` and the units.
     pub files: RefCell<HashMap<PathBuf, String>>,
@@ -1254,6 +1256,7 @@ impl Default for FakeHost {
             env: HashMap::from([("SUDO_USER".to_owned(), "alice".to_owned())]),
             users: vec![user("root", 0), user("alice", 1000), user("bob", 1001)],
             tools: RefCell::new(tools.iter().map(|t| (*t).to_owned()).collect()),
+            untrusted_tools: RefCell::default(),
             systemd: true,
             files: RefCell::new(HashMap::from([(
                 p("/proc/filesystems"),
@@ -1298,6 +1301,15 @@ impl FakeHost {
 
     pub fn without_tool(self, tool: &str) -> Self {
         self.tools.borrow_mut().remove(tool);
+        self
+    }
+
+    /// `tool` is there, but where root does not trust it, for `why`.
+    pub fn with_untrusted_tool(self, tool: &str, why: &str) -> Self {
+        self.tools.borrow_mut().remove(tool);
+        self.untrusted_tools
+            .borrow_mut()
+            .insert(tool.to_owned(), why.to_owned());
         self
     }
 
@@ -1400,8 +1412,14 @@ impl Host for FakeHost {
         Ok(self.users.iter().find(|u| u.name == name).cloned())
     }
 
-    fn tool_exists(&self, tool: &str) -> bool {
-        self.tools.borrow().contains(tool)
+    fn tool_state(&self, tool: &str) -> ToolState {
+        if self.tools.borrow().contains(tool) {
+            ToolState::Usable
+        } else if let Some(why) = self.untrusted_tools.borrow().get(tool) {
+            ToolState::Untrusted(why.clone())
+        } else {
+            ToolState::Missing
+        }
     }
 
     fn systemd_running(&self) -> bool {

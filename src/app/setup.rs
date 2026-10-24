@@ -1174,6 +1174,58 @@ mod tests {
         assert_no_mutation(&h);
     }
 
+    // U-SET-03c: a program that is there but where root does not trust it (it belongs to a
+    // user, or anybody could replace it) is not run; the error says that, and which file
+    // failed which check, instead of "not installed" - and nothing is created. Every
+    // program the run starts is checked up front, systemd's included.
+    #[rstest]
+    #[case::mkfs("mkfs.btrfs", "btrfs-progs")]
+    #[case::blkid("blkid", "util-linux")]
+    #[case::mount("mount", "util-linux")]
+    #[case::systemd_escape("systemd-escape", "systemd")]
+    #[case::systemctl("systemctl", "systemd")]
+    fn untrusted_tools_are_refused_with_the_reason_before_anything_is_created(
+        #[case] tool: &str,
+        #[case] package: &str,
+    ) {
+        let why = format!("`/usr/sbin/{tool}` is owned by uid 1000, not by root");
+        let h = FakeHost::default().with_untrusted_tool(tool, &why);
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MissingTool, "{err}");
+        assert!(err.message.contains(&why), "{}", err.message);
+        assert!(err.message.contains(package), "{}", err.message);
+        assert!(!err.message.contains("is not installed"), "{}", err.message);
+        assert_no_mutation(&h);
+    }
+
+    // U-SET-03d: removal checks the programs it will run the same way: `mount`, `umount` and
+    // `blkid` when it has to look into an image whose unit is gone, `systemd-escape` always.
+    #[rstest]
+    #[case::systemd_escape("systemd-escape", false)]
+    #[case::umount("umount", true)]
+    #[case::blkid("blkid", true)]
+    #[case::mount("mount", true)]
+    fn removal_refuses_untrusted_tools_too(#[case] tool: &str, #[case] unit_gone: bool) {
+        let why = format!("`/usr/bin/{tool}` can be written by everyone (mode 0777)");
+        let h = FakeHost::default().with_untrusted_tool(tool, &why);
+        installed(&h);
+        if unit_gone {
+            h.files.borrow_mut().remove(&p(UNIT_FILE));
+            h.mounted.borrow_mut().clear();
+        }
+        let err = setup(&h, &removal()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MissingTool, "{err}");
+        assert!(err.message.contains(&why), "{}", err.message);
+        assert!(h.exists(Path::new(IMG)), "the image is intact");
+        assert!(
+            !h.lines()
+                .iter()
+                .any(|l| l.starts_with("rm") || l.contains("chattr")),
+            "{:?}",
+            h.lines()
+        );
+    }
+
     // U-SET-09b: the user name ends up in paths, a unit file and a mount unit name; one
     // that systemd would expand (`%`) or that is not an account name is refused, whether
     // it was typed (`--user`) or inferred from `$SUDO_USER`.
@@ -1518,6 +1570,22 @@ mod tests {
                 .any(|l| l.contains("disable") || l.starts_with("rm")),
             "nothing torn down: {lines:?}"
         );
+    }
+
+    // U-SET-19b: ... and a `chattr` that is there but not trusted as root is the same: the
+    // store works, the image is not protected, and the error says why `chattr` was not run.
+    #[test]
+    fn an_untrusted_chattr_fails_loudly_but_leaves_a_working_store() {
+        let why = "`/usr/bin/chattr` is owned by uid 1000, not by root";
+        let h = FakeHost::default().with_untrusted_tool("chattr", why);
+        let err = setup(&h, &request()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MissingTool, "{err}");
+        assert!(err.message.contains(why), "{}", err.message);
+        assert!(err.message.contains(IMG), "{}", err.message);
+        assert!(err.message.contains("NOT protected"), "{}", err.message);
+        assert!(!err.message.contains("is not installed"), "{}", err.message);
+        assert!(!h.lines().iter().any(|l| l.contains("chattr")), "never run");
+        assert!(h.text("/parhel/alice/.parhel-store").is_some(), "usable");
     }
 
     // U-SET-20: a filesystem that refuses the attribute, or does not honor it, leaves

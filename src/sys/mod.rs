@@ -15,9 +15,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod trust;
+
 use crate::domain::{Error, ErrorCode, Result, mounts};
 use crate::fs::unix::io_error;
-use crate::ports::{Host, ImageUsage, MountBacking, Owner, UserInfo};
+use crate::ports::{Host, ImageUsage, MountBacking, Owner, ToolState, UserInfo};
+use trust::{Disk, Lookup, Policy, RealDisk, TRUSTED_DIRS, TRUSTED_PATH};
 
 /// The real [`Host`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,17 +37,98 @@ const NO_FOLLOW: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC;
 /// is a few hundred bytes, and a user can make the files it reads as large as they like.
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 
-/// Programs are looked up in the absolute directories of `PATH` only: an empty or
-/// relative entry would make root run whatever the current directory holds.
-fn resolve(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        return is_executable(Path::new(program)).then(|| PathBuf::from(program));
+/// Where the programs `setup` runs come from.
+///
+/// As root, `PATH` is not consulted: `sudo` can be set up to keep the caller's, and a
+/// directory in it that the user can write to would make root run the user's `mkfs.btrfs`.
+/// Root looks in [`TRUSTED_DIRS`] only, and runs what it finds only if the program, every
+/// link on the way to it and every directory above it belong to root and cannot be written
+/// to by anyone else (see [`trust`]).
+///
+/// Anyone else gets the absolute directories of `PATH` only: an empty or relative entry
+/// would make the program run whatever the current directory holds.
+fn lookup(program: &str) -> Lookup {
+    // SAFETY: `geteuid` has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    let policy = Policy {
+        owner: 0,
+        anchor: Path::new("/"),
+    };
+    lookup_in(
+        &RealDisk,
+        root,
+        &policy,
+        std::env::var_os("PATH").as_deref(),
+        program,
+    )
+}
+
+fn lookup_in(
+    disk: &dyn Disk,
+    root: bool,
+    policy: &Policy<'_>,
+    path_env: Option<&std::ffi::OsStr>,
+    program: &str,
+) -> Lookup {
+    // STAGE 1 (red): what the lookup did before the fix: PATH decides, for root too.
+    let _ = (policy, TRUSTED_PATH);
+    let root = false && root;
+    if root {
+        if program.contains('/') {
+            return trust::find_path(disk, policy, Path::new(program));
+        }
+        let dirs: Vec<PathBuf> = TRUSTED_DIRS.iter().map(PathBuf::from).collect();
+        return trust::find(disk, policy, &dirs, program);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
+    let found = if program.contains('/') {
+        is_executable(Path::new(program)).then(|| PathBuf::from(program))
+    } else {
+        path_env.and_then(|path| {
+            std::env::split_paths(path)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join(program))
+                .find(|candidate| is_executable(candidate))
+        })
+    };
+    found.map_or(Lookup::Missing, Lookup::Found)
+}
+
+/// The program to run, or the error that says why it will not be (`missing-tool`).
+fn resolve(program: &str) -> Result<PathBuf> {
+    match lookup(program) {
+        Lookup::Found(exe) => Ok(exe),
+        Lookup::Missing => Err(Error::new(
+            ErrorCode::MissingTool,
+            format!(
+                "`{program}` is not installed (as root, programs are looked up in {} only; \
+                 PATH is ignored)",
+                TRUSTED_DIRS.join(", ")
+            ),
+        )),
+        Lookup::Refused(why) => Err(untrusted(program, &why)),
+    }
+}
+
+fn untrusted(program: &str, why: &str) -> Error {
+    Error::new(
+        ErrorCode::MissingTool,
+        format!(
+            "`{program}` was not run as root: {why}. As root, programs are taken from {} \
+             only, and each must be owned by root and not writable by anyone else, like the \
+             directories above it",
+            TRUSTED_DIRS.join(", ")
+        ),
+    )
+}
+
+/// What a child of root gets to see of the environment: nothing but the trusted `PATH` and
+/// the locale. Anything else the caller left in it (`LD_PRELOAD`, `LIBMOUNT_FSTAB`, ...) is
+/// theirs, not root's.
+fn root_environment(command: &mut Command) {
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        command.env_clear().env("PATH", TRUSTED_PATH);
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -157,13 +241,17 @@ impl Host for SystemHost {
         }
     }
 
-    fn tool_exists(&self, tool: &str) -> bool {
-        resolve(tool).is_some()
+    fn tool_state(&self, tool: &str) -> ToolState {
+        match lookup(tool) {
+            Lookup::Found(_) => ToolState::Usable,
+            Lookup::Missing => ToolState::Missing,
+            Lookup::Refused(why) => ToolState::Untrusted(why),
+        }
     }
 
     fn systemd_running(&self) -> bool {
         // What `sd_booted()` checks.
-        Path::new("/run/systemd/system").is_dir() && resolve("systemctl").is_some()
+        Path::new("/run/systemd/system").is_dir() && self.tool_exists("systemctl")
     }
 
     fn read_text(&self, path: &Path) -> Result<Option<String>> {
@@ -314,13 +402,19 @@ impl Host for SystemHost {
     }
 
     fn filesystem_of(&self, image: &Path) -> Result<Option<String>> {
-        let Some(blkid) = resolve("blkid") else {
-            return Err(Error::new(
-                ErrorCode::MissingTool,
-                "`blkid` (package util-linux) is needed to check the image for a filesystem",
-            ));
-        };
-        let out = Command::new(blkid)
+        let blkid = resolve("blkid").map_err(|e| {
+            Error::new(
+                e.code,
+                format!(
+                    "{} (`blkid`, package util-linux, is needed to check the image for a \
+                     filesystem)",
+                    e.message
+                ),
+            )
+        })?;
+        let mut command = Command::new(blkid);
+        root_environment(&mut command);
+        let out = command
             .args(["-p", "-o", "export"])
             .arg(image)
             .env("LC_ALL", "C")
@@ -352,13 +446,10 @@ impl Host for SystemHost {
     }
 
     fn run(&self, program: &str, args: &[&str]) -> Result<String> {
-        let Some(exe) = resolve(program) else {
-            return Err(Error::new(
-                ErrorCode::MissingTool,
-                format!("`{program}` is not installed (it is not in PATH)"),
-            ));
-        };
-        let out = Command::new(&exe)
+        let exe = resolve(program)?;
+        let mut command = Command::new(&exe);
+        root_environment(&mut command);
+        let out = command
             .args(args)
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
@@ -684,24 +775,133 @@ fn allocate(_file: &File, _bytes: u64) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use trust::Lookup;
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
 
-    // U-SYS-02: only absolute PATH entries are searched.
+    fn executable(path: &Path) {
+        fs::write(path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn policy() -> Policy<'static> {
+        Policy {
+            owner: 0,
+            anchor: Path::new("/"),
+        }
+    }
+
+    /// `program` looked up as `root` (or not) with `path` as `PATH`, on the real disk.
+    fn looked_up(root: bool, path: Option<&str>, program: &str) -> Lookup {
+        lookup_in(
+            &RealDisk,
+            root,
+            &policy(),
+            path.map(std::ffi::OsStr::new),
+            program,
+        )
+    }
+
+    // U-SYS-02: for anyone but root, only absolute PATH entries are searched.
     #[test]
     fn programs_are_looked_up_in_absolute_directories_only() {
         let dir = tmp();
         let exe = dir.path().join("tool-here");
-        fs::write(&exe, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(resolve(exe.to_str().unwrap()), Some(exe.clone()));
-        assert_eq!(resolve("definitely-not-a-program-parhel"), None);
+        executable(&exe);
+        assert_eq!(
+            looked_up(false, None, exe.to_str().unwrap()),
+            Lookup::Found(exe.clone())
+        );
+        assert_eq!(
+            looked_up(
+                false,
+                Some("/usr/bin:/bin"),
+                "definitely-not-a-program-parhel"
+            ),
+            Lookup::Missing
+        );
         // A file that is not executable is not a tool.
         let plain = dir.path().join("plain");
         fs::write(&plain, "x").unwrap();
-        assert_eq!(resolve(plain.to_str().unwrap()), None);
+        assert_eq!(
+            looked_up(false, None, plain.to_str().unwrap()),
+            Lookup::Missing
+        );
+        // Empty and relative entries are skipped; an absolute one is searched.
+        let path = format!(":relative/dir:{}", dir.path().display());
+        assert_eq!(
+            looked_up(false, Some(&path), "tool-here"),
+            Lookup::Found(exe)
+        );
+        assert_eq!(
+            looked_up(false, Some(":relative/dir"), "tool-here"),
+            Lookup::Missing
+        );
+    }
+
+    // U-SYS-29: root does not consult PATH. A program that is only in a directory the user
+    // controls is not there; one that is in both places is the system's; and a program
+    // given with its directory is judged like any other (a temporary directory is nobody
+    // root can trust).
+    #[test]
+    fn as_root_path_is_not_consulted() {
+        let dir = tmp();
+        let only_here = dir.path().join("only-in-path");
+        executable(&only_here);
+        let lookalike = dir.path().join("sh");
+        executable(&lookalike);
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+
+        // Anyone else: PATH decides, the first directory first.
+        assert_eq!(
+            looked_up(false, Some(&path), "only-in-path"),
+            Lookup::Found(only_here.clone())
+        );
+        assert_eq!(
+            looked_up(false, Some(&path), "sh"),
+            Lookup::Found(lookalike.clone())
+        );
+
+        // Root: the user's directory is not looked in.
+        assert_eq!(
+            looked_up(true, Some(&path), "only-in-path"),
+            Lookup::Missing
+        );
+        match looked_up(true, Some(&path), "sh") {
+            Lookup::Found(sh) => assert!(
+                TRUSTED_DIRS.iter().any(|d| sh.starts_with(d)),
+                "{}",
+                sh.display()
+            ),
+            other => panic!("the system's sh was not found: {other:?}"),
+        }
+        match looked_up(true, Some(&path), lookalike.to_str().unwrap()) {
+            Lookup::Refused(why) => assert!(why.contains("not by root"), "{why}"),
+            other => panic!("a program under a temporary directory was trusted: {other:?}"),
+        }
+    }
+
+    // U-SYS-30: a program root refuses is reported with the file and the check that failed,
+    // as `missing-tool`, and is never run; the lookup says the same for `tool_state`.
+    #[test]
+    fn a_refused_program_is_missing_with_the_reason() {
+        let dir = tmp();
+        let exe = dir.path().join("mkfs.parhel-test");
+        executable(&exe);
+        let why = match looked_up(true, None, exe.to_str().unwrap()) {
+            Lookup::Refused(why) => why,
+            other => panic!("expected a refusal: {other:?}"),
+        };
+        let err = untrusted("mkfs.parhel-test", &why);
+        assert_eq!(err.code, ErrorCode::MissingTool, "{err}");
+        assert!(err.message.contains(&why), "{}", err.message);
+        assert!(
+            err.message.contains("owned by root") && err.message.contains("/usr/sbin"),
+            "{}",
+            err.message
+        );
     }
 
     // U-SYS-03: `run` reports the program's own words when it fails.
