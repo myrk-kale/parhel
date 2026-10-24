@@ -21,12 +21,12 @@ use crate::domain::exclusions::{ExclusionInput, Exclusions};
 use crate::domain::paths::{self, Placement};
 use crate::domain::relocate::{MAX_RELOCATE_BYTES, Relocation, Rewrite};
 use crate::domain::store::{
-    BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, Store, StoreState, WORKTREES_DIR, last_sync_of,
-    render_meta, repo_id,
+    BASELINES_DIR, LINKS_FILE, LOCK_FILE, MARKER_FILE, Marker, Store, StoreState, WORKTREES_DIR,
+    last_sync_of, render_meta, repo_id,
 };
 use crate::domain::{AddRequest, BranchMode, Error, ErrorCode, Result, SubmodulePolicy};
 use crate::git::parse::ensure_supported;
-use crate::ports::{CowFs, FileLock, Git, RepoInfo, WorktreeAddSpec};
+use crate::ports::{CowFs, FileLock, Git, RepoInfo, SharedLock, WorktreeAddSpec};
 
 /// Side-effect providers and process context.
 #[derive(Clone, Copy)]
@@ -107,8 +107,11 @@ pub fn add(env: &Env<'_>, request: &AddRequest) -> Result<AddOutcome> {
             if request.fallback {
                 return fallback(env, request, &plan, &problem);
             }
-            // The only way out of the problem that keeps the worktree copy-on-write.
-            let store = usable_store(env, &plan, problem)?;
+            // The only way out of the problem that keeps the worktree copy-on-write. The store
+            // lock is held from here - the moment the store is chosen - to the end of this
+            // function: until the worktree is published, or the run is undone.
+            let (store, _store_lock) = usable_store(env, &plan, problem)?;
+            crate::failpoint!("store_locked");
             crate::failpoint!("after_validate");
             return store_transaction(env, request, &plan, &store);
         }
@@ -340,7 +343,11 @@ fn cow_problem(env: &Env<'_>, plan: &Plan) -> Result<Option<Error>> {
 /// can serve this run, else the refusal itself, with the way to get a store when there
 /// is none, or `store-unavailable` when there is one that cannot be used (never a silent
 /// fallback to something that is not copy-on-write).
-fn usable_store(env: &Env<'_>, plan: &Plan, problem: Error) -> Result<Store> {
+///
+/// A store that will be used comes with its lock, taken shared: whoever removes the store
+/// (`setup --remove`) takes it exclusively before it looks inside, so as long as the caller
+/// holds this one the store is not removed from under the run.
+fn usable_store(env: &Env<'_>, plan: &Plan, problem: Error) -> Result<(Store, FileLock)> {
     let Some(path) = env.store else {
         return Err(problem);
     };
@@ -382,12 +389,37 @@ fn usable_store(env: &Env<'_>, plan: &Plan, problem: Error) -> Result<Store> {
                 Err(problem)
             } else {
                 // Git registers canonical paths: so does the store route.
-                Ok(Store {
-                    root: env.fs.canonicalize(&store.root)?,
-                    ..store
-                })
+                let root = env.fs.canonicalize(&store.root)?;
+                // Refused before anything is created, the lock file included.
+                let name = paths::destination_basename(&plan.destination)?;
+                let real = root
+                    .join(WORKTREES_DIR)
+                    .join(repo_id(&plan.repo.toplevel))
+                    .join(name);
+                refuse_registry_hostile(&plan.destination, &real)?;
+                let lock = lock_store(env, &root)?;
+                Ok((Store { root, ..store }, lock))
             }
         }
+    }
+}
+
+/// The store-wide lock of the store at `root`, shared and without waiting. Not given while a
+/// removal holds it, nor once a removal has sealed the store: either way the store is going
+/// away and nothing may be published in it.
+fn lock_store(env: &Env<'_>, root: &Path) -> Result<FileLock> {
+    match env.fs.lock_store_shared(&root.join(LOCK_FILE))? {
+        SharedLock::Held(lock) => Ok(lock),
+        SharedLock::Removing | SharedLock::Sealed => Err(Error::new(
+            ErrorCode::StoreUnavailable,
+            format!(
+                "the store at `{}` is being removed (`git parhel setup --remove` is running, \
+                 or was interrupted), so it cannot be used now. Wait for the removal to \
+                 finish, or, if none is running, bring the store back with `sudo git parhel \
+                 setup`; --copy and --fallback work without the store",
+                root.display()
+            ),
+        )),
     }
 }
 
@@ -449,7 +481,6 @@ fn store_transaction(
     let worktrees_dir = store.root.join(WORKTREES_DIR);
     let real_dir = worktrees_dir.join(&id);
     let name = paths::destination_basename(&plan.destination)?;
-    refuse_registry_hostile(&plan.destination, &real_dir.join(name))?;
 
     let exclusions = Exclusions::compute(&ExclusionInput {
         source_root: repo.toplevel.clone(),
@@ -3612,10 +3643,7 @@ mod tests {
             1
         );
         assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
-        assert_eq!(
-            w.calls().last(),
-            Some(&Call::RemoveDirAll(p(STORE_STAGING)))
-        );
+        assert_eq!(w.last_call(), Some(Call::RemoveDirAll(p(STORE_STAGING))));
     }
 
     // U-STO-51: the exclusive rename loses a race: the symlink this run made goes away.
@@ -3638,10 +3666,7 @@ mod tests {
                 }),
             1
         );
-        assert_eq!(
-            w.calls().last(),
-            Some(&Call::RemoveDirAll(p(STORE_STAGING)))
-        );
+        assert_eq!(w.last_call(), Some(Call::RemoveDirAll(p(STORE_STAGING))));
     }
 
     // U-STO-52: two worktrees with one name in the same repository get distinct real
@@ -3799,8 +3824,8 @@ mod tests {
             && !w.fail.borrow().contains_key(&Step::CreateStaging)
         {
             assert_eq!(
-                calls.last(),
-                Some(&Call::RemoveDirAll(p(STORE_STAGING))),
+                w.last_call(),
+                Some(Call::RemoveDirAll(p(STORE_STAGING))),
                 "{calls:#?}"
             );
         }
@@ -4377,7 +4402,7 @@ mod tests {
         calls
     }
 
-    // U-STO-100: from deciding to use the store until the worktree is published, a run holds
+    // U-STO-120: from deciding to use the store until the worktree is published, a run holds
     // the store's lock (shared; `setup --remove` takes it exclusively): taken before anything
     // is written, let go of after the last thing is done, and nothing in the store is touched
     // without it. This is what keeps a removal from deleting the image between its look at
@@ -4419,7 +4444,7 @@ mod tests {
         );
     }
 
-    // U-STO-100b: ... and when the run fails, or is interrupted, the lock outlives the
+    // U-STO-120b: ... and when the run fails, or is interrupted, the lock outlives the
     // rollback: a removal must not find a store with a half-undone run in it.
     #[rstest]
     #[case::sync(Step::Mirror, None)]
@@ -4464,7 +4489,7 @@ mod tests {
         );
     }
 
-    // U-STO-101: a removal holds the lock exclusively: the run does not start. It is
+    // U-STO-121: a removal holds the lock exclusively: the run does not start. It is
     // `store-unavailable` - the store is not usable now - saying why, and the way out; the
     // only thing it did was ask for the lock.
     #[test]
@@ -4484,7 +4509,7 @@ mod tests {
         assert!(w.links.borrow().is_empty());
     }
 
-    // U-STO-101b: ... and so is the store a removal sealed when it let go of the lock to
+    // U-STO-121b: ... and so is the store a removal sealed when it let go of the lock to
     // unmount it: the lock is free, but the file says the store is going away.
     #[test]
     fn a_sealed_store_is_refused_too() {
@@ -4499,7 +4524,7 @@ mod tests {
         assert_eq!(w.store_locks_held.get(), 0);
     }
 
-    // U-STO-102: a store that predates the lock (set up by an older version) has no lock
+    // U-STO-122: a store that predates the lock (set up by an older version) has no lock
     // file: the first run makes it, and uses it.
     #[test]
     fn the_run_makes_the_lock_file_when_the_store_has_none() {
@@ -4509,7 +4534,7 @@ mod tests {
         assert!(w.files.borrow().contains_key(&store_lock()));
     }
 
-    // U-STO-103: the lock is for runs that use the store. Where the store is not used - it
+    // U-STO-123: the lock is for runs that use the store. Where the store is not used - it
     // cannot be, or the run does not need it - nothing is taken, and no file is made in a
     // directory that may be an empty mount point.
     #[rstest]

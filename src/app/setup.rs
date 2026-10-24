@@ -10,9 +10,11 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::domain::request::DEFAULT_STORE_SIZE;
-use crate::domain::store::{BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, WORKTREES_DIR};
+use crate::domain::store::{
+    BASELINES_DIR, LINKS_FILE, LOCK_FILE, MARKER_FILE, Marker, REMOVING_MARK, WORKTREES_DIR,
+};
 use crate::domain::{Error, ErrorCode, Result, SetupRequest};
-use crate::ports::{Host, MountBacking, Owner, ToolState, UserInfo};
+use crate::ports::{FileLock, Host, MountBacking, Owner, ToolState, UserInfo};
 
 /// Where the images live: root's, and immutable once there is one.
 const STATE_DIR: &str = "/var/lib/parhel";
@@ -480,11 +482,48 @@ fn build(
         )?;
         progress.changed = true;
     }
+    ensure_store_lock(host, places, progress)?;
 
     if !host.is_immutable(Path::new(STATE_DIR)) {
         protect(host, places)?;
         progress.changed = true;
     }
+    Ok(())
+}
+
+/// The store-wide lock file is there, the user's, and does not say the store is going away.
+///
+/// Made when missing (a new store, or one set up before the lock existed) - never replaced:
+/// a run that holds the lock on the old file would be outside the new one. And a store whose
+/// removal died after sealing it (killed, power lost) is closed to `add` for good until this
+/// takes the mark out. A file that is there and unmarked costs nothing: it is only read.
+fn ensure_store_lock(host: &dyn Host, places: &Places, progress: &mut Progress) -> Result<()> {
+    let path = places.root.join(LOCK_FILE);
+    let sealed = match host.read_text(&path)? {
+        None => false,
+        Some(text) if text.starts_with(REMOVING_MARK) => true,
+        Some(_) => return Ok(()),
+    };
+    let Some(lock) = host.lock_store(&path, places.owner)? else {
+        // Somebody holds it: it exists. Only a sealed store needs more than that.
+        if sealed {
+            return Err(Error::new(
+                ErrorCode::StoreInUse,
+                format!(
+                    "the store for {} is marked as going away and a run holds its lock right \
+                     now (a `setup --remove` that has not finished, or an `add` reading the \
+                     mark); wait a moment and run this again",
+                    places.user.name
+                ),
+            ));
+        }
+        return Ok(());
+    };
+    if sealed {
+        host.set_store_sealed(&path, false)?;
+    }
+    drop(lock);
+    progress.changed = true;
     Ok(())
 }
 
@@ -687,6 +726,10 @@ struct Looked {
     way: Option<Way>,
     /// `Err(why)` when the contents could not be reached: nothing to judge.
     contents: std::result::Result<Option<Contents>, String>,
+    /// The store-wide lock, held exclusively since before the store was looked at, when the
+    /// store is mounted at its place (and so can be in use). Not for an image mounted
+    /// read-only on a private directory: see [`look`].
+    lock: Option<FileLock>,
 }
 
 fn remove(host: &dyn Host, places: &Places, discard: bool) -> Result<SetupOutcome> {
@@ -709,8 +752,8 @@ fn remove(host: &dyn Host, places: &Places, discard: bool) -> Result<SetupOutcom
     // The worktrees are the user's work, and so is whatever else is in there. Looked at
     // before anything is deleted: through the mount if it is up, by starting the unit if
     // there is one, or by mounting the image read-only on a private directory when the
-    // unit is gone.
-    let looked = look(host, places, unit_text.is_some(), image_present, mounted)?;
+    // unit is gone. A store that is mounted is looked at under its lock, held exclusively.
+    let mut looked = look(host, places, unit_text.is_some(), image_present, mounted)?;
     let verdict = judge(places, &looked, discard);
     match (&looked.way, &verdict) {
         (Some(Way::Probe(dir)), _) => {
@@ -720,6 +763,8 @@ fn remove(host: &dyn Host, places: &Places, discard: bool) -> Result<SetupOutcom
             }
         }
         (Some(Way::Started), Err(_)) => {
+            // An open file keeps a mount busy: the lock goes first.
+            drop(looked.lock.take());
             let _ = host.run("systemctl", &["stop", &places.unit]);
         }
         _ => {}
@@ -735,34 +780,32 @@ fn remove(host: &dyn Host, places: &Places, discard: bool) -> Result<SetupOutcom
         None
     };
 
-    // Stop using the image, then forget the unit.
-    if unit_text.is_some() {
-        host.run("systemctl", &["disable", "--now", &places.unit])?;
-        host.remove_file(&places.unit_file)?;
-        host.run("systemctl", &["daemon-reload"])?;
-    } else if mounted {
-        host.umount(&places.root)?;
-    }
-
-    // The directory is immutable: lift it to delete, and put it back for the others.
-    let state_dir = Path::new(STATE_DIR);
-    let lifted = host.is_immutable(state_dir);
-    if lifted {
-        host.run("chattr", &["-i", STATE_DIR])?;
-    }
-    let deleted = (|| -> Result<()> {
-        if image_present {
-            host.remove_file(&places.image)?;
+    // From here the store goes away. The lock cannot be held through the unmount - an open
+    // file keeps the mount busy, and `umount` would refuse - so the store is sealed first:
+    // the lock file says it is going away, which an `add` that takes the lock after this
+    // reads and does not start. (One that took it before is in the lock's way, and `look`
+    // would not have got it.)
+    let sealed = match looked.lock.take() {
+        Some(lock) => {
+            seal(host, places, lock)?;
+            true
         }
-        if root_present {
-            host.remove_dir(&places.root)?;
-        }
-        Ok(())
-    })();
-    if lifted && other_images(host, state_dir)? {
-        host.run("chattr", &["+i", STATE_DIR])?;
+        None => false,
+    };
+    let taken_down = take_down(
+        host,
+        places,
+        &Existing {
+            image: image_present,
+            unit: unit_text.is_some(),
+            mounted,
+        },
+        root_present,
+        sealed,
+    );
+    if let Err(e) = taken_down {
+        return Err(if sealed { reopen(host, places, e) } else { e });
     }
-    deleted?;
 
     Ok(SetupOutcome::Removed(StoreSummary {
         user: places.user.name.clone(),
@@ -774,11 +817,112 @@ fn remove(host: &dyn Host, places: &Places, discard: bool) -> Result<SetupOutcom
     }))
 }
 
+/// Mark the store as going away in its lock file, which `lock` holds, and let go of the lock.
+fn seal(host: &dyn Host, places: &Places, lock: FileLock) -> Result<()> {
+    let path = places.root.join(LOCK_FILE);
+    let sealed = host.set_store_sealed(&path, true);
+    if sealed.is_err() {
+        // Whatever was written, while the lock is still ours.
+        let _ = host.set_store_sealed(&path, false);
+    }
+    drop(lock);
+    sealed
+}
+
+/// Stop using the image and delete it: the unit (or the bare mount) goes first, then the
+/// image and the mount point. `sealed`: the store is closed to `add` while this runs.
+fn take_down(
+    host: &dyn Host,
+    places: &Places,
+    existing: &Existing,
+    root_present: bool,
+    sealed: bool,
+) -> Result<()> {
+    if sealed {
+        crate::failpoint!("store_remove_sealed");
+    }
+    // Stop using the image, then forget the unit.
+    if existing.unit {
+        host.run("systemctl", &["disable", "--now", &places.unit])?;
+        host.remove_file(&places.unit_file)?;
+        host.run("systemctl", &["daemon-reload"])?;
+    } else if existing.mounted {
+        host.umount(&places.root)?;
+    }
+
+    // The directory is immutable: lift it to delete, and put it back for the others.
+    let state_dir = Path::new(STATE_DIR);
+    let lifted = host.is_immutable(state_dir);
+    if lifted {
+        host.run("chattr", &["-i", STATE_DIR])?;
+    }
+    let deleted = (|| -> Result<()> {
+        if existing.image {
+            host.remove_file(&places.image)?;
+        }
+        if root_present {
+            host.remove_dir(&places.root)?;
+        }
+        Ok(())
+    })();
+    if lifted && other_images(host, state_dir)? {
+        host.run("chattr", &["+i", STATE_DIR])?;
+    }
+    deleted
+}
+
+/// A removal that failed after the store was sealed opens it again, if it is still there to
+/// be opened, so that it goes on working; the error is the real one. When the mark cannot
+/// be taken out (a run holds the lock) it says so, and what to do.
+fn reopen(host: &dyn Host, places: &Places, error: Error) -> Error {
+    // Only the store that is mounted at its place: where it is not, nothing is made.
+    if !matches!(
+        host.mount_backing(&places.root, &places.image),
+        Ok(MountBacking::Image)
+    ) {
+        return error;
+    }
+    let path = places.root.join(LOCK_FILE);
+    let reopened = match host.lock_store(&path, places.owner) {
+        Ok(Some(lock)) => {
+            let done = host.set_store_sealed(&path, false).is_ok();
+            drop(lock);
+            done
+        }
+        _ => false,
+    };
+    if reopened {
+        return error;
+    }
+    Error::new(
+        error.code,
+        format!(
+            "{}\nthe store is still closed to `git parhel add` (a removal marked it as going \
+             away): `sudo git parhel setup` opens it again",
+            error.message
+        ),
+    )
+}
+
 /// Reach the contents of the store, whichever way works, and read them.
 ///
 /// `Err` is for what is wrong with the machine (an unreadable directory); a store that
 /// cannot be reached is reported in the result, for the caller to refuse or, with
 /// `--discard-contents`, to go on.
+///
+/// A store that is mounted at its place can be in use, so it is looked at under its
+/// lock, taken exclusively and without waiting before anything is read: whoever works in
+/// it - an `add`, a `doctor --fix` - holds the lock shared, and if anyone does, a run is
+/// in progress and the removal stops (`store-in-use`) instead of deleting the image under
+/// it. The lock is the way the check "no worktrees" and the deletion stay one decision: no
+/// run can publish a worktree between them.
+///
+/// An image whose unit is gone is not mounted at its place but read-only on a private
+/// directory of root's (mode 0700, under `/run`), which no user can enter; `add` finds a
+/// store by its marker at `/parhel/<user>`, never there. No run can be using it, so there
+/// is nothing to take a lock on - and no lock file is made on a mount point with nothing
+/// mounted. (Someone mounting the image at the store's place by hand, as root, while this
+/// runs is outside what a lock can guard.)
 fn look(
     host: &dyn Host,
     places: &Places,
@@ -790,6 +934,7 @@ fn look(
         Ok(Looked {
             way: None,
             contents: Err(why),
+            lock: None,
         })
     };
     let (way, at) = if mounted {
@@ -799,6 +944,7 @@ fn look(
         return Ok(Looked {
             way: None,
             contents: Ok(None),
+            lock: None,
         });
     } else if has_unit {
         if let Err(e) = host.run("systemctl", &["start", &places.unit]) {
@@ -819,6 +965,7 @@ fn look(
                 return Ok(Looked {
                     way: None,
                     contents: Ok(None),
+                    lock: None,
                 });
             }
             Some(kind) if kind == "btrfs" => {}
@@ -831,25 +978,76 @@ fn look(
             Err(e) => return unreachable(format!("it does not mount: {}", e.message)),
         }
     };
-    match inspect(host, places, &at) {
+    // As found: a unit started to look is stopped again, a private mount unmounted. The lock
+    // is let go of before, an open file keeps a mount busy.
+    let put_back = |way: &Way, lock: Option<FileLock>| {
+        drop(lock);
+        match way {
+            Way::Probe(dir) => {
+                let _ = host.umount(dir);
+            }
+            Way::Started => {
+                let _ = host.run("systemctl", &["stop", &places.unit]);
+            }
+            Way::Mounted => {}
+        }
+    };
+    let lock = if matches!(way, Way::Probe(_)) {
+        None
+    } else {
+        match lock_for_removal(host, places) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                put_back(&way, None);
+                return Err(e);
+            }
+        }
+    };
+    match inspect_under_lock(host, places, &at) {
         Ok(contents) => Ok(Looked {
             way: Some(way),
             contents: Ok(Some(contents)),
+            lock,
         }),
         Err(e) => {
-            // As found: not left mounted because looking failed.
-            match &way {
-                Way::Probe(dir) => {
-                    let _ = host.umount(dir);
-                }
-                Way::Started => {
-                    let _ = host.run("systemctl", &["stop", &places.unit]);
-                }
-                Way::Mounted => {}
-            }
+            put_back(&way, lock);
             Err(e)
         }
     }
+}
+
+/// [`inspect`], with the lock taken (a test freezes the removal here to start an `add`).
+fn inspect_under_lock(host: &dyn Host, places: &Places, at: &Path) -> Result<Contents> {
+    crate::failpoint!("store_remove_locked");
+    inspect(host, places, at)
+}
+
+/// The store-wide lock, exclusively and without waiting: `store-in-use` when a run holds it.
+fn lock_for_removal(host: &dyn Host, places: &Places) -> Result<FileLock> {
+    let path = places.root.join(LOCK_FILE);
+    let taken = host.lock_store(&path, places.owner).map_err(|e| {
+        // The lock file is the user's, in a directory that is theirs: a link or a FIFO
+        // planted there is refused, and the way out is to delete it.
+        Error::new(
+            e.code,
+            format!(
+                "{}\nthe store's lock file is the user's: delete `{}` and run this again",
+                e.message,
+                path.display()
+            ),
+        )
+    })?;
+    taken.ok_or_else(|| {
+        Error::new(
+            ErrorCode::StoreInUse,
+            format!(
+                "the store for {} is in use: a run is in progress (a `git parhel add`, a `git \
+                 parhel doctor --fix` or another `setup --remove`; it holds the store's lock), \
+                 so nothing was looked at or deleted. Wait for it to finish and run this again",
+                places.user.name
+            ),
+        )
+    })
 }
 
 /// Read the store whose root is `at` (its mount point, or a private mount of its image).
@@ -868,7 +1066,13 @@ fn inspect(host: &dyn Host, places: &Places, at: &Path) -> Result<Contents> {
             Err(e) => MarkerState::Foreign(e.message),
         },
     };
-    let own = [MARKER_FILE, BASELINES_DIR, WORKTREES_DIR, LINKS_FILE];
+    let own = [
+        MARKER_FILE,
+        BASELINES_DIR,
+        WORKTREES_DIR,
+        LINKS_FILE,
+        LOCK_FILE,
+    ];
     let extras = names
         .iter()
         .filter(|name| !own.iter().any(|o| name.as_encoded_bytes() == o.as_bytes()))
@@ -1112,6 +1316,9 @@ mod tests {
         h.files
             .borrow_mut()
             .insert(p("/parhel/alice/.parhel-store"), MARKER_TEXT.into());
+        h.files
+            .borrow_mut()
+            .insert(p("/parhel/alice/.parhel-store.lock"), String::new());
         h.mounted.borrow_mut().insert(p(ROOT));
         h.immutable.borrow_mut().insert(p("/var/lib/parhel"));
     }
@@ -1131,6 +1338,8 @@ mod tests {
             "mkdir /parhel/alice/baselines",
             "mkdir /parhel/alice/worktrees",
             "write /parhel/alice/.parhel-store",
+            "lock-store /parhel/alice/.parhel-store.lock",
+            "unlock-store /parhel/alice/.parhel-store.lock",
             "run chattr +i /var/lib/parhel",
             "verify-immutable /var/lib/parhel /var/lib/parhel/alice.img",
         ]
@@ -2078,7 +2287,7 @@ mod tests {
             "{}",
             err.message
         );
-        assert_no_mutation(&h);
+        assert_only_locked(&h);
     }
 
     // U-SET-31: baselines are a cache; only worktrees block the removal.
@@ -2106,6 +2315,9 @@ mod tests {
         assert_eq!(
             h.lines(),
             vec![
+                "lock-store /parhel/alice/.parhel-store.lock",
+                "seal-store /parhel/alice/.parhel-store.lock",
+                "unlock-store /parhel/alice/.parhel-store.lock",
                 "run systemctl disable --now parhel-alice.mount",
                 "rm /etc/systemd/system/parhel-alice.mount",
                 "run systemctl daemon-reload",
@@ -2354,9 +2566,11 @@ mod tests {
         for gone in ["/parhel/alice/baselines", "/parhel/alice/worktrees"] {
             h.dirs.borrow_mut().remove(&p(gone));
         }
-        h.files
-            .borrow_mut()
-            .remove(&p("/parhel/alice/.parhel-store"));
+        for gone in [".parhel-store", ".parhel-store.lock"] {
+            h.files
+                .borrow_mut()
+                .remove(&p(&format!("/parhel/alice/{gone}")));
+        }
         assert!(matches!(
             setup(&h, &removal()).unwrap(),
             SetupOutcome::Removed(_)
@@ -2506,6 +2720,8 @@ mod tests {
             h.lines(),
             vec![
                 "run systemctl start parhel-alice.mount".to_owned(),
+                lock_line(),
+                unlock_line(),
                 "run systemctl stop parhel-alice.mount".to_owned()
             ]
         );
@@ -2600,7 +2816,7 @@ mod tests {
         assert!(err.message.contains("add"), "{}", err.message);
         assert!(!err.message.contains("worktrees/abc"), "{}", err.message);
         assert!(
-            err.message.contains("nothing was deleted"),
+            err.message.contains("nothing was looked at or deleted"),
             "{}",
             err.message
         );
@@ -2746,6 +2962,9 @@ mod tests {
         for with_worktree in [false, true] {
             let h = FakeHost::default();
             image_without_unit(&h);
+            // (What is in the image is not the lock the test is about: a lock file made
+            // there would show.)
+            h.files.borrow_mut().remove(&p(LOCK));
             if with_worktree {
                 worktree_inside(&h);
             }
@@ -2800,6 +3019,7 @@ mod tests {
         // Older store: made, and said.
         let h = FakeHost::default();
         installed(&h);
+        h.files.borrow_mut().remove(&p(LOCK));
         assert!(matches!(
             setup(&h, &request()).unwrap(),
             SetupOutcome::Restored(_)
@@ -2889,8 +3109,10 @@ mod tests {
         assert_eq!(
             h.lines(),
             vec![
-                "run systemctl start parhel-alice.mount",
-                "run systemctl stop parhel-alice.mount"
+                "run systemctl start parhel-alice.mount".to_owned(),
+                lock_line(),
+                unlock_line(),
+                "run systemctl stop parhel-alice.mount".to_owned()
             ]
         );
         assert!(!h.is_mount_point(Path::new(ROOT)), "left as it was found");
@@ -2904,8 +3126,10 @@ mod tests {
         h.files.borrow_mut().remove(&p(UNIT_FILE));
         setup(&h, &removal()).unwrap();
         assert_eq!(
-            h.lines().first().map(String::as_str),
-            Some("umount /parhel/alice")
+            h.lines().get(3).map(String::as_str),
+            Some("umount /parhel/alice"),
+            "after the lock was let go of: {:?}",
+            h.lines()
         );
         assert!(!h.exists(Path::new(IMG)) && !h.exists(Path::new(ROOT)));
     }
