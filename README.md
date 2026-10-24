@@ -259,8 +259,8 @@ cannot check them: before you install one, check it against its `.sha256` file
 and with `gh attestation verify` (see [Verify a download](#verify-a-download)).
 
 The packages install `/usr/bin/git-parhel` and the man pages. They require `git`
-and recommend `btrfs-progs`, which a planned `setup` command will use to prepare
-a Btrfs volume; parhel does not call it today. Packages are attached to the
+and recommend `btrfs-progs`, which `sudo git parhel setup` needs to create the
+copy-on-write area on ext4 and other filesystems without it. Packages are attached to the
 releases after 0.3.0. A signed apt or dnf repository, so that
 `apt install parhel` works without downloading anything and the package manager
 updates parhel for you, does not exist yet. For now, upgrade by installing the

@@ -68,7 +68,7 @@ maintainer = "Kale <parhel-release@users.noreply.github.com>"
 section = "vcs"
 priority = "optional"
 depends = "git (>= 1:2.29)"
-# Used by a future `setup` command to prepare a Btrfs volume.
+# `git parhel setup` formats its store image with mkfs.btrfs.
 recommends = "btrfs-progs"
 license-file = ["packaging/debian/copyright", "0"]
 extended-description = """\
