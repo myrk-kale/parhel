@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::request::DEFAULT_STORE_SIZE;
 use crate::domain::store::{BASELINES_DIR, LINKS_FILE, MARKER_FILE, Marker, WORKTREES_DIR};
 use crate::domain::{Error, ErrorCode, Result, SetupRequest};
-use crate::ports::{Host, MountBacking, Owner, UserInfo};
+use crate::ports::{Host, MountBacking, Owner, ToolState, UserInfo};
 
 /// Where the images live: root's, and immutable once there is one.
 const STATE_DIR: &str = "/var/lib/parhel";
@@ -173,6 +173,10 @@ pub fn setup(host: &dyn Host, request: &SetupRequest) -> Result<SetupOutcome> {
         require_tool(host, "blkid", "util-linux")?;
         require_tool(host, "mount", "util-linux")?;
     }
+    // A `systemctl` that is there but not trusted is not "no systemd".
+    if matches!(host.tool_state("systemctl"), ToolState::Untrusted(_)) {
+        require_tool(host, "systemctl", "systemd")?;
+    }
     if !host.systemd_running() {
         return Err(Error::new(
             ErrorCode::UnsupportedPlatform,
@@ -226,13 +230,22 @@ fn not_root(request: &SetupRequest) -> Error {
 }
 
 fn require_tool(host: &dyn Host, tool: &str, package: &str) -> Result<()> {
-    if host.tool_exists(tool) {
-        return Ok(());
+    match host.tool_state(tool) {
+        ToolState::Usable => Ok(()),
+        ToolState::Missing => Err(Error::new(
+            ErrorCode::MissingTool,
+            format!("`{tool}` is not installed: install the package {package} and run this again"),
+        )),
+        ToolState::Untrusted(why) => Err(Error::new(
+            ErrorCode::MissingTool,
+            format!(
+                "`{tool}` cannot be run as root: {why}. As root, programs are taken only from \
+                 /usr/sbin, /usr/bin, /sbin and /bin, and each must be owned by root and not \
+                 writable by anyone else, like the directories above it; install the package \
+                 {package} and run this again"
+            ),
+        )),
     }
-    Err(Error::new(
-        ErrorCode::MissingTool,
-        format!("`{tool}` is not installed: install the package {package} and run this again"),
-    ))
 }
 
 /// btrfs must be in the kernel: load the module when it is only available.
@@ -611,14 +624,19 @@ fn protect(host: &dyn Host, places: &Places) -> Result<()> {
             ),
         )
     };
-    if !host.tool_exists("chattr") {
+    let chattr = match host.tool_state("chattr") {
+        ToolState::Usable => None,
+        ToolState::Missing => Some("`chattr` is not installed (package e2fsprogs)".to_owned()),
+        ToolState::Untrusted(why) => Some(format!("`chattr` cannot be run as root: {why}")),
+    };
+    if let Some(problem) = chattr {
         return Err(Error::new(
             ErrorCode::MissingTool,
             format!(
                 "the store is ready, but its image {image} is NOT protected from deletion: \
-                 `chattr` is not installed (package e2fsprogs). Anything that runs `rm` as \
-                 root would delete every worktree in the store with it. Install e2fsprogs and \
-                 run `{}` again: it only adds the protection",
+                 {problem}. Anything that runs `rm` as root would delete every worktree in the \
+                 store with it. Install e2fsprogs (in /usr/bin or /usr/sbin) and run `{}` \
+                 again: it only adds the protection",
                 rerun_command(places)
             ),
         ));

@@ -70,9 +70,6 @@ fn lookup_in(
     path_env: Option<&std::ffi::OsStr>,
     program: &str,
 ) -> Lookup {
-    // STAGE 1 (red): what the lookup did before the fix: PATH decides, for root too.
-    let _ = (policy, TRUSTED_PATH);
-    let root = false && root;
     if root {
         if program.contains('/') {
             return trust::find_path(disk, policy, Path::new(program));
