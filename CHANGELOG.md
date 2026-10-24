@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-24
+
 ### Fixed
 
 - **`setup --remove` could delete the store under an `add`.** It checked that no

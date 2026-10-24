@@ -1,6 +1,6 @@
 [package]
 name = "parhel"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Create Git worktrees with filesystem copy-on-write, ignored build output (node_modules, target/) included. macOS (APFS) and Linux (Btrfs, XFS); Windows planned"
