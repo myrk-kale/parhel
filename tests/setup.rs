@@ -21,7 +21,7 @@ mod common;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 use common::*;
 use serial_test::serial;
@@ -1049,6 +1049,193 @@ fn iset22_prune_while_the_unit_is_stopped_keeps_the_registration() {
         .filter(|l| !l.starts_with("store-low-space:") && *l != "no issues found")
         .collect();
     assert!(others.is_empty(), "{said}");
+}
+
+/// `add` at the default store, spawned and frozen at `failpoint` until `barrier` is released.
+fn spawn_add_default(
+    sb: &Sandbox,
+    src: &TestRepo,
+    dest: &Path,
+    branch: &str,
+    barrier: &Barrier,
+    failpoint: &str,
+) -> Child {
+    let args = vec!["--new-branch", branch];
+    parhel_cmd(&sb.env, &src.root, &add_args(dest, &args))
+        .env_remove("PARHEL_STORE")
+        .env("PARHEL_FAILPOINTS", barrier.spec(failpoint))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// `sudo git-parhel setup --remove`, spawned, with `PARHEL_FAILPOINTS=<spec>` for root's
+/// process (`sudo env`: sudo does not keep the environment).
+fn spawn_remove_with(spec: &str) -> Child {
+    Command::new("sudo")
+        .args(["-n", "env", &format!("PARHEL_FAILPOINTS={spec}")])
+        .arg(parhel_bin())
+        .args(["setup", "--remove"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+// I-SET23: the race the store lock closes. An `add` has decided to use the store and is
+// frozen right after it took the store's lock (nothing published yet): `--remove` looks at the
+// worktrees, finds none, and used to go on to delete the image under the run. It now cannot
+// take the lock: `store-in-use`, saying a run is in progress, the image and the unit still
+// there; and the run, released, publishes its worktree into a store that is intact.
+#[test]
+#[serial(setup)]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn iset23_remove_does_not_delete_the_store_under_an_add_in_progress() {
+    if !enabled() {
+        return;
+    }
+    let Some((sb, src)) = ext4_source() else {
+        return;
+    };
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    let dest = sb.path("wt");
+    let barrier = Barrier::new(&sb.root, "add");
+    let mut add = spawn_add_default(&sb, &src, &dest, "f1", &barrier, "store_locked");
+    barrier.wait_reached(&mut add);
+
+    let refused = setup(&["--remove"]);
+    assert_error(&refused, "store-in-use");
+    assert!(
+        stderr(&refused).contains("in progress"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        root_exists(image()) && unit_file().exists(),
+        "nothing was removed"
+    );
+    assert!(is_mounted(&store_root()), "and it is still mounted");
+
+    barrier.release();
+    assert_success(&finish_within(add, 120));
+    let real = fs::read_link(&dest).expect("the run published");
+    assert!(real.starts_with(store_root().join("worktrees")));
+    TestRepo::open(&sb.env, &dest).assert_clean();
+}
+
+// I-SET24: ... and the other way round. `--remove` is frozen right after it took the lock
+// exclusively (it has looked at nothing yet): an `add` that starts then does not: `store-
+// unavailable`, the store is being removed, nothing written. Released, the removal finishes.
+#[test]
+#[serial(setup)]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn iset24_add_does_not_start_in_a_store_that_is_being_removed() {
+    if !enabled() {
+        return;
+    }
+    let Some((sb, src)) = ext4_source() else {
+        return;
+    };
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    let barrier = Barrier::new(&sb.root, "remove");
+    let mut removal = spawn_remove_with(&barrier.spec("store_remove_locked"));
+    barrier.wait_reached(&mut removal);
+
+    let dest = sb.path("wt");
+    let blocked = add_default(&sb, &src, &dest, "f1");
+    assert_error(&blocked, "store-unavailable");
+    assert!(
+        stderr(&blocked).contains("being removed"),
+        "{}",
+        stderr(&blocked)
+    );
+    assert!(fs::symlink_metadata(&dest).is_err(), "no symlink");
+    assert_eq!(
+        src.worktree_paths(),
+        vec![src.root.clone()],
+        "no registration"
+    );
+    assert!(
+        fs::read_dir(store_root().join("baselines"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "nothing was written into the store"
+    );
+
+    barrier.release();
+    let out = finish_within(removal, 120);
+    assert_success(&out);
+    assert!(!root_exists(image()), "the removal went through");
+}
+
+// I-SET25: the lock cannot be held through the unmount (an open file keeps a mount busy), so a
+// removal seals the store and lets go of it just before it stops the unit. Frozen there, an
+// `add` finds the lock free but the mark in it: `store-unavailable`, the same refusal. Released,
+// the removal unmounts and deletes: it was not held up by anything open on the store.
+#[test]
+#[serial(setup)]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn iset25_a_sealed_store_refuses_adds_until_it_is_gone() {
+    if !enabled() {
+        return;
+    }
+    let Some((sb, src)) = ext4_source() else {
+        return;
+    };
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    let barrier = Barrier::new(&sb.root, "sealed");
+    let mut removal = spawn_remove_with(&barrier.spec("store_remove_sealed"));
+    barrier.wait_reached(&mut removal);
+    assert_eq!(
+        fs::read_to_string(store_root().join(".parhel-store.lock")).unwrap(),
+        "removing\n"
+    );
+
+    let dest = sb.path("wt");
+    let blocked = add_default(&sb, &src, &dest, "f1");
+    assert_error(&blocked, "store-unavailable");
+    assert!(
+        stderr(&blocked).contains("being removed"),
+        "{}",
+        stderr(&blocked)
+    );
+    assert!(fs::symlink_metadata(&dest).is_err());
+
+    barrier.release();
+    assert_success(&finish_within(removal, 120));
+    assert!(!root_exists(image()) && !unit_file().exists());
+    assert!(!store_root().exists(), "mount point left");
+}
+
+// I-SET26: a removal that fails after it sealed the store opens it again: the mark is gone
+// and the store works.
+#[test]
+#[serial(setup)]
+#[cfg_attr(not(feature = "failpoints"), ignore = "requires --features failpoints")]
+fn iset26_a_removal_that_fails_after_sealing_leaves_a_working_store() {
+    if !enabled() {
+        return;
+    }
+    let Some((sb, src)) = ext4_source() else {
+        return;
+    };
+    let _machine = Machine::clean();
+    assert_success(&setup(&["--size", "512M"]));
+    let out = finish_within(spawn_remove_with("store_remove_sealed=error"), 120);
+    assert_error(&out, "failpoint");
+    assert!(root_exists(image()) && unit_file().exists());
+    assert!(is_mounted(&store_root()));
+    assert_eq!(
+        fs::read_to_string(store_root().join(".parhel-store.lock")).unwrap(),
+        "",
+        "the mark is out"
+    );
+    assert_success(&add_default(&sb, &src, &sb.path("wt"), "f1"));
 }
 
 // I-SET16: these tests remove the store of the user who runs them, and `PARHEL_TEST_SETUP=1`

@@ -10,13 +10,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::anchor;
 use crate::domain::paths::STAGING_PREFIX;
+use crate::domain::store::REMOVING_MARK;
 use crate::domain::{Error, ErrorCode, Result};
-use crate::ports::{FileLock, Scan, Space};
+use crate::ports::{FileLock, Scan, SharedLock, Space};
 
 pub(crate) fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| {
@@ -515,6 +516,58 @@ pub(crate) fn lock_exclusive(path: &Path) -> Result<FileLock> {
     Ok(FileLock::new(file))
 }
 
+/// `flock(file, op | LOCK_NB)`: whether the lock was taken (`false`: somebody else holds a
+/// lock that conflicts with it).
+pub(crate) fn try_flock(file: &File, op: libc::c_int) -> io::Result<bool> {
+    match flock(file, op | libc::LOCK_NB) {
+        Ok(()) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Open the store-wide lock file `path`, creating it (mode 0600) when it is missing. A
+/// link at the last component is not followed, the open does not block (a FIFO planted
+/// there would), and what is opened must be a regular file: root opens this too, in a
+/// directory the user owns.
+pub(crate) fn open_store_lock(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                Error::new(
+                    ErrorCode::Io,
+                    format!(
+                        "`{}` is a symbolic link: refusing to follow it as the store's lock",
+                        path.display()
+                    ),
+                )
+            } else {
+                io_error(path, &e)
+            }
+        })?;
+    if !file.metadata().map_err(|e| io_error(path, &e))?.is_file() {
+        return Err(Error::new(
+            ErrorCode::Io,
+            format!(
+                "`{}` is not a regular file: refusing to use it as the store's lock",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// STAGE 1 (red): the lock is not taken.
+pub(crate) fn lock_store_shared(_path: &Path) -> Result<SharedLock> {
+    Ok(SharedLock::Held(FileLock::detached()))
+}
+
 pub(crate) fn is_locked(path: &Path) -> Result<bool> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -620,6 +673,126 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(held.unwrap());
+    }
+
+    fn held(lock: SharedLock) -> FileLock {
+        match lock {
+            SharedLock::Held(guard) => guard,
+            other => panic!("expected the lock to be taken, got {other:?}"),
+        }
+    }
+
+    /// Not locked any more: a guard that was dropped is released promptly (see U-FS-14 for
+    /// why not at once).
+    fn released(path: &Path) -> bool {
+        (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            !is_locked(path).unwrap()
+        })
+    }
+
+    // U-FS-24: the store-wide lock is shared by the runs that work in the store, any number
+    // at once, and keeps whoever wants it exclusively (a removal) out until the last one lets
+    // go. It is made, the user's and private, when it is missing; and kept when it is there.
+    #[test]
+    fn the_store_lock_is_shared_and_keeps_an_exclusive_taker_out() {
+        let d = tmp();
+        let path = d.path().join(".parhel-store.lock");
+        let a = held(lock_store_shared(&path).unwrap());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let b = held(lock_store_shared(&path).unwrap());
+        assert!(is_locked(&path).unwrap(), "an exclusive taker is kept out");
+        drop(a);
+        assert!(is_locked(&path).unwrap(), "one run is still working");
+        drop(b);
+        assert!(released(&path));
+        // A file that is there is used as it is.
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        drop(held(lock_store_shared(&path).unwrap()));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    // U-FS-25: while a removal holds the lock a run does not start: the answer is
+    // "removing", and nothing is held when it comes.
+    #[test]
+    fn the_store_lock_is_refused_while_a_removal_holds_it() {
+        let d = tmp();
+        let path = d.path().join(".parhel-store.lock");
+        fs::write(&path, b"").unwrap();
+        let removal = lock_exclusive(&path).unwrap();
+        assert!(matches!(
+            lock_store_shared(&path).unwrap(),
+            SharedLock::Removing
+        ));
+        drop(removal);
+        assert!(released(&path));
+        drop(held(lock_store_shared(&path).unwrap()));
+    }
+
+    // U-FS-26: ... and after it, when it let go to unmount the store, the mark it left in
+    // the file says the store is going away: refused, nothing held, the mark not ours to clear.
+    #[test]
+    fn a_sealed_store_lock_is_refused_and_released() {
+        let d = tmp();
+        let path = d.path().join(".parhel-store.lock");
+        fs::write(&path, REMOVING_MARK).unwrap();
+        assert!(matches!(
+            lock_store_shared(&path).unwrap(),
+            SharedLock::Sealed
+        ));
+        assert!(released(&path), "nothing is held after the refusal");
+        assert_eq!(fs::read(&path).unwrap(), REMOVING_MARK.as_bytes());
+        // Something else in the file is not the mark.
+        fs::write(&path, b"removing soon").unwrap();
+        drop(held(lock_store_shared(&path).unwrap()));
+    }
+
+    // U-FS-27: the lock file is opened the way root opens what a user can plant: a link is
+    // not followed (not to a file, not to a dangling name that would be created), a FIFO is
+    // not waited on, a directory is not a lock.
+    #[test]
+    fn the_store_lock_does_not_follow_links_or_open_what_is_not_a_file() {
+        let d = tmp();
+        let victim = d.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        let link = d.path().join("link");
+        symlink(&victim, &link).unwrap();
+        let err = lock_store_shared(&link).unwrap_err();
+        assert!(err.message.contains("symbolic link"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(!is_locked(&victim).unwrap());
+
+        let dangling = d.path().join("dangling");
+        symlink(d.path().join("not-created"), &dangling).unwrap();
+        lock_store_shared(&dangling).unwrap_err();
+        assert!(!d.path().join("not-created").exists());
+
+        let fifo = d.path().join("fifo");
+        let c = c_path(&fifo).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(lock_store_shared(&path).map(|_| ()));
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening the lock blocked on a FIFO");
+        assert!(
+            answer.unwrap_err().message.contains("not a regular file"),
+            "a FIFO is not a lock"
+        );
+
+        let err = lock_store_shared(d.path()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
     }
 
     // U-FS-16

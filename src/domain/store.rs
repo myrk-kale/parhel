@@ -5,6 +5,9 @@
 //!
 //! ```text
 //! .parhel-store                 marker (format=1, user, image, unit)
+//! .parhel-store.lock            the store-wide lock: `add` and `doctor --fix` hold it shared,
+//!                               `setup --remove` exclusive; empty, or `removing` once a
+//!                               removal has sealed the store
 //! baselines/<id>/tree           mirror of one repository's source worktree
 //! baselines/<id>/meta           source=<path>, state, when the last finished sync began
 //! baselines/<id>/lock           flock held for sync AND clone
@@ -30,6 +33,21 @@ pub const BASELINES_DIR: &str = "baselines";
 pub const WORKTREES_DIR: &str = "worktrees";
 /// Registry of the symlinks created at requested destinations.
 pub const LINKS_FILE: &str = "links";
+/// The store-wide lock, at the store's root (a file of the user's, made by `setup` or by the
+/// first `add` that finds it missing).
+///
+/// Whoever works in the store - an `add` from deciding to use it until its worktree is
+/// published or undone, a `doctor --fix` - holds a *shared* `flock` on it. `setup --remove`
+/// takes it *exclusively*, without waiting, before it looks inside the store: if anyone has
+/// it, a run is in progress and nothing is removed; and an `add` that finds it taken by a
+/// removal does not start. So no worktree can be published between the removal's look and its
+/// deletion.
+pub const LOCK_FILE: &str = ".parhel-store.lock";
+/// What a removal writes into the lock file before it lets go of the lock to unmount the
+/// store (an open file keeps a mount busy, so the lock cannot be held through the unmount):
+/// an `add` that takes the lock afterwards reads it and does not start. A removal that
+/// fails takes it back out; `setup` brings back a store whose removal died half way.
+pub const REMOVING_MARK: &str = "removing\n";
 
 /// Contents of `.parhel-store`: `key=value` lines, `format=1` first.
 #[derive(Debug, Clone, PartialEq, Eq)]

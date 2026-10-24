@@ -14,7 +14,7 @@ use super::tree::{self, Data};
 use super::unix::{self, c_path, io_error};
 use crate::domain::store::EntryMeta;
 use crate::domain::{Error, ErrorCode, Result};
-use crate::ports::{CowFs, FileLock, Scan, Space, VolumeInfo};
+use crate::ports::{CowFs, FileLock, Scan, SharedLock, Space, VolumeInfo};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxFs;
@@ -307,6 +307,10 @@ impl CowFs for LinuxFs {
 
     fn is_locked(&self, path: &Path) -> Result<bool> {
         unix::is_locked(path)
+    }
+
+    fn lock_store_shared(&self, path: &Path) -> Result<SharedLock> {
+        unix::lock_store_shared(path)
     }
 
     fn stat_within(&self, root: &Path, rel: &Path) -> Result<Option<EntryMeta>> {

@@ -17,9 +17,10 @@ use std::process::{Command, Stdio};
 
 mod trust;
 
+use crate::domain::store::REMOVING_MARK;
 use crate::domain::{Error, ErrorCode, Result, mounts};
-use crate::fs::unix::io_error;
-use crate::ports::{Host, ImageUsage, MountBacking, Owner, ToolState, UserInfo};
+use crate::fs::unix::{io_error, open_store_lock, try_flock};
+use crate::ports::{FileLock, Host, ImageUsage, MountBacking, Owner, ToolState, UserInfo};
 use trust::{Disk, Lookup, Policy, RealDisk, TRUSTED_DIRS, TRUSTED_PATH};
 
 /// The real [`Host`].
@@ -711,6 +712,15 @@ impl Host for SystemHost {
     fn notice(&self, message: &str) {
         eprintln!("{message}");
     }
+
+    /// STAGE 1 (red): the lock is not taken.
+    fn lock_store(&self, _path: &Path, _owner: Owner) -> Result<Option<FileLock>> {
+        Ok(Some(FileLock::detached()))
+    }
+
+    fn set_store_sealed(&self, _path: &Path, _sealed: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Where the directories to look inside an image on are made: root's, in memory.
@@ -1208,6 +1218,115 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
         let err = creation_is_refused(&dir.path().join("missing")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn me() -> Owner {
+        // SAFETY: `getuid`/`getgid` have no preconditions.
+        Some(unsafe { (libc::getuid(), libc::getgid()) })
+    }
+
+    // U-SYS-12: root takes the store-wide lock exclusively and does not wait: free, it is
+    // taken (the file made, the user's, private); held by a run (shared) or by another
+    // removal, the answer is `None`, at once.
+    #[test]
+    fn the_store_lock_is_exclusive_and_never_waits() {
+        let dir = tmp();
+        let host = SystemHost;
+        let path = dir.path().join(".parhel-store.lock");
+        let first = host.lock_store(&path, me()).unwrap().expect("free");
+        let md = fs::metadata(&path).unwrap();
+        assert_eq!(md.permissions().mode() & 0o777, 0o600);
+        // SAFETY: `getuid` has no preconditions.
+        assert_eq!(md.uid(), unsafe { libc::getuid() });
+        assert!(
+            host.lock_store(&path, me()).unwrap().is_none(),
+            "held by a removal"
+        );
+        drop(first);
+
+        let run = crate::fs::unix::lock_store_shared(&path).unwrap();
+        assert!(
+            host.lock_store(&path, me()).unwrap().is_none(),
+            "held by a run"
+        );
+        drop(run);
+        let freed = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            host.lock_store(&path, me()).unwrap().is_some()
+        });
+        assert!(freed, "free again");
+    }
+
+    // U-SYS-13: root opens it as it opens everything a user can plant: no link followed, no
+    // FIFO waited on, only a regular file.
+    #[test]
+    fn the_store_lock_does_not_follow_links_or_block_on_a_fifo() {
+        let dir = tmp();
+        let host = SystemHost;
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        let link = dir.path().join("lock");
+        symlink(&victim, &link).unwrap();
+        let err = host.lock_store(&link, me()).unwrap_err();
+        assert!(err.message.contains("symbolic link"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        let err = host.set_store_sealed(&link, true).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io, "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+
+        let fifo = dir.path().join("fifo");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let locked = SystemHost.lock_store(&path, me()).map(|_| ());
+            let sealed = SystemHost.set_store_sealed(&path, true);
+            let _ = tx.send((locked, sealed));
+        });
+        let (locked, sealed) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("blocked on a FIFO");
+        assert!(locked.unwrap_err().message.contains("not a regular file"));
+        // (Writing to a FIFO nobody reads fails at once, with `ENXIO`.)
+        sealed.unwrap_err();
+    }
+
+    // U-SYS-14: sealing writes the mark into the file the caller holds the lock of, and
+    // unsealing takes it out; what the runs read through the shared lock follows. The file is
+    // never created by it.
+    #[test]
+    fn sealing_writes_the_mark_and_unsealing_clears_it() {
+        let dir = tmp();
+        let host = SystemHost;
+        let path = dir.path().join(".parhel-store.lock");
+        host.set_store_sealed(&path, true).unwrap_err();
+        assert!(!path.exists(), "never created");
+
+        let guard = host.lock_store(&path, me()).unwrap().expect("free");
+        host.set_store_sealed(&path, true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), REMOVING_MARK.as_bytes());
+        // Sealing twice is the same.
+        host.set_store_sealed(&path, true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), REMOVING_MARK.as_bytes());
+        drop(guard);
+        let freed = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            !crate::fs::unix::is_locked(&path).unwrap()
+        });
+        assert!(freed);
+        assert!(matches!(
+            crate::fs::unix::lock_store_shared(&path).unwrap(),
+            crate::ports::SharedLock::Sealed
+        ));
+
+        host.set_store_sealed(&path, false).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        assert!(matches!(
+            crate::fs::unix::lock_store_shared(&path).unwrap(),
+            crate::ports::SharedLock::Held(_)
+        ));
     }
 
     #[test]

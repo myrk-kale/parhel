@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{Error, Result};
-use crate::ports::{CowFs, FileLock, VolumeInfo};
+use crate::ports::{CowFs, FileLock, SharedLock, VolumeInfo};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnsupportedFs;
@@ -62,6 +62,9 @@ impl CowFs for UnsupportedFs {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }
     fn is_locked(&self, _: &Path) -> Result<bool> {
+        Err(Error::not_implemented("copy-on-write on this platform"))
+    }
+    fn lock_store_shared(&self, _: &Path) -> Result<SharedLock> {
         Err(Error::not_implemented("copy-on-write on this platform"))
     }
     fn replace_contents(&self, _: &Path, _: &[u8]) -> Result<()> {

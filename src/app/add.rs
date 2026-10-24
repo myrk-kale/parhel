@@ -1337,6 +1337,7 @@ mod tests {
     use super::*;
     use crate::app::fakes::{Call, FAKE_STAGING, SHA_A, SHA_B, Step, World, apfs, btrfs, ext4, p};
     use crate::app::rollback::{JOURNAL_FILE, Journal};
+    use crate::domain::store::REMOVING_MARK;
     use crate::domain::{BranchMode, ErrorCode, SubmodulePolicy};
     use crate::git::parse::{GitVersion, WorktreeEntry};
     use crate::ports::{VolumeInfo, WorktreeAddSpec};
@@ -4356,5 +4357,181 @@ mod tests {
                 }),
             1
         );
+    }
+
+    // ------------------------------------------------- the store-wide lock
+
+    fn store_lock() -> PathBuf {
+        p("/store/.parhel-store.lock")
+    }
+
+    /// Every call the log has, in order, without the release of the store lock (which is
+    /// always last).
+    fn before_the_unlock(w: &World) -> Vec<Call> {
+        let mut calls = w.calls();
+        assert_eq!(
+            calls.pop(),
+            Some(Call::StoreUnlock(store_lock())),
+            "{calls:#?}"
+        );
+        calls
+    }
+
+    // U-STO-100: from deciding to use the store until the worktree is published, a run holds
+    // the store's lock (shared; `setup --remove` takes it exclusively): taken before anything
+    // is written, let go of after the last thing is done, and nothing in the store is touched
+    // without it. This is what keeps a removal from deleting the image between its look at
+    // the worktrees and its `rm`.
+    #[test]
+    fn a_store_run_holds_the_store_lock_from_the_decision_to_the_publication() {
+        let w = store_world();
+        run_store(&w, &new_branch()).unwrap();
+        let calls = w.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&Call::StoreLock(store_lock())),
+            "{calls:#?}"
+        );
+        let before = before_the_unlock(&w);
+        let pos = |wanted: Call| {
+            before
+                .iter()
+                .position(|c| *c == wanted)
+                .unwrap_or_else(|| panic!("missing {wanted:?} in {before:#?}"))
+        };
+        // The last things a run does are after the rename; the lock outlives all of them.
+        let rename = pos(Call::Rename {
+            from: p(STORE_STAGED_WT),
+            to: real("feat"),
+        });
+        assert_eq!(
+            before.last(),
+            Some(&Call::RemoveDirAll(p(STORE_STAGING))),
+            "{before:#?}"
+        );
+        assert!(rename < before.len() - 1);
+        assert_eq!(w.count(|c| matches!(c, Call::StoreLock(_))), 1);
+        assert_eq!(w.store_locks_held.get(), 0, "let go of");
+        assert!(
+            w.lock_violations.borrow().is_empty(),
+            "touched the store without the lock: {:#?}",
+            w.lock_violations.borrow()
+        );
+    }
+
+    // U-STO-100b: ... and when the run fails, or is interrupted, the lock outlives the
+    // rollback: a removal must not find a store with a half-undone run in it.
+    #[rstest]
+    #[case::sync(Step::Mirror, None)]
+    #[case::staging(Step::CreateStaging, None)]
+    #[case::worktree_add(Step::WorktreeAdd, None)]
+    #[case::clone(Step::Clone, None)]
+    #[case::symlink(Step::Symlink, None)]
+    #[case::rename(Step::Rename, None)]
+    #[case::interrupted_in_the_sync(Step::Mirror, Some(Step::Mirror))]
+    #[case::interrupted_after_the_clone(Step::Clone, Some(Step::Clone))]
+    fn the_store_lock_outlives_a_rollback(#[case] fails: Step, #[case] interrupt: Option<Step>) {
+        let w = if interrupt.is_some() {
+            store_world()
+        } else {
+            store_world().failing(fails, ErrorCode::Io)
+        };
+        w.interrupt_after.set(interrupt);
+        run_store(&w, &new_branch()).unwrap_err();
+        let calls = w.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&Call::StoreLock(store_lock())),
+            "{calls:#?}"
+        );
+        let before = before_the_unlock(&w);
+        if before
+            .iter()
+            .any(|c| matches!(c, Call::CreateStaging { .. }))
+            && fails != Step::CreateStaging
+        {
+            assert_eq!(
+                before.last(),
+                Some(&Call::RemoveDirAll(p(STORE_STAGING))),
+                "the rollback is done before the lock is let go of: {before:#?}"
+            );
+        }
+        assert_eq!(w.store_locks_held.get(), 0, "let go of");
+        assert!(
+            w.lock_violations.borrow().is_empty(),
+            "{:#?}",
+            w.lock_violations.borrow()
+        );
+    }
+
+    // U-STO-101: a removal holds the lock exclusively: the run does not start. It is
+    // `store-unavailable` - the store is not usable now - saying why, and the way out; the
+    // only thing it did was ask for the lock.
+    #[test]
+    fn a_store_being_removed_is_refused_before_anything_is_written() {
+        let w = store_world();
+        w.locked.borrow_mut().insert(store_lock());
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        for needle in ["being removed", "--copy", "--fallback"] {
+            assert!(
+                err.message.contains(needle),
+                "lacks `{needle}`: {}",
+                err.message
+            );
+        }
+        assert_eq!(w.calls(), vec![Call::StoreLock(store_lock())]);
+        assert!(w.links.borrow().is_empty());
+    }
+
+    // U-STO-101b: ... and so is the store a removal sealed when it let go of the lock to
+    // unmount it: the lock is free, but the file says the store is going away.
+    #[test]
+    fn a_sealed_store_is_refused_too() {
+        let w = store_world();
+        w.files
+            .borrow_mut()
+            .insert(store_lock(), REMOVING_MARK.as_bytes().to_vec());
+        let err = run_store(&w, &new_branch()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoreUnavailable, "{err}");
+        assert!(err.message.contains("being removed"), "{}", err.message);
+        assert_eq!(w.calls(), vec![Call::StoreLock(store_lock())]);
+        assert_eq!(w.store_locks_held.get(), 0);
+    }
+
+    // U-STO-102: a store that predates the lock (set up by an older version) has no lock
+    // file: the first run makes it, and uses it.
+    #[test]
+    fn the_run_makes_the_lock_file_when_the_store_has_none() {
+        let w = store_world();
+        assert!(!w.files.borrow().contains_key(&store_lock()));
+        run_store(&w, &new_branch()).unwrap();
+        assert!(w.files.borrow().contains_key(&store_lock()));
+    }
+
+    // U-STO-103: the lock is for runs that use the store. Where the store is not used - it
+    // cannot be, or the run does not need it - nothing is taken, and no file is made in a
+    // directory that may be an empty mount point.
+    #[rstest]
+    #[case::marker_missing(|w: &mut World| { w.files.borrow_mut().remove(&p("/store/.parhel-store")); })]
+    #[case::not_writable(|w: &mut World| { w.unwritable.borrow_mut().insert(p("/store")); })]
+    #[case::no_copy_on_write(|w: &mut World| { w.volumes = vec![(p("/"), ext4(1)), (p("/store"), ext4(2))]; })]
+    #[case::on_the_sources_own_filesystem(|w: &mut World| { w.volumes = vec![(p("/"), btrfs(3)), (p("/d"), btrfs(4)), (p("/store"), btrfs(3))]; })]
+    fn no_lock_is_taken_where_the_store_is_not_used(#[case] change: fn(&mut World)) {
+        let mut w = store_world();
+        change(&mut w);
+        w.put_dir(Path::new("/d"));
+        let req = AddRequest {
+            destination: p("/d/feat"),
+            ..new_branch()
+        };
+        let _ = run_store(&w, &req);
+        assert_eq!(
+            w.count(|c| matches!(c, Call::StoreLock(_))),
+            0,
+            "{:#?}",
+            w.calls()
+        );
+        assert!(!w.files.borrow().contains_key(&store_lock()));
     }
 }
