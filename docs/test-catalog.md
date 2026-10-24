@@ -468,6 +468,12 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-STO-97 / 97b | A symlink claimed by a live run (journal locked) is not dangling and is left alone by `--fix`; the same state with nobody holding the journal is cleaned up | `src/app/doctor.rs` |
 | U-STO-102 | Killed after the registration was repaired, before the staging directory was removed: `--fix` finishes (lock, cleanup) and keeps the symlink | `src/app/doctor.rs` |
 | U-STO-84 | `not-cow` is not reported while the store can serve the source (it is when the store is broken or absent) | `src/app/doctor.rs` |
+| U-STO-120 / 120b | `add` through the store holds the store-wide lock (shared) from deciding to use the store to the end: it is the first call of the run and the release the last, after the publishing rename and the cleanup; also through a failure at each step and an interrupt, the rollback done before the release; nothing in the store is touched without it | `src/app/add.rs` |
+| U-STO-121 / 121b | A store whose lock a removal holds, or whose lock file a removal sealed (`removing`): `store-unavailable` ("being removed", naming `--copy` and `--fallback`), the only call made is the request for the lock | `src/app/add.rs` |
+| U-STO-122 | A store that predates the lock (no lock file): the run makes it | `src/app/add.rs` |
+| U-STO-123 | No lock where the store is not used: marker missing, not writable, no copy-on-write, on the source's own filesystem (and no lock file made on a directory that may be an empty mount point) | `src/app/add.rs` |
+| U-STO-130 / 130b | `doctor --fix` changes the store (stale baseline, crashed run's staging directory and symlink) under the lock, from before the first change to after the last; a report takes none | `src/app/doctor.rs` |
+| U-STO-130c | `doctor --fix` on a store that is being removed or sealed: one `store-unavailable` finding ("being removed"), nothing in the store touched, not even the leftovers git still registers there | `src/app/doctor.rs` |
 | U-SET-01 | Off Linux: `unsupported-platform`, no mutation (real) | `src/app/setup.rs` |
 | U-SET-02…09 | Preconditions: root (`not-root` naming `sudo git parhel setup [--remove]`), `mkfs.btrfs` (`missing-tool` naming `btrfs-progs`), btrfs loadable or not, systemd, unknown user, user from `$SUDO_USER`, inferred root refused and explicit `--user root` honored | `src/app/setup.rs` |
 | U-SET-10…14 | The steps in order (image, mkfs, mount point, unit, enable, ownership, layout, marker, `chattr +i`, verify), modes and owners, unit content, unit name from `systemd-escape`, marker | `src/app/setup.rs` |
@@ -485,10 +491,24 @@ simulates just enough (files, mounts, immutable directories, units) for re-runs.
 | U-SET-38 | `--remove` of a stopped store mounts it to look for worktrees (they cannot be seen otherwise) and puts it back down when it refuses | `src/app/setup.rs` |
 | U-SET-39 / 40 | `--remove` unmounts a mount no unit owns; staging directories of an `add` are not worktrees | `src/app/setup.rs` |
 | U-SET-36 / 36b…36j / 38b / 02c | `--remove` looks inside before deleting: an image whose unit is gone is mounted read-only, looked into and unmounted; worktrees → `store-in-use` (named where they will appear, image intact, nothing left mounted, never overridden by the flag); a blank image is deleted without mounting; a store it cannot vouch for (does not mount, another filesystem, marker missing next to files or not this user's, unit that does not start) → `store-unavailable` saying nothing was deleted with the commands to look and to insist; files that are not the store's → `store-in-use`; `--discard-contents` overrides those two; the symlinks of `links` are printed once each before anything is deleted; a unit started to look is stopped again when looking fails | `src/app/setup.rs` |
+| U-SET-03c / 03d / 19b | A tool that is there but where root does not trust it (`mkfs.btrfs`, `blkid`, `mount`, `systemd-escape`, `systemctl`, `umount`, `chattr`) is `missing-tool` naming the file and the check, not "not installed"; checked before anything is created, also by `--remove` | `src/app/setup.rs` |
+| U-SET-41 / 42 | `--remove` takes the store lock exclusively and without waiting before it looks (mounted, or after starting the unit to look); a run holding it is `store-in-use` ("a run is in progress"), nothing looked at, deleted or overridden by `--discard-contents`, a started unit stopped again | `src/app/setup.rs` |
+| U-SET-43 | The order of a removal: lock, seal (`removing` in the lock file), release, and only then stop the unit or unmount: an open file keeps a mount busy | `src/app/setup.rs` |
+| U-SET-44 | A refusal (worktrees, other files) takes and releases the lock and seals nothing | `src/app/setup.rs` |
+| U-SET-45 / 45b / 45c | A removal that fails after sealing takes the mark out again (and says `sudo git parhel setup` when a run holds the lock meanwhile); not when the store is already gone (nothing is made where it was mounted); a lock file that cannot be written stops the removal before anything is stopped | `src/app/setup.rs` |
+| U-SET-46 | An image whose unit is gone is looked at on a private directory and takes no lock (no run can use it; no lock file is made on an unmounted mount point) | `src/app/setup.rs` |
+| U-SET-47 | The lock file is the store's own, not a foreign file that blocks the removal | `src/app/setup.rs` |
+| U-SET-48 | `setup` makes the lock file (the user's, via `lock_store`), in a new store and in one that predates it, never replaces one that is there, and does nothing to a store that has it | `src/app/setup.rs` |
+| U-SET-49 | `setup` reopens a store whose removal died after sealing it (`Restored`); if a run holds the lock at that moment it says so (`store-in-use`) and leaves the mark | `src/app/setup.rs` |
 | U-SET-30…37 | `--remove`: refuses with worktrees (`store-in-use`, listing them), ignores baselines and empty directories, the order (disable, remove unit, reload, `chattr -i`, delete image, remove mount point), re-protects the directory while other images remain, idempotent, same user rules, partial stores, touches only parhel's paths | `src/app/setup.rs` |
 | U-SYS-01 / 01b | `/proc/self/mountinfo`: octal escapes, the fields read, the topmost mount at a path, the deepest mount holding one | `src/domain/mounts.rs` |
 | U-SYS-06b / 06c / 10 / 11 | Reading as root: a FIFO is refused without blocking, a file over 64 KiB is refused; `mount_backing` against the machine's mount table (loop mount, an alias of the image, anything else, nothing); signals raised while deferred are delivered after | `src/sys/mod.rs` |
-| U-SYS-01…09 | The real `Host` (`src/sys`): programs only from absolute `PATH` directories; `run` reports stderr, a missing program is `missing-tool`; directories get their mode and owner through a descriptor and a link is not a directory; files are replaced whole and a link at their place is replaced, never followed; a marker that is a link is refused without reading its target; listing does not look through a link; sparse and fully allocated images, never over an existing one, a failed one removed; **verifying the protection of an unprotected directory reports it and keeps the image** | `src/sys/mod.rs` |
+| U-SYS-12 / 13 / 14 | The store lock on a real file (root's side): exclusive, without waiting, `None` when a run or another removal holds it, the file made private and the user's; a link is not followed, a FIFO not waited on; sealing writes `removing` and unsealing clears it, never creating the file | `src/sys/mod.rs` |
+| U-SYS-20…28 | `sys::trust`, the rules for what root may run: found when program, links and directories are root's and closed; refused (naming the file and the check) when owned by someone else, writable by group or others, under a directory or through a link a user controls (also the middle of a chain), a loop; a trusted program later in the list wins over a refused one; what cannot be run is not the program; the same rules on a real disk with the running user as the trusted owner. Decisions are made over injected owners and modes because a test cannot `chown` to root | `src/sys/trust.rs` |
+| U-SYS-29 / 30 | As root `PATH` is not consulted (a program only in a user's directory is missing, one in both is the system's, a path with a directory is judged too), a refused program is `missing-tool` with the reason; for anyone else `PATH` decides as before | `src/sys/mod.rs` |
+| U-SYS-31 | The layouts real distributions have (usr-merge links, `/bin`, `/sbin`) pass the check, and a program under a temporary directory does not (Linux; against the machine the tests run on) | `src/sys/trust.rs` |
+| U-FS-40…43 | The store lock on a real file (the user's side): shared by any number of runs and keeping an exclusive taker out; refused while a removal holds it; a sealed file is refused and released and the mark kept; links, FIFOs and directories are not a lock | `src/fs/unix.rs` |
+| U-SYS-01…09 | The real `Host` (`src/sys`): programs only from absolute `PATH` directories (U-SYS-02: for anyone but root); `run` reports stderr, a missing program is `missing-tool`; directories get their mode and owner through a descriptor and a link is not a directory; files are replaced whole and a link at their place is replaced, never followed; a marker that is a link is refused without reading its target; listing does not look through a link; sparse and fully allocated images, never over an existing one, a failed one removed; **verifying the protection of an unprotected directory reports it and keeps the image** | `src/sys/mod.rs` |
 | U-CLI-20…24 | `setup` command line: defaults, flags, `--remove` conflicts, invalid usage (including user names that are not account names), help mentions sudo, `/parhel/<user>` and `--discard-contents` (real) | `src/cli.rs` |
 | U-CLI-22b | `--discard-contents` belongs to `--remove` | `src/cli.rs` |
 | U-CLI-27 | Account names accepted and rejected (`[a-z_][a-z0-9_.-]*`) | `src/domain/request.rs` |
@@ -541,8 +561,19 @@ command gets a `PARHEL_STORE` that does not exist, so a developer's real store n
 | I-S33b | A 128 MiB store and 192 MiB of data, no hook: `store-no-space` naming the store before a byte is copied (no tree, no `meta`, no trace); works with less |
 | I-S42 | The marker's image lives on the small disk: `store-no-space` naming the image |
 | I-S43 | `doctor` low space is injected, not found by luck: quiet with room, `store-low-space` for the store and for the disk of the image when told |
+| I-S44 | A removal holds the store lock (the test takes `flock(LOCK_EX)` as `setup --remove` does): `add` is `store-unavailable` ("being removed"), nothing written, not even a baseline; works once the lock is free |
+| I-S45 | A lock file with the `removing` mark: the same refusal and the mark kept; works once it is cleared |
+| I-S46 | A run frozen right after taking the lock, after the sync, before the rename and after it: the removal's exclusive lock is refused every time; free when the run is over |
+| I-S47 | The first run in a store without a lock file makes it: a regular file, mode 0600, the user's, empty |
+| I-S08 | (also) `store_locked=error` right after the lock: no trace, no baseline |
 
 ### Setup — `tests/setup.rs` (needs sudo, systemd, btrfs-progs; `PARHEL_TEST_SETUP=1`, CI job `setup (Linux)`)
+`scripts/setup-container-test.sh` runs the file in a privileged container instead, with
+`scripts/fake-systemctl.sh` in place of systemd: it understands what `setup` and the tests use and
+really mounts and unmounts the unit's image, so an open file on the store makes `umount` fail
+there as it does under systemd (I-SET25 depends on that). The stand-in is installed in
+`/usr/bin`, where root looks for programs.
+
 Without the variable every test prints `SKIPPED: PARHEL_TEST_SETUP=1 is not set ...` and
 passes; the tests are serialized (`#[serial(setup)]`) and clean the machine before and after.
 They run as an ordinary user and call `sudo -n` only for `setup`, `systemctl`, and the
@@ -560,7 +591,7 @@ protected image (see the comment on the CI job for why).
 | I-SET08 | `--preallocate` allocates the whole image |
 | I-SET09 | Without root: `not-root` naming the sudo command; nothing created |
 | I-SET10 | A root shell (no `SUDO_USER`) is refused with a hint for `--user`; nothing created |
-| I-SET11 | No `mkfs.btrfs` (empty PATH): `missing-tool` naming `btrfs-progs` |
+| I-SET11 | Root ignores `PATH`: a directory of the user's, first in `PATH`, holds a program for every tool `setup` starts, each leaving a trace; `setup` and `--remove` use the system's (the store is a real btrfs) and none of the user's ran. Replaces "empty PATH", which cannot mean anything once root ignores `PATH` (the missing-tool message is U-SET-03) |
 | I-SET12 | Unknown `--user`: usage error, nothing created |
 | I-SET13 | `doctor` reports `store-image-deleted` when the image was deleted under a mounted store |
 | I-SET14 | Off Linux (macOS): `setup` is `unsupported-platform` (the only test here that runs unguarded) |
@@ -570,6 +601,10 @@ protected image (see the comment on the CI job for why).
 | I-SET19 | Another file in the store root: `--remove` refuses naming it; `--discard-contents` removes |
 | I-SET20 | A tmpfs mounted at the store's place: `setup` and `--remove` say `store-unavailable` naming it and touch nothing |
 | I-SET22 | The unit stopped (mount down): a published worktree is locked; `doctor` names it (`store-worktrees-unreachable`); `git worktree prune` and `gc` keep its registration; with the store back the worktree and its uncommitted file are intact and `doctor` is quiet |
+| I-SET23 | `add` frozen right after it took the store lock, `--remove` as root: `store-in-use` ("a run is in progress"), image, unit and mount still there; the run, released, publishes into an intact store (needs `failpoints`) |
+| I-SET24 | `--remove` frozen right after it took the lock exclusively, `add`: `store-unavailable` ("being removed"), no symlink, registration or baseline; released, the removal completes (needs `failpoints`) |
+| I-SET25 | `--remove` frozen after sealing the store and letting go of the lock, just before it stops the unit: the lock file says `removing`, `add` is refused the same way; released, the removal unmounts (nothing open on the store holds it up) and deletes (needs `failpoints`) |
+| I-SET26 | `--remove` that fails right after sealing (`store_remove_sealed=error`): the mark is out, the unit and image remain, and `add` works (needs `failpoints`) |
 | I-SET21 | `--user` names that systemd would expand or that are not account names: usage error naming the rule, nothing created |
 | I-SET15 | A second (real) user's store goes into the directory that protects the first image: both images exist, both stores are mounted and the new one is that user's, `lsattr` shows the attribute, `rm` of either image as root fails with `Operation not permitted`; removing one store leaves the other image protected |
 

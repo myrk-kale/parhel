@@ -46,6 +46,11 @@ dependencies, no local config), when the project has no heavy ignored files,
 or when `git parhel` is not installed (`git parhel --version` fails). Do not
 install it without asking the user.
 
+If the user asks you to install it from a release, know that the `.deb` and
+`.rpm` packages are **not GPG-signed**, so `apt` and `dnf` cannot verify them.
+Check each package before installing it: `sha256sum -c <file>.sha256` and
+`gh attestation verify <file> -R myrk-kale/parhel`, and show the user the result.
+
 ## The workflow
 
 ### 1. Check the source
@@ -128,10 +133,12 @@ git parhel add ../<project>-<task> --new-branch <branch>
 - With a store, `add` uses it by itself and prints where the worktree really
   lives. The worktree is in the store (`/parhel/<user>/worktrees/<id>/<name>`)
   and the path you asked for is a **symlink** to it. Work from either path;
-  git registers the real one. Remember that the store is one image file:
-  commits are safe in the repository's `.git`, but uncommitted work inside a
-  store worktree goes with the image if it is lost, so tell the user to push
-  what matters.
+  git registers the real one. Remember that the store is one image file, and
+  it holds every store worktree: lose it and all of them go at once, with their
+  uncommitted and ignored files. `chattr +i` on `/var/lib/parhel` only stops an
+  accidental `rm`; it does not protect against a failing disk or a corrupted
+  filesystem, and it is not a backup. Commits are safe in the repository's
+  `.git`, outside the image, so tell the user to commit and push what matters.
 - Other forms: `--branch <existing>`, `--detach <ref>`, a start commit as the
   last argument. With initialized submodules, `--submodules=reinit` is
   required.
@@ -151,7 +158,7 @@ git parhel add ../<project>-<task> --new-branch <branch>
 | `source-changed` | Something wrote to the source during the copy; wait for it and retry |
 | `submodules-present` | Retry with `--submodules=reinit` |
 | `not-cow`, `cross-volume` | Linux: stop, tell the user to run `sudo git parhel setup` once, wait. macOS: a destination on APFS. `--copy` or `--fallback` only if the user chooses them after hearing about setup |
-| `store-unavailable` | Stop. Show `git parhel doctor` and `systemctl status <unit>`; the user fixes it (`sudo systemctl start <unit>` or `sudo git parhel setup`), then retry |
+| `store-unavailable` | Stop. Show `git parhel doctor` and `systemctl status <unit>`; the user fixes it (`sudo systemctl start <unit>` or `sudo git parhel setup`), then retry. If the message says the store is **being removed**, a `sudo git parhel setup --remove` is running or was killed half way: tell the user, wait for it, and only if none is running does `sudo git parhel setup` bring the store back |
 | `store-no-space` | Stop. The disk that holds the store's image, or the store, is too small for what `add` would copy (the message gives the figures). Tell the user; they free space or remove store worktrees they no longer need. Do not switch to `--copy` or `--fallback` on your own |
 | `git-failed` | Git's message follows, for example a branch name already in use |
 | `rollback-failed` | Run `git parhel doctor`, show the user, then `--fix` (step 6) |
