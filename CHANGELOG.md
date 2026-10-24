@@ -6,6 +6,50 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`setup --remove` could delete the store under an `add`.** It checked that no
+  worktree was in the store, then stopped the unit and deleted the image, and an
+  `add` could publish a worktree in between, losing it. The store now has a lock,
+  the file `.parhel-store.lock` in its root (the user's, empty; `setup` makes it,
+  and the first `add` makes it in a store that predates it). `add` holds it shared
+  from the moment it decides to use the store until its worktree is published or
+  undone, and `doctor --fix` holds it while it changes the store. `--remove` takes
+  it exclusively, without waiting, before it looks: if a run holds it, it stops
+  with `store-in-use` ("a run is in progress") having looked at nothing; if it
+  holds it, an `add` stops with `store-unavailable` ("the store is being removed")
+  before it writes anything, and `doctor --fix` leaves the store alone. An open
+  file keeps a mount busy, so just before it stops the unit `--remove` marks the
+  lock file (`removing`) and lets go of the lock; an `add` that takes it after that
+  reads the mark and does not start. A removal that fails takes the mark out again,
+  and `sudo git parhel setup` does it for one that was killed. An image mounted
+  read-only on a private directory to look inside it (the unit is gone) needs no
+  lock: it is not at the store's place, so no run can be using it.
+
+### Security
+
+- **`setup` as root ignores `PATH`.** A `sudo` that keeps the caller's `PATH`
+  could make root run a program a user controls as `mkfs.btrfs`, `mount` or
+  `systemctl`. As root, programs are now looked up only in `/usr/sbin`, `/usr/bin`,
+  `/sbin` and `/bin`, links are followed one at a time, and a program is run only
+  if it, every link on the way and every directory above it are owned by root and
+  not writable by group or others; otherwise the error is `missing-tool` and names
+  the file and the check that failed. What root starts gets `PATH` set to those
+  directories, `LC_ALL=C` and nothing else of the caller's environment. Nothing
+  changes for anyone else.
+
+### Changed
+
+- The README, the agent skill and SECURITY.md say plainly that the store image
+  holds every store worktree, so losing it loses them all; that `chattr +i`
+  protects against accidental deletion, not disk failure or corruption, and is not a
+  backup (commits live in each repository's own `.git`: push what you cannot lose);
+  and that the `.deb` and `.rpm` packages are not GPG-signed, so each should be
+  checked against its `.sha256` file and with `gh attestation verify`.
+- `scripts/setup-container-test.sh` runs `tests/setup.rs` in a privileged
+  container with a stand-in for `systemctl` that really mounts and unmounts the
+  image, for developers without a Linux machine.
+
 ## [0.4.0] - 2026-10-23
 
 ### Added

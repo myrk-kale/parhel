@@ -18,6 +18,10 @@ real git in hermetic sandboxes (their own `HOME` and global config).
 To run the suite on Linux from a Mac, use `scripts/linux-test.sh` (Docker, with
 btrfs, XFS and ext4 loop mounts; extra arguments go to `cargo test`).
 
+`tests/setup.rs` needs root, systemd and a loop mount and runs for real only in CI
+(the job `setup (Linux)`). `scripts/setup-container-test.sh` runs it in a privileged
+container with a stand-in for `systemctl`.
+
 ## Workflow
 
 1. Open an issue first for behavior changes, so we can agree on the expected outcome.
