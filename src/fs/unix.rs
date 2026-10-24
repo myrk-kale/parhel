@@ -563,9 +563,25 @@ pub(crate) fn open_store_lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// STAGE 1 (red): the lock is not taken.
-pub(crate) fn lock_store_shared(_path: &Path) -> Result<SharedLock> {
-    Ok(SharedLock::Held(FileLock::detached()))
+pub(crate) fn lock_store_shared(path: &Path) -> Result<SharedLock> {
+    let file = open_store_lock(path)?;
+    match try_flock(&file, libc::LOCK_SH) {
+        Ok(true) => {}
+        Ok(false) => return Ok(SharedLock::Removing),
+        Err(e) => return Err(io_error(path, &e)),
+    }
+    // Read under the lock: a removal writes the mark while it holds the lock exclusively,
+    // so what is read here is what it left.
+    let mut mark = Vec::new();
+    io::Read::read_to_end(
+        &mut io::Read::take(&file, REMOVING_MARK.len() as u64),
+        &mut mark,
+    )
+    .map_err(|e| io_error(path, &e))?;
+    if mark == REMOVING_MARK.as_bytes() {
+        return Ok(SharedLock::Sealed);
+    }
+    Ok(SharedLock::Held(FileLock::new(file)))
 }
 
 pub(crate) fn is_locked(path: &Path) -> Result<bool> {
@@ -691,7 +707,7 @@ mod tests {
         })
     }
 
-    // U-FS-24: the store-wide lock is shared by the runs that work in the store, any number
+    // U-FS-40: the store-wide lock is shared by the runs that work in the store, any number
     // at once, and keeps whoever wants it exclusively (a removal) out until the last one lets
     // go. It is made, the user's and private, when it is missing; and kept when it is there.
     #[test]
@@ -719,7 +735,7 @@ mod tests {
         );
     }
 
-    // U-FS-25: while a removal holds the lock a run does not start: the answer is
+    // U-FS-41: while a removal holds the lock a run does not start: the answer is
     // "removing", and nothing is held when it comes.
     #[test]
     fn the_store_lock_is_refused_while_a_removal_holds_it() {
@@ -736,7 +752,7 @@ mod tests {
         drop(held(lock_store_shared(&path).unwrap()));
     }
 
-    // U-FS-26: ... and after it, when it let go to unmount the store, the mark it left in
+    // U-FS-42: ... and after it, when it let go to unmount the store, the mark it left in
     // the file says the store is going away: refused, nothing held, the mark not ours to clear.
     #[test]
     fn a_sealed_store_lock_is_refused_and_released() {
@@ -754,7 +770,7 @@ mod tests {
         drop(held(lock_store_shared(&path).unwrap()));
     }
 
-    // U-FS-27: the lock file is opened the way root opens what a user can plant: a link is
+    // U-FS-43: the lock file is opened the way root opens what a user can plant: a link is
     // not followed (not to a file, not to a dangling name that would be created), a FIFO is
     // not waited on, a directory is not a lock.
     #[test]

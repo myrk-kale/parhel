@@ -511,6 +511,27 @@ impl World {
         self.log.borrow().clone()
     }
 
+    /// The calls other than taking the store lock and letting go of it.
+    pub fn mutations(&self) -> Vec<Call> {
+        self.log
+            .borrow()
+            .iter()
+            .filter(|c| !matches!(c, Call::StoreLock(_) | Call::StoreUnlock(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// The last mutation logged, not counting the release of the store lock that ends a
+    /// store run.
+    pub fn last_call(&self) -> Option<Call> {
+        self.log
+            .borrow()
+            .iter()
+            .rev()
+            .find(|c| !matches!(c, Call::StoreUnlock(_)))
+            .cloned()
+    }
+
     /// Index of the first logged call matching `pred`.
     pub fn position(&self, pred: impl Fn(&Call) -> bool) -> Option<usize> {
         self.log.borrow().iter().position(pred)
@@ -1865,6 +1886,9 @@ impl Host for FakeHost {
                 ErrorCode::Io,
                 format!("{}: no such file", path.display()),
             ));
+        }
+        if sealed && self.busy_once_sealed.get() {
+            self.store_busy.set(true);
         }
         self.files.borrow_mut().insert(
             path.into(),

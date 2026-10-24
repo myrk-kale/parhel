@@ -40,10 +40,17 @@ pub const ADD_FAILPOINTS: &[&str] = &[
     "before_rename",
 ];
 
-/// Failpoints of the store route of `add`, in execution order: after the baseline sync,
-/// and after the symlink was claimed at the requested destination (both before the
-/// publishing rename). Each also applies to [`ADD_FAILPOINTS`] steps the route shares.
-pub const STORE_FAILPOINTS: &[&str] = &["after_sync", "after_link"];
+/// Failpoints of the store route of `add`, in execution order: right after the store-wide
+/// lock was taken (shared, before `after_validate`), after the baseline sync, and after the
+/// symlink was claimed at the requested destination (both before the publishing rename).
+/// Each also applies to [`ADD_FAILPOINTS`] steps the route shares.
+pub const STORE_FAILPOINTS: &[&str] = &["store_locked", "after_sync", "after_link"];
+
+/// Failpoints of `setup --remove`, in execution order: right after the store-wide lock was
+/// taken exclusively (before anything in the store is looked at), and after the store was
+/// sealed and the lock let go of, right before the unit is stopped. Frozen at either, a
+/// test starts an `add` and sees what it makes of a store that is going away.
+pub const REMOVE_FAILPOINTS: &[&str] = &["store_remove_locked", "store_remove_sealed"];
 
 /// Failpoint of the baseline sync, evaluated as `sync_entry:<path>` just before each
 /// entry below the source root is compared (the sync's twin of [`WALK_FAILPOINT`]).

@@ -10,11 +10,11 @@ use crate::app::store::discover;
 use crate::domain::mounts;
 use crate::domain::paths::{self, is_staging_name};
 use crate::domain::store::{
-    BASELINES_DIR, LINKS_FILE, Store, StoreState, WORKTREES_DIR, is_repo_id, repo_id,
+    BASELINES_DIR, LINKS_FILE, LOCK_FILE, Store, StoreState, WORKTREES_DIR, is_repo_id, repo_id,
 };
 use crate::domain::{DoctorRequest, ErrorCode, Result};
 use crate::git::parse::WorktreeEntry;
-use crate::ports::{CowFs, RepoInfo};
+use crate::ports::{CowFs, FileLock, RepoInfo, SharedLock};
 
 /// Something worth reporting. `code()` is printed and is a stable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +131,7 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         // Registrations name canonical paths; compare like with like.
         store.root = env.fs.canonicalize(&store.root)?;
     }
+    let (_store_lock, removing) = lock_for_fix(env, request.fix, &store_state)?;
 
     report
         .findings
@@ -145,7 +146,7 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
     // The staging dirs of store runs sit in the store, with no registration to lead here
     // when the run died before registering anything.
     let store = match &store_state {
-        StoreState::Available(store) => Some(store),
+        StoreState::Available(store) if removing.is_none() => Some(store),
         _ => None,
     };
     scan_dirs.extend(store.map(|s| s.root.join(WORKTREES_DIR)));
@@ -197,6 +198,13 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
     // Where crashed store runs were going (before the fix removes their staging dirs).
     let claimed = store.map_or_else(Vec::new, |s| claimed_destinations(env.fs, s));
     if request.fix {
+        // Nothing in a store that is being removed, whatever points into it.
+        let outside = |path: &&PathBuf| match &removing {
+            Some(Finding::StoreUnavailable { path: root, .. }) => !path.starts_with(root),
+            _ => true,
+        };
+        let orphans: Vec<PathBuf> = orphans.iter().filter(outside).cloned().collect();
+        let registrations: Vec<PathBuf> = registrations.iter().filter(outside).cloned().collect();
         fix(
             env,
             &repo,
@@ -208,16 +216,52 @@ pub fn doctor(env: &Env<'_>, request: &DoctorRequest) -> Result<DoctorReport> {
         );
     }
     // After the fix: a crashed run's symlink is gone by now and is not reported twice.
-    store_findings_of(
-        env,
-        &repo,
-        &store_state,
-        &worktrees,
-        &claimed,
-        request.fix,
-        &mut report,
-    );
+    if let Some(finding) = removing {
+        report.findings.push(finding);
+    } else {
+        store_findings_of(
+            env,
+            &repo,
+            &store_state,
+            &worktrees,
+            &claimed,
+            request.fix,
+            &mut report,
+        );
+    }
     Ok(report)
+}
+
+/// What `--fix` changes in the store (the leftovers of a crashed run, a link, a baseline) it
+/// changes under the store's lock, shared, so that `setup --remove` cannot delete the image
+/// under a repair. A store that is being removed is left alone: the finding says so. The
+/// lock is held until the guard drops (the caller keeps it until the report is made).
+fn lock_for_fix(
+    env: &Env<'_>,
+    fix: bool,
+    store_state: &StoreState,
+) -> Result<(Option<FileLock>, Option<Finding>)> {
+    let StoreState::Available(store) = store_state else {
+        return Ok((None, None));
+    };
+    if !fix {
+        return Ok((None, None));
+    }
+    Ok(
+        match env.fs.lock_store_shared(&store.root.join(LOCK_FILE))? {
+            SharedLock::Held(lock) => (Some(lock), None),
+            SharedLock::Removing | SharedLock::Sealed => (
+                None,
+                Some(Finding::StoreUnavailable {
+                    path: store.root.clone(),
+                    reason: "the store is being removed (`git parhel setup --remove` is running, \
+                             or was interrupted), so nothing in it is changed; `sudo git parhel \
+                             setup` brings it back if no removal is running"
+                        .to_owned(),
+                }),
+            ),
+        },
+    )
 }
 
 /// What the store adds to the report: why it cannot be used, or the checks that need it.
@@ -1675,7 +1719,7 @@ mod tests {
         let report = run_store(&w, true);
         assert_eq!(report.fixed, vec![finding]);
         assert!(report.healthy());
-        assert_eq!(w.calls(), vec![Call::RemoveFile(p("/w/feat"))]);
+        assert_eq!(w.mutations(), vec![Call::RemoveFile(p("/w/feat"))]);
     }
 
     // U-STO-77: the registry is a record of what we created, not a license: a path
@@ -1718,7 +1762,7 @@ mod tests {
 
         let report = run_store(&w, true);
         assert_eq!(report.fixed, vec![finding]);
-        assert_eq!(w.calls(), vec![Call::RemoveDirAll(baseline_dir())]);
+        assert_eq!(w.mutations(), vec![Call::RemoveDirAll(baseline_dir())]);
     }
 
     // U-STO-79: a baseline whose source is still a registered worktree (the main one
@@ -1731,7 +1775,7 @@ mod tests {
             format!("source={}\n", real().display()).into_bytes(),
         );
         assert_eq!(store_findings(&run_store(&w, true)), Vec::<&Finding>::new());
-        assert_eq!(w.calls(), vec![]);
+        assert_eq!(w.mutations(), vec![]);
     }
 
     // U-STO-80: whatever --fix repairs, no worktree directory is ever deleted.
@@ -1837,8 +1881,8 @@ mod tests {
         );
         assert_eq!(w.count(|c| *c == Call::BranchDelete("feat".into())), 1);
         assert_eq!(
-            w.calls().last(),
-            Some(&Call::RemoveDirAll(p(
+            w.last_call(),
+            Some(Call::RemoveDirAll(p(
                 "/store/worktrees/.parhel-staging-dead"
             )))
         );
@@ -1848,7 +1892,7 @@ mod tests {
         p("/store/.parhel-store.lock")
     }
 
-    // U-STO-110: what `--fix` changes in the store it changes under the store's lock (shared:
+    // U-STO-130: what `--fix` changes in the store it changes under the store's lock (shared:
     // `setup --remove` takes it exclusively), taken before the first change and let go of
     // after the last, so a removal cannot delete the image under a repair. A report only
     // looks, and takes nothing.
@@ -1890,7 +1934,7 @@ mod tests {
         );
     }
 
-    // U-STO-110b: ... the undoing of a store run that crashed is the other thing it does in
+    // U-STO-130b: ... the undoing of a store run that crashed is the other thing it does in
     // the store, and is under the lock as well, rollback to the last step.
     #[test]
     fn fix_undoes_a_crashed_store_run_under_the_lock() {
@@ -1919,7 +1963,7 @@ mod tests {
         );
     }
 
-    // U-STO-110c: a store that is being removed (the lock is taken) or that a removal sealed
+    // U-STO-130c: a store that is being removed (the lock is taken) or that a removal sealed
     // is left alone: it is reported as unavailable, saying why - not as a store whose
     // worktrees cannot be reached, which it is not - and nothing in it is changed.
     #[rstest]
@@ -1991,7 +2035,7 @@ mod tests {
         let report = run_store(&w, true);
         assert!(report.healthy(), "{report:#?}");
         assert_eq!(
-            w.calls(),
+            w.mutations(),
             vec![
                 Call::Repair { path: real() },
                 Call::WorktreeLock {
@@ -2169,7 +2213,7 @@ mod tests {
             "{report:#?}"
         );
         assert!(report.healthy(), "{report:#?}");
-        assert_eq!(w.calls(), vec![], "nothing touched");
+        assert_eq!(w.mutations(), vec![], "nothing touched");
     }
 
     // U-STO-97b: ... and the same state with nobody holding the journal is a crashed run:
@@ -2217,8 +2261,8 @@ mod tests {
             w.calls()
         );
         assert_eq!(
-            w.calls().last(),
-            Some(&Call::RemoveDirAll(p(
+            w.last_call(),
+            Some(Call::RemoveDirAll(p(
                 "/store/worktrees/.parhel-staging-dead"
             )))
         );

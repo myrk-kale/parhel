@@ -1,11 +1,12 @@
-//! I-SET01..I-SET22: `git parhel setup`, the store at its real place.
+//! I-SET01..I-SET26: `git parhel setup`, the store at its real place.
 //!
 //! These tests change the machine: they create `/var/lib/parhel`, a loop-mounted btrfs
 //! image, a systemd unit and `/parhel/<user>`, and they need `sudo`, systemd and the
 //! btrfs tools. They run only when `PARHEL_TEST_SETUP=1` (the CI job `setup (Linux)`);
 //! otherwise each one prints a notice and passes, so a developer's machine is never
 //! touched by accident. `scripts/linux-test.sh` (a container without systemd) does not
-//! set it.
+//! set it; `scripts/setup-container-test.sh` does, with a stand-in for `systemctl` that
+//! really mounts and unmounts the image.
 //!
 //! Who runs what: the tests run as the ordinary user, as the product does. Only the
 //! commands that need root go through `sudo -n` (the binary's `setup`, `systemctl`,
@@ -1168,6 +1169,7 @@ fn iset24_add_does_not_start_in_a_store_that_is_being_removed() {
 
     barrier.release();
     let out = finish_within(removal, 120);
+    barrier.clear_marker();
     assert_success(&out);
     assert!(!root_exists(image()), "the removal went through");
 }
@@ -1207,7 +1209,9 @@ fn iset25_a_sealed_store_refuses_adds_until_it_is_gone() {
     assert!(fs::symlink_metadata(&dest).is_err());
 
     barrier.release();
-    assert_success(&finish_within(removal, 120));
+    let out = finish_within(removal, 120);
+    barrier.clear_marker();
+    assert_success(&out);
     assert!(!root_exists(image()) && !unit_file().exists());
     assert!(!store_root().exists(), "mount point left");
 }

@@ -713,13 +713,40 @@ impl Host for SystemHost {
         eprintln!("{message}");
     }
 
-    /// STAGE 1 (red): the lock is not taken.
-    fn lock_store(&self, _path: &Path, _owner: Owner) -> Result<Option<FileLock>> {
-        Ok(Some(FileLock::detached()))
+    fn lock_store(&self, path: &Path, owner: Owner) -> Result<Option<FileLock>> {
+        let file = open_store_lock(path)?;
+        fchown(&file, owner).map_err(|e| io_error(path, &e))?;
+        match try_flock(&file, libc::LOCK_EX) {
+            Ok(true) => Ok(Some(FileLock::new(file))),
+            Ok(false) => Ok(None),
+            Err(e) => Err(io_error(path, &e)),
+        }
     }
 
-    fn set_store_sealed(&self, _path: &Path, _sealed: bool) -> Result<()> {
-        Ok(())
+    fn set_store_sealed(&self, path: &Path, sealed: bool) -> Result<()> {
+        // Never created, never followed: the file is the user's and this is root.
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(NO_FOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| io_error(path, &e))?;
+        if !file.metadata().map_err(|e| io_error(path, &e))?.is_file() {
+            return Err(Error::new(
+                ErrorCode::Io,
+                format!(
+                    "`{}` is not a regular file: refusing to write to it",
+                    path.display()
+                ),
+            ));
+        }
+        let written = (|| -> io::Result<()> {
+            file.set_len(0)?;
+            if sealed {
+                (&file).write_all(REMOVING_MARK.as_bytes())?;
+            }
+            file.sync_all()
+        })();
+        written.map_err(|e| io_error(path, &e))
     }
 }
 
@@ -1220,9 +1247,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    fn me() -> Owner {
+    fn me() -> (u32, u32) {
         // SAFETY: `getuid`/`getgid` have no preconditions.
-        Some(unsafe { (libc::getuid(), libc::getgid()) })
+        unsafe { (libc::getuid(), libc::getgid()) }
     }
 
     // U-SYS-12: root takes the store-wide lock exclusively and does not wait: free, it is
@@ -1233,26 +1260,26 @@ mod tests {
         let dir = tmp();
         let host = SystemHost;
         let path = dir.path().join(".parhel-store.lock");
-        let first = host.lock_store(&path, me()).unwrap().expect("free");
+        let first = host.lock_store(&path, Some(me())).unwrap().expect("free");
         let md = fs::metadata(&path).unwrap();
         assert_eq!(md.permissions().mode() & 0o777, 0o600);
         // SAFETY: `getuid` has no preconditions.
         assert_eq!(md.uid(), unsafe { libc::getuid() });
         assert!(
-            host.lock_store(&path, me()).unwrap().is_none(),
+            host.lock_store(&path, Some(me())).unwrap().is_none(),
             "held by a removal"
         );
         drop(first);
 
         let run = crate::fs::unix::lock_store_shared(&path).unwrap();
         assert!(
-            host.lock_store(&path, me()).unwrap().is_none(),
+            host.lock_store(&path, Some(me())).unwrap().is_none(),
             "held by a run"
         );
         drop(run);
         let freed = (0..100).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            host.lock_store(&path, me()).unwrap().is_some()
+            host.lock_store(&path, Some(me())).unwrap().is_some()
         });
         assert!(freed, "free again");
     }
@@ -1267,7 +1294,7 @@ mod tests {
         fs::write(&victim, "precious").unwrap();
         let link = dir.path().join("lock");
         symlink(&victim, &link).unwrap();
-        let err = host.lock_store(&link, me()).unwrap_err();
+        let err = host.lock_store(&link, Some(me())).unwrap_err();
         assert!(err.message.contains("symbolic link"), "{}", err.message);
         assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
         let err = host.set_store_sealed(&link, true).unwrap_err();
@@ -1281,7 +1308,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let path = fifo.clone();
         std::thread::spawn(move || {
-            let locked = SystemHost.lock_store(&path, me()).map(|_| ());
+            let locked = SystemHost.lock_store(&path, Some(me())).map(|_| ());
             let sealed = SystemHost.set_store_sealed(&path, true);
             let _ = tx.send((locked, sealed));
         });
@@ -1304,7 +1331,7 @@ mod tests {
         host.set_store_sealed(&path, true).unwrap_err();
         assert!(!path.exists(), "never created");
 
-        let guard = host.lock_store(&path, me()).unwrap().expect("free");
+        let guard = host.lock_store(&path, Some(me())).unwrap().expect("free");
         host.set_store_sealed(&path, true).unwrap();
         assert_eq!(fs::read(&path).unwrap(), REMOVING_MARK.as_bytes());
         // Sealing twice is the same.

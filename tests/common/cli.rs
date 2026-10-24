@@ -137,6 +137,13 @@ impl Barrier {
     pub fn release(&self) {
         fs::write(&self.path, b"go").unwrap();
     }
+
+    /// Remove the marker the frozen process wrote. For a process that ran as root: the
+    /// marker is root's, in a directory of the user's, and the sandbox's cleanup (a `chmod`)
+    /// would complain about it.
+    pub fn clear_marker(&self) {
+        let _ = fs::remove_file(self.reached_marker());
+    }
 }
 
 /// Wait for a child with a timeout, returning its full output.
