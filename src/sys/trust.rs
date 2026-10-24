@@ -144,15 +144,63 @@ fn check_directories(disk: &dyn Disk, policy: &Policy<'_>, dir: &Path) -> Result
     Ok(())
 }
 
-/// STAGE 1 (red): what the lookup did before the fix - any executable regular file will
-/// do, whoever owns it and whoever can write to it.
-fn check(disk: &dyn Disk, _policy: &Policy<'_>, candidate: &Path) -> Verdict {
-    match disk.lstat(candidate) {
-        Ok(facts) if facts.kind == Kind::File && facts.mode & 0o111 != 0 => {
-            Verdict::Trusted(candidate.to_path_buf())
+/// Follow `candidate` to the program it names, judging every directory and every link on
+/// the way and the program itself.
+fn check(disk: &dyn Disk, policy: &Policy<'_>, candidate: &Path) -> Verdict {
+    let mut current = candidate.to_path_buf();
+    for _ in 0..=MAX_LINKS {
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            return Verdict::NotThere;
+        };
+        let real_parent = match disk.canonicalize(parent) {
+            Ok(real) => real,
+            Err(e) if is_absent(&e) => return Verdict::NotThere,
+            Err(e) => return Verdict::Refused(format!("`{}`: {e}", parent.display())),
+        };
+        let at = real_parent.join(name);
+        let facts = match disk.lstat(&at) {
+            Ok(facts) => facts,
+            Err(e) if is_absent(&e) => return Verdict::NotThere,
+            Err(e) => return Verdict::Refused(format!("`{}`: {e}", at.display())),
+        };
+        if let Err(why) = check_directories(disk, policy, &real_parent) {
+            return Verdict::Refused(why);
         }
-        _ => Verdict::NotThere,
+        match facts.kind {
+            Kind::Symlink => {
+                if facts.uid != policy.owner {
+                    return Verdict::Refused(format!(
+                        "the link `{}` is owned by {}, not by {}",
+                        at.display(),
+                        owner_name(facts.uid),
+                        owner_name(policy.owner)
+                    ));
+                }
+                match disk.read_link(&at) {
+                    Ok(target) if target.is_absolute() => current = target,
+                    Ok(target) => current = real_parent.join(target),
+                    Err(e) => return Verdict::Refused(format!("`{}`: {e}", at.display())),
+                }
+            }
+            Kind::File => {
+                if let Some(why) = program_problem(&at, &facts, policy) {
+                    return Verdict::Refused(why);
+                }
+                // A file that cannot be run is not the program (it may be a data file
+                // that happens to carry the name): look on.
+                return if facts.mode & 0o111 == 0 {
+                    Verdict::NotThere
+                } else {
+                    Verdict::Trusted(at)
+                };
+            }
+            Kind::Dir | Kind::Other => return Verdict::NotThere,
+        }
     }
+    Verdict::Refused(format!(
+        "`{}` leads through too many symbolic links",
+        candidate.display()
+    ))
 }
 
 fn is_absent(e: &io::Error) -> bool {
