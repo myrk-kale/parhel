@@ -575,27 +575,74 @@ fn iset10_root_is_never_inferred() {
     assert!(!root_exists("/var/lib/parhel/root.img"));
 }
 
-// I-SET11: a missing mkfs.btrfs is reported with the package that provides it.
+/// Programs of the user's, in a directory the user can write to, for each program `setup`
+/// runs as root: every one records that it ran in `witness` and succeeds.
+fn evil_bin(sb: &Sandbox) -> (PathBuf, PathBuf) {
+    let bin = sb.path("evil-bin");
+    let witness = sb.path("witness");
+    fs::create_dir(&bin).unwrap();
+    for tool in [
+        "mkfs.btrfs",
+        "blkid",
+        "mount",
+        "umount",
+        "systemctl",
+        "systemd-escape",
+        "chattr",
+        "modprobe",
+    ] {
+        let script = format!(
+            "#!/bin/sh\necho \"{tool} $*\" >> '{}'\nexit 0\n",
+            witness.display()
+        );
+        let path = bin.join(tool);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    (bin, witness)
+}
+
+// I-SET11: root does not take its programs from PATH. A `sudo` that keeps the caller's PATH
+// (a `Defaults !env_reset`, an `env_keep`) would otherwise run whatever the user left first
+// in it: here a directory of the user's holds a program for each tool `setup` starts, and
+// each one leaves a trace if it is run. `setup` and `--remove` use the system's, the store
+// is a real btrfs, and none of the user's ever ran.
 #[test]
 #[serial(setup)]
-fn iset11_missing_btrfs_progs_names_the_package() {
+fn iset11_root_ignores_path_and_never_runs_a_program_the_user_controls() {
     if !enabled() {
         return;
     }
     let _machine = Machine::clean();
-    let out = sudo(
-        "env",
-        &[
-            "PATH=/nonexistent",
-            parhel_bin().to_str().unwrap(),
-            "setup",
-            "--size",
-            "512M",
-        ],
+    let sb = Sandbox::new();
+    let (bin, witness) = evil_bin(&sb);
+    let path = format!("PATH={}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display());
+    let binary = parhel_bin();
+    let with_path = |args: &[&str]| {
+        let mut all = vec![path.as_str(), binary.to_str().unwrap(), "setup"];
+        all.extend_from_slice(args);
+        sudo("env", &all)
+    };
+
+    assert_success(&with_path(&["--size", "512M"]));
+    assert_eq!(common::cow::fs_type(&store_root()), "btrfs");
+    assert!(
+        store_root().join(".parhel-store").exists(),
+        "the layout was made"
     );
-    assert_error(&out, "missing-tool");
-    assert!(stderr(&out).contains("btrfs-progs"), "{}", stderr(&out));
-    assert!(!root_exists(image()) && !unit_file().exists());
+    assert!(
+        !witness.exists(),
+        "root ran the user's program: {}",
+        fs::read_to_string(&witness).unwrap_or_default()
+    );
+
+    assert_success(&with_path(&["--remove"]));
+    assert!(!root_exists(image()), "image left");
+    assert!(
+        !witness.exists(),
+        "root ran the user's program: {}",
+        fs::read_to_string(&witness).unwrap_or_default()
+    );
 }
 
 // I-SET12: an unknown user is a usage error and nothing is created.

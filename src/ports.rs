@@ -252,6 +252,17 @@ pub enum MountBacking {
     Other(String),
 }
 
+/// Whether a program can be run by root (see `sys::trust`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolState {
+    Usable,
+    /// Nothing by that name in the directories root looks in.
+    Missing,
+    /// There is one, but not one that only root could have put there: which file failed
+    /// which check.
+    Untrusted(String),
+}
+
 /// Everything `git parhel setup` asks of the machine: privileged system calls,
 /// programs, systemd. Reads are separate from mutations so a fake can log only the
 /// latter.
@@ -262,8 +273,13 @@ pub trait Host {
     fn env_var(&self, name: &str) -> Option<String>;
     /// `getpwnam`.
     fn user(&self, name: &str) -> Result<Option<UserInfo>>;
-    /// Whether `tool` is found in the directories root searches.
-    fn tool_exists(&self, tool: &str) -> bool;
+    /// Whether root can run `tool`, and if not why: not installed, or installed where root
+    /// does not trust it.
+    fn tool_state(&self, tool: &str) -> ToolState;
+    /// `tool` can be run by root.
+    fn tool_exists(&self, tool: &str) -> bool {
+        self.tool_state(tool) == ToolState::Usable
+    }
     /// Whether systemd is PID 1 (`systemctl` can manage units).
     fn systemd_running(&self) -> bool;
     /// Contents of a text file (`/proc/filesystems`, a unit, the marker); `None` when missing.
