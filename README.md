@@ -36,6 +36,10 @@ and a 300 MB build artifact:
 | `git worktree add`, then `cp -R node_modules target` | 6.9 s | 383 MiB |
 | `git parhel add` | 0.5 s | about 8 MiB |
 
+For a closer look at disk usage, filesystem support, and how parhel
+compares with other worktree tools, see the
+[Git worktree disk usage guides](docs/README.md).
+
 parhel runs on macOS (APFS) and on Linux (Btrfs, XFS with reflink and other
 filesystems that can reflink). Windows is planned; see
 [Platform support](#platform-support).
